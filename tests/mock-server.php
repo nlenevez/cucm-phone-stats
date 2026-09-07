@@ -24,6 +24,113 @@
  */
 
 const GEN_FILE = __DIR__ . '/.mock-generation';
+const BIG_FILE = __DIR__ . '/.mock-big';
+
+/**
+ * Large-estate mode: GET /_big/<n> synthesises n registered phones.
+ *
+ * It reproduces the failure seen on the real cluster: an unpartitioned
+ * query is silently capped at BIG_CAP devices and then simply stops
+ * returning StateInfo - a well formed, error free, WRONG answer - while
+ * TotalDevicesFound keeps reporting the true total. A query narrowed by
+ * name pattern is served in full. Without this the partitioning fallback
+ * would be untestable, and an untested fallback for a fault you cannot
+ * reproduce is just a hopeful guess.
+ */
+const BIG_CAP = 120;
+const SOFT_FILE = __DIR__ . '/.mock-soft';
+const CONC_FILE = __DIR__ . '/.mock-conc';
+const SLOW_FILE = __DIR__ . '/.mock-slow';
+
+/**
+ * Track how many phone requests are being served at once.
+ *
+ * The point is to assert overlap directly rather than infer it from elapsed
+ * time. A timing assertion on a build machine is a flaky test; "the server
+ * saw six requests in flight simultaneously" is not. Needs the built-in
+ * server started with PHP_CLI_SERVER_WORKERS so requests are not serialised
+ * by a single process - hence the file plus flock rather than a static.
+ */
+function concEnter(): void {
+    $fh = fopen(CONC_FILE, 'c+');
+    if (!$fh) { return; }
+    flock($fh, LOCK_EX);
+    $d = json_decode((string)stream_get_contents($fh), true) ?: ['cur' => 0, 'max' => 0];
+    $d['cur']++;
+    $d['max'] = max($d['max'], $d['cur']);
+    ftruncate($fh, 0); rewind($fh); fwrite($fh, json_encode($d));
+    flock($fh, LOCK_UN); fclose($fh);
+}
+function concLeave(): void {
+    $fh = fopen(CONC_FILE, 'c+');
+    if (!$fh) { return; }
+    flock($fh, LOCK_EX);
+    $d = json_decode((string)stream_get_contents($fh), true) ?: ['cur' => 0, 'max' => 0];
+    $d['cur'] = max(0, $d['cur'] - 1);
+    ftruncate($fh, 0); rewind($fh); fwrite($fh, json_encode($d));
+    flock($fh, LOCK_UN); fclose($fh);
+}
+const SLOWMOD_FILE = __DIR__ . '/.mock-slowmod';
+
+function slowMs(): int {
+    return is_readable(SLOW_FILE) ? max(0, (int)file_get_contents(SLOW_FILE)) : 0;
+}
+/** 0 = every phone is slow; n > 0 = roughly one phone in n is slow. */
+function slowMod(): int {
+    return is_readable(SLOWMOD_FILE) ? max(0, (int)file_get_contents(SLOWMOD_FILE)) : 0;
+}
+/**
+ * Should this phone be slow? A realistic estate is not uniformly slow - it
+ * is mostly fast with a scattering of handsets that crawl or time out, and
+ * that VARIANCE is the entire difference between batching and a rolling
+ * window. With uniform latency the two are indistinguishable.
+ */
+function isSlowPhone(string $ip): bool {
+    $mod = slowMod();
+    if ($mod <= 0) { return true; }
+    return (hexdec(substr(md5($ip), 0, 4)) % $mod) === 0;
+}
+
+/**
+ * GET /_soft/1 adds registered soft clients to the estate.
+ *
+ * Behind a toggle so the counts every other test asserts stay stable. Their
+ * addresses are deliberately in the same range as the handsets: a Jabber
+ * client registers from the user's workstation, and the point of the
+ * device-prefix filter is that nothing about the ADDRESS tells you not to
+ * poll it - only the device name does.
+ */
+function softClients(): array {
+    if (!is_readable(SOFT_FILE) || trim((string)file_get_contents(SOFT_FILE)) !== '1') { return []; }
+    return [
+        'CSFJOSEPH'       => ['ip' => '10.10.10.51', 'status' => 'Registered', 'model' => 'Cisco Unified Client',
+                              'descr' => 'Jabber desktop', 'http' => 'No', 'behaviour' => 'noweb'],
+        'TCTJSMITH'       => ['ip' => '10.10.10.52', 'status' => 'Registered', 'model' => 'Cisco Jabber for iPhone',
+                              'descr' => 'Jabber iPhone', 'http' => 'No', 'behaviour' => 'noweb'],
+        'BOTJSMITH'       => ['ip' => '10.10.10.53', 'status' => 'Registered', 'model' => 'Cisco Jabber for Android',
+                              'descr' => 'Jabber Android', 'http' => 'No', 'behaviour' => 'noweb'],
+        'ATA001122335501' => ['ip' => '10.10.10.54', 'status' => 'Registered', 'model' => 'Cisco ATA 192',
+                              'descr' => 'Analog adapter', 'http' => 'No', 'behaviour' => 'noweb'],
+    ];
+}
+
+function bigCount(): int {
+    return is_readable(BIG_FILE) ? max(0, (int)file_get_contents(BIG_FILE)) : 0;
+}
+
+/** Deterministic synthetic estate, spread across all 16 SEP buckets. */
+function bigEstate(): array {
+    $out = [];
+    for ($i = 0; $i < bigCount(); $i++) {
+        $name = 'SEP' . strtoupper(substr(md5('dev' . $i), 0, 12));
+        $out[$name] = [
+            'ip' => sprintf('10.%d.%d.%d', 20 + intdiv($i, 65025), intdiv($i, 255) % 255, ($i % 254) + 1),
+            'status' => 'Registered', 'model' => 'Cisco 8841',
+            'descr' => "Synthetic $i", 'http' => 'Yes', 'behaviour' => 'clean',
+        ];
+    }
+    return $out;
+}
 
 function gen(): int {
     return is_readable(GEN_FILE) ? max(1, (int)file_get_contents(GEN_FILE)) : 1;
@@ -32,6 +139,38 @@ function gen(): int {
 $uri  = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $body = file_get_contents('php://input');
 
+if ($uri === '/_conc') {
+    header('Content-Type: application/json');
+    echo is_readable(CONC_FILE) ? (string)file_get_contents(CONC_FILE) : '{"cur":0,"max":0}';
+    return;
+}
+if ($uri === '/_conc/reset') {
+    file_put_contents(CONC_FILE, json_encode(['cur' => 0, 'max' => 0]));
+    echo "reset\n";
+    return;
+}
+if (preg_match('#^/_slowmod/(\d+)$#', $uri, $m)) {
+    file_put_contents(SLOWMOD_FILE, $m[1]);
+    echo "slowmod {$m[1]}\n";
+    return;
+}
+if (preg_match('#^/_slow/(\d+)$#', $uri, $m)) {
+    file_put_contents(SLOW_FILE, $m[1]);
+    echo "slow {$m[1]}ms\n";
+    return;
+}
+if (preg_match('#^/_soft/([01])$#', $uri, $m)) {
+    file_put_contents(SOFT_FILE, $m[1]);
+    header('Content-Type: text/plain');
+    echo "soft clients {$m[1]}\n";
+    return;
+}
+if (preg_match('#^/_big/(\d+)$#', $uri, $m)) {
+    file_put_contents(BIG_FILE, $m[1]);
+    header('Content-Type: text/plain');
+    echo "big estate {$m[1]}\n";
+    return;
+}
 if (preg_match('#^/_gen/(\d+)$#', $uri, $m)) {
     file_put_contents(GEN_FILE, $m[1]);
     header('Content-Type: text/plain');
@@ -55,7 +194,7 @@ echo "no mock route for $uri\n";
 // Each phone is here to produce a specific, checkable outcome.
 // ---------------------------------------------------------------------------
 function estate(): array {
-    return [
+    return softClients() + [
         // clean baseline: both ports 100/full, no errors
         'SEP001122334401' => ['ip' => '10.10.10.1', 'status' => 'Registered', 'model' => 'Cisco 8841',
                               'descr' => 'Reception', 'http' => 'Yes', 'behaviour' => 'clean'],
@@ -231,18 +370,35 @@ function ris(string $body): void {
     preg_match('#<[^>]*MaxReturnedDevices>(\d+)<#', $body, $mx);
     $max = max(1, (int)($mx[1] ?? 1000));
 
+    // Which name patterns did the caller ask for?
+    preg_match_all('#<[^>]*Item>([^<]*)<#', $body, $im);
+    $patterns = array_values(array_filter($im[1] ?? [], fn($x) => trim($x) !== ''));
+    if (!$patterns) { $patterns = ['*']; }
+    $narrowed = !(count($patterns) === 1 && $patterns[0] === '*');
+
+    $source = bigCount() > 0 ? bigEstate() : estate();
     $all = [];
-    foreach (estate() as $name => $e) {
+    foreach ($source as $name => $e) {
         if ($want !== 'Any' && strcasecmp($e['status'], $want) !== 0) { continue; }
-        $all[$name] = $e;
+        foreach ($patterns as $pat) {
+            $re = '/^' . str_replace('\*', '.*', preg_quote($pat, '/')) . '$/i';
+            if (preg_match($re, $name)) { $all[$name] = $e; break; }
+        }
     }
+
+    // The cap only bites an unnarrowed query, which is what makes splitting
+    // by name prefix a workaround rather than a coincidence.
+    $trueTotal = count($all);
+    $capped    = (bigCount() > 0 && !$narrowed) ? BIG_CAP : PHP_INT_MAX;
 
     // Page deliberately at 3 devices regardless of MaxReturnedDevices, so
     // StateInfo paging is exercised even on a small fixture estate.
-    $pageSize = min($max, 3);
+    $pageSize = min($max, bigCount() > 0 ? 50 : 3);
     $offset   = $state === '' ? 0 : (int)$state;
-    $slice    = array_slice($all, $offset, $pageSize, true);
-    $next     = ($offset + $pageSize) < count($all) ? (string)($offset + $pageSize) : '';
+    $reachable = min(count($all), $capped);
+    $slice    = array_slice($all, $offset, min($pageSize, max(0, $reachable - $offset)), true);
+    // StateInfo simply stops once the cap is reached: no error, no warning.
+    $next     = ($offset + $pageSize) < $reachable ? (string)($offset + $pageSize) : '';
 
     $xml = '';
     foreach ($slice as $name => $e) {
@@ -261,7 +417,7 @@ function ris(string $body): void {
     }
     soap_out('<ns:selectCmDeviceResponse xmlns:ns="http://schemas.cisco.com/ast/soap">'
            . '<selectCmDeviceReturn><SelectCmDeviceResult>'
-           . '<TotalDevicesFound>' . count($all) . '</TotalDevicesFound>'
+           . '<TotalDevicesFound>' . $trueTotal . '</TotalDevicesFound>'
            . '<CmNodes><item><Name>CUCM-SUB1</Name><NoChange>false</NoChange>'
            . '<CmDevices>' . $xml . '</CmDevices></item></CmNodes>'
            . '</SelectCmDeviceResult><StateInfo>' . $next . '</StateInfo>'
@@ -270,10 +426,21 @@ function ris(string $body): void {
 
 // ------------------------------------------------------------------ phones
 function phone(string $ip, string $adapter): void {
+    concEnter();
+    try {
+        phoneInner($ip, $adapter);
+    } finally {
+        concLeave();
+    }
+}
+
+function phoneInner(string $ip, string $adapter): void {
+    if (($ms = slowMs()) > 0 && isSlowPhone($ip)) { usleep($ms * 1000); }
+    $source = bigCount() > 0 ? bigEstate() + estate() : estate();
     $name = null;
-    foreach (estate() as $n => $e) { if ($e['ip'] === $ip) { $name = $n; break; } }
+    foreach ($source as $n => $e) { if ($e['ip'] === $ip) { $name = $n; break; } }
     if ($name === null) { http_response_code(404); echo 'no such phone'; return; }
-    $e = estate()[$name];
+    $e = $source[$name];
 
     if ($e['behaviour'] === 'auth' && ($_SERVER['PHP_AUTH_USER'] ?? '') === '') {
         http_response_code(401);

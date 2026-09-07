@@ -42,6 +42,34 @@
   `https://{ip}` and `http://{ip}`.
 
 ### Added
+- **`poll_device_prefixes` (default `SEP`) — only hard handsets are polled.**
+  CSF/TCT/BOT/TAB Jabber clients, CIPC and ATA adapters have no switch or PC
+  port, so there is nothing to collect from them; more importantly a Jabber
+  client registers from the *user's workstation*, so an unfiltered sweep
+  fired an HTTPS request at every desk in the estate. `--all-devices` or an
+  explicit `--device-prefixes` list overrides. The skip is reported with a
+  per-prefix breakdown.
+- `--match` accepts `field:value` to scope the search to one field.
+  `--match` remains a substring search across name/description/model/ip, so
+  `--match SEP` legitimately matches `CSFJOSEPH` (JO-SEP-H); the docs and
+  `--help` now say so, a test pins the behaviour, and `--device-prefixes` is
+  pointed to as the anchored alternative.
+- **Partitioned RisPort enumeration** (`ris_partitions`, default `auto`).
+  RisPort caps a single `selectCmDevice` conversation without saying so -
+  `StateInfo` stops arriving and the truncated answer looks complete. The
+  returned count is now compared against the cluster's own
+  `TotalDevicesFound`, and a short answer triggers a re-run split by
+  device-name prefix, merged by name. Truncation is warned about, never
+  swallowed.
+- Discovery reports **per server**: devices returned, new-unique, and the
+  per-node `CmNodes` breakdown - a single total cannot show which of several
+  clusters came up short.
+- `exclude_subnets` / `--exclude-subnet CIDR[,CIDR]` on `cucm-sweep.php` and
+  `cucm-phones.php`, sharing one implementation so the listing and the sweep
+  cannot disagree about scope. Matching is byte-wise over `inet_pton`, so
+  non-byte-boundary prefixes and both address families are handled. An
+  invalid prefix is fatal, and a prefix that matched nothing is named in the
+  output.
 - `--sample N` on `cucm-sweep.php` for a random spread across the estate,
   plus `--match TEXT` (name/description/model/IP) applied before sampling.
   `--limit N` still takes the first N, which on a real cluster means one
@@ -56,6 +84,21 @@
   a complete one.
 
 ### Fixed
+- **Phone polling batched instead of streaming, and one slow handset stalled
+  nine fast ones.** `fetchMany()` split phones into chunks of
+  `phone_parallel` and ran each chunk to completion before starting the
+  next, so every chunk cost as much as its slowest member. Replaced with a
+  rolling window that refills as each request finishes. Measured on 100
+  phones with one in eight slow: **12.2s to 3.1s** at the default
+  `phone_parallel = 10`, and 1.6s at 20. Added `--parallel N`, plus progress
+  logging at `--verbose` so a long sweep does not look hung.
+- **Config values that look boolean were being destroyed by the INI parser.**
+  `parse_ini_file`'s TYPED and NORMAL scanners both turn `off`, `no`, `false`
+  and `none` into `false` or `""`, so `ris_partitions = off` became an empty
+  pattern list and discovery returned **zero** phones - from a config file
+  that reads correctly and raises no error. Now parsed with
+  `INI_SCANNER_RAW`, with the genuinely boolean settings coerced explicitly
+  (`cps_cfg_bool`, which accepts 1/0, true/false, yes/no, on/off).
 - **`&nbsp;` spacer cells corrupted parsed values.** These pages pad tables
   with `&nbsp;`, which decodes to U+00A0; PCRE's `\s` does not match U+00A0
   outside UTF-8 mode, so a cell that should test as empty did not, the

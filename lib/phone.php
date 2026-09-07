@@ -362,46 +362,98 @@ class CpsPhoneFetcher
     }
 
     /**
-     * Fetch every configured adapter from every phone, in parallel.
+     * Fetch every configured adapter from every phone.
+     *
+     * A rolling window, not batches. The previous implementation split the
+     * phones into chunks of $parallel and ran each chunk to completion
+     * before starting the next, which put a barrier between every chunk:
+     * one handset timing out at phone_timeout stalled the nine that had
+     * already answered in 200ms, so a chunk cost as much as its slowest
+     * member and 100 phones took 36 seconds. Here a finished request is
+     * replaced immediately, so slow handsets cost only their own latency
+     * and never anyone else's.
+     *
+     * The window is counted in REQUESTS - $parallel phones times the number
+     * of adapters - so "10 phones in flight" keeps meaning that however many
+     * pages each phone is asked for.
      *
      * @param array<int,array{name:string, ip:string}> $phones
      * @return array<string, array> keyed by device name
      */
     public function fetchMany(array $phones): array
     {
-        $results = [];
-        foreach (array_chunk($phones, max(1, $this->parallel)) as $chunk) {
-            $mh   = curl_multi_init();
-            $map  = [];
-            foreach ($chunk as $p) {
-                foreach ($this->adapters as $a) {
-                    $ch = $this->makeHandle($p['ip'], $a);
-                    curl_multi_add_handle($mh, $ch);
-                    $map[(int)spl_object_id($ch)] = ['phone' => $p, 'adapter' => $a, 'ch' => $ch];
-                }
-            }
-            do {
-                $status = curl_multi_exec($mh, $running);
-                if ($running) { curl_multi_select($mh, 1.0); }
-            } while ($running && $status === CURLM_OK);
+        $jobs = [];
+        foreach ($phones as $p) {
+            foreach ($this->adapters as $a) { $jobs[] = ['phone' => $p, 'adapter' => $a]; }
+        }
+        $total = count($jobs);
+        if ($total === 0) { return []; }
 
-            foreach ($map as $entry) {
-                $ch      = $entry['ch'];
-                $phone   = $entry['phone'];
-                $adapter = $entry['adapter'];
-                $name    = $phone['name'];
-                $body    = curl_multi_getcontent($ch);
-                $errno   = curl_errno($ch);
-                $err     = curl_error($ch);
-                $code    = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $window  = max(1, $this->parallel) * max(1, count($this->adapters));
+        $mh      = curl_multi_init();
+        $inFlight = [];
+        $results = [];
+        $next    = 0;
+        $done    = 0;
+        $t0      = microtime(true);
+        $step    = max(50, (int)($total / 20));   // ~20 progress lines, at most
+
+        $launch = function () use (&$next, &$inFlight, $jobs, $mh, $total) {
+            if ($next >= $total) { return false; }
+            $job = $jobs[$next++];
+            $ch  = $this->makeHandle($job['phone']['ip'], $job['adapter']);
+            curl_multi_add_handle($mh, $ch);
+            $inFlight[spl_object_id($ch)] = $job + ['ch' => $ch];
+            return true;
+        };
+
+        while (count($inFlight) < $window && $launch()) { /* prime the window */ }
+
+        while ($inFlight) {
+            $status = curl_multi_exec($mh, $running);
+            if ($status !== CURLM_OK) {
+                cps_warn('curl_multi_exec failed: ' . curl_multi_strerror($status));
+                break;
+            }
+
+            while (($info = curl_multi_info_read($mh)) !== false) {
+                $ch  = $info['handle'];
+                $id  = spl_object_id($ch);
+                $job = $inFlight[$id] ?? null;
+                // Drop the map entry BEFORE closing: spl_object_id is reused
+                // once a handle is freed, and a stale entry would then be
+                // overwritten by the next request's job.
+                unset($inFlight[$id]);
+
+                if ($job !== null) {
+                    $name = $job['phone']['name'];
+                    $results[$name]['phone'] = $job['phone'];
+                    $results[$name]['pages'][$job['adapter']] = $this->interpret(
+                        (string)curl_multi_getcontent($ch),
+                        curl_errno($ch), curl_error($ch),
+                        (int)curl_getinfo($ch, CURLINFO_HTTP_CODE)
+                    );
+                }
                 curl_multi_remove_handle($mh, $ch);
                 curl_close($ch);
 
-                $results[$name]['phone'] = $phone;
-                $results[$name]['pages'][$adapter] = $this->interpret($body, $errno, $err, $code);
+                $done++;
+                if ($done % $step === 0) {
+                    $rate = $done / max(0.001, microtime(true) - $t0);
+                    cps_log(sprintf('  %d/%d requests (%.0f/s, ~%ds left)',
+                        $done, $total, $rate, (int)(($total - $done) / max(0.01, $rate))), 2);
+                }
+                $launch();   // refill the window straight away
             }
-            curl_multi_close($mh);
+
+            // Only block once nothing is completable; with a full window and
+            // nothing ready this is where the time is legitimately spent.
+            if ($inFlight && $running) { curl_multi_select($mh, 0.2); }
         }
+        curl_multi_close($mh);
+
+        cps_log(sprintf('fetched %d pages from %d phones in %.1fs (window %d)',
+            $total, count($phones), microtime(true) - $t0, $window), 2);
         return $results;
     }
 

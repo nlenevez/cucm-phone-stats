@@ -38,6 +38,27 @@ const CPS_RIS_PATH = '/realtimeservice2/services/RISService70';
 class CpsRisportClient
 {
     /**
+     * Name patterns used to enumerate an estate too large for one query.
+     *
+     * RisPort caps how many devices a single selectCmDevice conversation
+     * will yield, and it does not report that it has truncated - StateInfo
+     * simply stops coming and the answer looks complete. Splitting the
+     * request by device-name prefix keeps every individual query well under
+     * the cap, which is the documented way around it.
+     *
+     * SEP is split on the first hex digit of the MAC, giving 16 roughly even
+     * buckets for hard phones. The soft-client and analog prefixes follow so
+     * that a partitioned run is not silently narrower than an unpartitioned
+     * one - they have no port statistics to collect, but leaving them out
+     * here would make the two paths disagree about what exists.
+     */
+    public const DEFAULT_PARTITIONS = [
+        'SEP0*', 'SEP1*', 'SEP2*', 'SEP3*', 'SEP4*', 'SEP5*', 'SEP6*', 'SEP7*',
+        'SEP8*', 'SEP9*', 'SEPA*', 'SEPB*', 'SEPC*', 'SEPD*', 'SEPE*', 'SEPF*',
+        'CSF*', 'TCT*', 'BOT*', 'TAB*', 'ATA*', 'CIPC*', 'SIP*',
+    ];
+
+    /**
      * Diagnostics from the most recent selectCmDevice call. Populated even
      * when the result looks fine, because the interesting failure here is a
      * quiet undercount - a node that answers cleanly with a fraction of the
@@ -230,6 +251,88 @@ class CpsRisportClient
     }
 
     /**
+     * Enumerate every matching device, working around the response cap.
+     *
+     * One plain query first, because on a small cluster that is the whole
+     * answer and costs one round trip. Its TotalDevicesFound is then
+     * compared against what actually arrived: if fewer came back than the
+     * cluster says exist, the query was truncated and it is re-run split by
+     * name prefix, merging the results.
+     *
+     * That comparison is the only reliable truncation signal available. A
+     * capped response is well formed, carries no error, and simply stops
+     * producing StateInfo - so a sweep that trusts it reports a confidently
+     * wrong estate size.
+     *
+     * @param string|array $partitions 'auto', 'off', or an explicit list
+     * @return array<int,array<string,mixed>>
+     */
+    public function selectCmDeviceComplete(
+        string $status = 'Registered',
+        string $deviceClass = 'Phone',
+        string|array $partitions = 'auto',
+    ): array {
+        $mode = is_array($partitions) ? 'explicit' : strtolower(trim($partitions));
+
+        if ($mode !== 'explicit') {
+            $rows  = $this->selectCmDevice($status, $deviceClass);
+            $diag  = $this->lastDiagnostics();
+            $totals = array_map('intval', array_filter(array_column($diag['rounds'] ?? [], 'total_devices_found'), 'strlen'));
+            $claimed = $totals ? max($totals) : null;
+
+            if ($mode === 'off' || $claimed === null || count($rows) >= $claimed) {
+                $this->lastDiag['enumeration'] = [
+                    'mode' => 'single', 'returned' => count($rows),
+                    'total_devices_found' => $claimed, 'truncated' => false,
+                ];
+                return $rows;
+            }
+            cps_warn(sprintf(
+                '%s: RisPort returned %d of %d devices it says exist - re-running split by name prefix',
+                $this->soap->baseUrl(), count($rows), $claimed
+            ));
+            $patterns = self::DEFAULT_PARTITIONS;
+            $firstPass = $rows;
+            $firstClaimed = $claimed;
+        } else {
+            $patterns = $partitions;
+            $firstPass = [];
+            $firstClaimed = null;
+        }
+
+        $byName = [];
+        foreach ($firstPass as $r) { $byName[$r['name']] = $r; }
+        $perPattern = [];
+        foreach ($patterns as $pat) {
+            try {
+                $part = $this->selectCmDevice($status, $deviceClass, [$pat]);
+            } catch (Throwable $e) {
+                cps_warn("RisPort partition $pat failed: " . $e->getMessage());
+                $perPattern[$pat] = 'ERROR: ' . $e->getMessage();
+                continue;
+            }
+            $perPattern[$pat] = count($part);
+            foreach ($part as $r) {
+                if ($r['name'] !== '') { $byName[$r['name']] = $r; }
+            }
+            if ($this->requestGapMs > 0) { usleep($this->requestGapMs * 1000); }
+        }
+
+        $merged = array_values($byName);
+        $this->lastDiag['enumeration'] = [
+            'mode'                 => $mode === 'explicit' ? 'partitioned (explicit)' : 'partitioned (auto)',
+            'first_pass_returned'  => count($firstPass),
+            'total_devices_found'  => $firstClaimed,
+            'per_pattern'          => $perPattern,
+            'returned'             => count($merged),
+            'truncated'            => $firstClaimed !== null && count($merged) < $firstClaimed,
+        ];
+        cps_log(sprintf('%s: partitioned enumeration produced %d unique devices (first pass %d)',
+            $this->soap->baseUrl(), count($merged), count($firstPass)));
+        return $merged;
+    }
+
+    /**
      * Query several servers and merge, keeping the best row per device.
      *
      * "Best" = a row with an IP beats one without, and Registered beats any
@@ -240,28 +343,47 @@ class CpsRisportClient
      * @param CpsRisportClient[] $clients
      * @return array{devices: array<string,array>, errors: array<int,array>}
      */
-    public static function discover(array $clients, string $status = 'Registered', string $deviceClass = 'Phone'): array
-    {
+    public static function discover(
+        array $clients,
+        string $status = 'Registered',
+        string $deviceClass = 'Phone',
+        string|array $partitions = 'auto',
+    ): array {
         $byName = [];
         $errors = [];
+        $perServer = [];
         foreach ($clients as $c) {
             try {
-                $rows = $c->selectCmDevice($status, $deviceClass);
+                $rows = $c->selectCmDeviceComplete($status, $deviceClass, $partitions);
             } catch (Throwable $e) {
                 $errors[] = ['server' => $c->baseUrl(), 'error' => $e->getMessage()];
                 cps_warn($c->baseUrl() . ': ' . $e->getMessage());
                 continue;
             }
+            $added = 0;
             foreach ($rows as $r) {
                 $r['ris_server'] = $c->baseUrl();
                 $name = $r['name'];
                 if ($name === '') { continue; }
+                if (!isset($byName[$name])) { $added++; }
                 if (!isset($byName[$name]) || self::isBetter($r, $byName[$name])) {
                     $byName[$name] = $r;
                 }
             }
+            $diag = $c->lastDiagnostics();
+            // Per-server attribution: with more than one cluster in play, a
+            // total on its own cannot show which one came up short.
+            $perServer[$c->baseUrl()] = [
+                'returned'    => count($rows),
+                'new_unique'  => $added,
+                'nodes'       => $diag['nodes'] ?? [],
+                'enumeration' => $diag['enumeration'] ?? null,
+            ];
+            cps_log(sprintf('%s: %d devices (%d new), nodes: %s',
+                $c->baseUrl(), count($rows), $added,
+                ($diag['nodes'] ?? []) ? json_encode($diag['nodes']) : 'none reported'));
         }
-        return ['devices' => $byName, 'errors' => $errors];
+        return ['devices' => $byName, 'errors' => $errors, 'per_server' => $perServer];
     }
 
     private static function isBetter(array $new, array $old): bool

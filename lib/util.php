@@ -199,3 +199,157 @@ function cps_tri_bool(mixed $v): ?int {
     if (in_array($s, ['0', 'no', 'false', 'n', 'off', 'unsupported'], true)) { return 0; }
     return null;
 }
+
+/**
+ * Is $ip inside $cidr?
+ *
+ * Byte-wise against inet_pton output, so it is correct for both address
+ * families and for prefixes that are not on a byte boundary. A mismatch in
+ * family (an IPv4 address against an IPv6 prefix) is false, not an error -
+ * mixing the two in one exclusion list is legitimate.
+ *
+ * A bare address with no "/" is treated as a single host (/32 or /128).
+ * Host bits set in the network part are ignored: "10.1.2.5/24" matches the
+ * whole of 10.1.2.0/24, which is what someone writing that means.
+ */
+function cps_ip_in_cidr(string $ip, string $cidr): bool {
+    $cidr  = trim($cidr);
+    $slash = strrpos($cidr, '/');
+    $net   = $slash === false ? $cidr : substr($cidr, 0, $slash);
+    $bitsS = $slash === false ? null : substr($cidr, $slash + 1);
+
+    $ipBin  = @inet_pton(trim($ip));
+    $netBin = @inet_pton(trim($net));
+    if ($ipBin === false || $netBin === false) { return false; }
+    if (strlen($ipBin) !== strlen($netBin)) { return false; } // v4 vs v6
+
+    $maxBits = strlen($netBin) * 8;
+    $bits    = $bitsS === null ? $maxBits : (int)$bitsS;
+    if ($bits < 0 || $bits > $maxBits) { return false; }
+    // Guard /0 explicitly: it matches everything, and the byte loop below
+    // would otherwise compare nothing and fall through to the same answer
+    // only by accident.
+    if ($bits === 0) { return true; }
+
+    $whole = intdiv($bits, 8);
+    $rem   = $bits % 8;
+    if ($whole > 0 && strncmp($ipBin, $netBin, $whole) !== 0) { return false; }
+    if ($rem === 0) { return true; }
+    $mask = chr((0xFF << (8 - $rem)) & 0xFF);
+    return (($ipBin[$whole] & $mask) === ($netBin[$whole] & $mask));
+}
+
+/**
+ * Validate and split a comma/space separated CIDR list.
+ *
+ * Invalid entries are fatal rather than ignored. A silently dropped
+ * exclusion is the worst outcome here: the operator believes a subnet is
+ * being left alone, the tool polls it anyway, and nothing in the output
+ * says so. Better to refuse to start.
+ *
+ * @return string[]
+ */
+function cps_parse_cidr_list(string $list, string $label = 'subnet list'): array {
+    $out = [];
+    foreach (preg_split('/[\s,]+/', trim($list), -1, PREG_SPLIT_NO_EMPTY) as $entry) {
+        $slash = strrpos($entry, '/');
+        $net   = $slash === false ? $entry : substr($entry, 0, $slash);
+        $bitsS = $slash === false ? null : substr($entry, $slash + 1);
+        $bin   = @inet_pton($net);
+        if ($bin === false) {
+            cps_die("$label: '$entry' is not a valid address or CIDR");
+        }
+        if ($bitsS !== null) {
+            if ($bitsS === '' || !ctype_digit($bitsS)) {
+                cps_die("$label: '$entry' has a non-numeric prefix length");
+            }
+            $max = strlen($bin) * 8;
+            if ((int)$bitsS > $max) {
+                cps_die("$label: '$entry' prefix length exceeds /$max for this address family");
+            }
+        }
+        $out[] = $entry;
+    }
+    return $out;
+}
+
+/**
+ * Split rows into kept and excluded by CIDR, recording which prefix matched.
+ *
+ * Returns the excluded rows too, so a caller can say what it dropped and
+ * why. A filter that shrinks the estate without saying so is how a partial
+ * sweep gets mistaken for a complete one.
+ *
+ * @param array<int,array<string,mixed>> $rows
+ * @return array{kept: array, excluded: array, by_cidr: array<string,int>}
+ */
+function cps_filter_by_cidr(array $rows, array $cidrs, string $ipField = 'ip'): array {
+    if (!$cidrs) { return ['kept' => $rows, 'excluded' => [], 'by_cidr' => []]; }
+    $kept = $excluded = [];
+    $byCidr = array_fill_keys($cidrs, 0);
+    foreach ($rows as $r) {
+        $ip = (string)($r[$ipField] ?? '');
+        $hit = null;
+        if ($ip !== '') {
+            foreach ($cidrs as $c) {
+                if (cps_ip_in_cidr($ip, $c)) { $hit = $c; break; }
+            }
+        }
+        if ($hit === null) {
+            $kept[] = $r;
+        } else {
+            $r['excluded_by'] = $hit;
+            $excluded[] = $r;
+            $byCidr[$hit]++;
+        }
+    }
+    return ['kept' => $kept, 'excluded' => $excluded, 'by_cidr' => $byCidr];
+}
+
+/**
+ * Cisco device-name prefixes, longest-first so no prefix shadows another.
+ *
+ * SEP is a hard handset. The rest are soft clients and analog adapters:
+ * CSF (Jabber desktop), TCT (iPhone), BOT (Android), TAB (tablet),
+ * CIPC (the old IP Communicator), ATA (analog adapter), SIP/IMS (third
+ * party). None of the non-SEP kinds have a switch port or a PC port, so
+ * none of them have port statistics to collect.
+ */
+const CPS_DEVICE_PREFIXES = ['CIPC', 'SEP', 'CSF', 'TCT', 'BOT', 'TAB', 'ATA', 'SIP', 'IMS'];
+
+/** The device-name prefix of a device, or 'other' if unrecognised. */
+function cps_device_prefix(string $name): string {
+    foreach (CPS_DEVICE_PREFIXES as $p) {
+        if (stripos($name, $p) === 0) { return $p; }
+    }
+    return 'other';
+}
+
+/**
+ * Split rows by device-name prefix.
+ *
+ * @param string[] $prefixes kept prefixes; empty means keep everything
+ * @return array{kept: array, excluded: array, by_prefix: array<string,int>}
+ */
+function cps_filter_by_device_prefix(array $rows, array $prefixes, string $nameField = 'name'): array {
+    if (!$prefixes) { return ['kept' => $rows, 'excluded' => [], 'by_prefix' => []]; }
+    $want = array_map('strtoupper', $prefixes);
+    $kept = $excluded = [];
+    $byPrefix = [];
+    foreach ($rows as $r) {
+        $name = (string)($r[$nameField] ?? '');
+        $hit  = false;
+        foreach ($want as $p) {
+            if (stripos($name, $p) === 0) { $hit = true; break; }
+        }
+        if ($hit) {
+            $kept[] = $r;
+        } else {
+            $excluded[] = $r;
+            $k = cps_device_prefix($name);
+            $byPrefix[$k] = ($byPrefix[$k] ?? 0) + 1;
+        }
+    }
+    arsort($byPrefix);
+    return ['kept' => $kept, 'excluded' => $excluded, 'by_prefix' => $byPrefix];
+}

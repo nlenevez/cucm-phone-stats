@@ -37,6 +37,15 @@ soap_timeout   = 60
 ris_gap_ms     = 4000
 ris_max_devices = 1000
 
+; How to enumerate an estate larger than one RisPort response will carry.
+; RisPort caps a single selectCmDevice conversation and does NOT say it has
+; truncated - StateInfo just stops and the short answer looks complete.
+;   auto  (default) one plain query; if it returns fewer devices than
+;                   TotalDevicesFound claims, re-run split by name prefix
+;   off             never split (use only to reproduce the truncation)
+;   <list>          explicit patterns, e.g. "SEP0*,SEP1*,SEP2*"
+ris_partitions = auto
+
 ; --------------------------------------------------------------- phones ---
 ; "{ip}" is replaced with each phone's address. Use http://{ip} if the
 ; estate has not enabled HTTPS on the handsets.
@@ -47,12 +56,30 @@ phone_pass     =
 phone_pass_file =
 phone_pass_env  =
 
+; Device-name prefixes worth polling. SEP is a hard handset; CSF/TCT/BOT/TAB
+; are Jabber clients, CIPC a softphone, ATA an analog adapter - none of which
+; have a switch or PC port to report on. A Jabber client also registers from
+; the USER'S WORKSTATION, so polling one means an HTTPS request at someone's
+; desk. Blank = poll everything; --all-devices overrides for a single run.
+poll_device_prefixes = SEP
+
+; Subnets to leave alone entirely, comma separated CIDR. Applies to both
+; discovery and sweeps. An invalid entry stops the run rather than being
+; ignored, and a prefix matching nothing is reported - a silently dropped
+; exclusion would let the tool poll a subnet you believe is off limits.
+; exclude_subnets = 10.20.0.0/16, 10.30.4.0/24
+exclude_subnets =
+
 ; Schemes bin/cucm-probe.php tries when probing a handset directly.
 ; If every phone is HTTPS, set this to "https" - the http attempts do not
 ; fail fast, they TIME OUT, costing phone_timeout twice per probe run.
 ; This has no effect on collection: sweeps only ever use phone_url_base.
 phone_probe_schemes = https,http
 
+; Phones in flight at once. Requests roll: as one finishes another starts,
+; so a handset that times out costs only its own latency. Measured on 100
+; phones with one in eight slow: 5 -> 4.6s, 10 -> 3.1s, 20 -> 1.6s, then it
+; plateaus. 20-25 is reasonable for a large estate.
 phone_parallel = 10
 phone_timeout  = 10
 phone_connect_timeout = 5

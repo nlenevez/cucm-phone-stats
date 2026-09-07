@@ -137,9 +137,115 @@ On an estate of thousands, do not sweep the lot to find out whether it works:
 
 ```bash
 php bin/cucm-sweep.php --sample 20 --no-db          # 20 random phones, nothing stored
-php bin/cucm-sweep.php --match SEP0011 --sample 5   # narrow first, then sample
+php bin/cucm-sweep.php --match Warehouse --sample 5  # narrow first, then sample
 php bin/cucm-sweep.php --sample 50                  # 50 random, stored as a real sweep
 ```
+
+### Large estates: the RisPort response cap
+
+RisPort caps how many devices one `selectCmDevice` conversation yields, and
+**it does not report that it truncated** — `StateInfo` simply stops arriving,
+so a short answer is well formed, error free and indistinguishable from a
+complete one. On a multi-thousand-phone cluster that means a confidently
+wrong estate size.
+
+The only reliable signal is the cluster's own `TotalDevicesFound` against
+what actually arrived. `ris_partitions = auto` (the default) does one plain
+query, compares the two, and if it came up short re-runs the enumeration
+split by device-name prefix — 16 buckets on the first hex digit of the MAC
+for `SEP*`, plus the soft-client prefixes — merging by device name. The
+truncation is logged rather than swallowed:
+
+```
+WARN: https://cucm1: RisPort returned 120 of 300 devices it says exist -
+      re-running split by name prefix
+```
+
+Discovery also reports **per server**: how many devices each one returned,
+how many were new, and the per-node breakdown from `CmNodes`. With more than
+one cluster in play, a single total cannot show which one came up short.
+
+Set `ris_partitions = off` to reproduce the untruncated behaviour, or give an
+explicit pattern list.
+
+### Speed
+
+Phones are fetched through a **rolling window** of `phone_parallel`
+concurrent requests (default 10, `--parallel N` to override). A finished
+request is replaced immediately, so a handset that times out costs only its
+own latency and never holds up phones that already answered.
+
+Measured on 100 phones, one in eight slow (1.5s), one adapter each:
+
+| `--parallel` | Elapsed |
+|---|---|
+| batched (previous behaviour) | 12.2s |
+| 5 | 4.6s |
+| **10 (default)** | **3.1s** |
+| 20 | 1.6s |
+| 30 | 1.6s |
+
+It plateaus once the window is wide enough that the slow handsets overlap;
+past that you are bounded by their own latency. **20–25 is a reasonable
+setting for a large estate.** The other lever is `adapters` — each one is a
+separate request per phone, so trimming `adapters` to `network,access`
+halves the work against the four-adapter default.
+
+### Which devices get polled
+
+By default only **`SEP*`** devices — hard handsets. Everything else CUCM
+registers has no switch port and no PC port, so there are no port statistics
+to collect from it:
+
+| Prefix | What it is | Has ports? |
+|---|---|---|
+| `SEP` | desk handset | **yes** |
+| `CSF` / `TCT` / `BOT` / `TAB` | Jabber desktop / iPhone / Android / tablet | no |
+| `CIPC` | IP Communicator softphone | no |
+| `ATA` | analog adapter | no |
+
+This matters beyond tidiness: **a Jabber client registers from the user's
+workstation**, so an unfiltered sweep of a few thousand devices fires an
+HTTPS request at every desk in the estate. Nothing about the *address* says
+not to poll it — only the device name does.
+
+```ini
+poll_device_prefixes = SEP          # cucm.conf; blank polls everything
+```
+```bash
+php bin/cucm-sweep.php --all-devices             # poll everything, once
+php bin/cucm-sweep.php --device-prefixes SEP,ATA # explicit list
+```
+
+The skip is always reported with a per-prefix breakdown, so the count is
+explained rather than mysteriously short:
+
+```
+4 device(s) skipped as not SEP (CSF=1, TCT=1, BOT=1, ATA=1) - no ports to poll
+```
+
+That line is also the answer to "CUCM says 3,000 devices and I only see
+2,000": the difference is soft clients.
+
+### Leaving subnets alone
+
+```ini
+exclude_subnets = 10.20.0.0/16, 10.30.4.0/24     # cucm.conf
+```
+```bash
+php bin/cucm-sweep.php  --exclude-subnet 10.20.0.0/16,10.30.4.0/24
+php bin/cucm-phones.php --exclude-subnet 10.20.0.0/16
+```
+
+Applies to discovery and sweeps alike, and both tools share one
+implementation — if the listing and the sweep disagreed about scope, a CSV
+carried between them would quietly put the excluded phones back.
+
+Two deliberate behaviours: an **invalid prefix is fatal**, never ignored
+(a silently dropped exclusion means the tool polls a subnet you believe is
+off limits and nothing says so), and a prefix that **matched nothing is
+called out by name**, since a zero is how you find out a CIDR is wrong or
+the estate has moved.
 
 `--sample N` takes a **random** spread; `--limit N` takes the **first** N.
 They are not the same test. RisPort returns devices grouped by node, so the
@@ -147,6 +253,12 @@ first N are typically all from one subscriber, one site, often one switch —
 the population least likely to show up a problem only part of the estate
 has. `--match` filters on name, description, model or IP and is applied
 before sampling.
+
+**`--match` is a substring search, not a device-type filter.** `--match SEP`
+also matches `CSFJOSEPH`, because JO-**SEP**-H contains it — a Jabber client
+belonging to anyone called Joseph. Use `--device-prefixes` for device types
+(it anchors to the start of the name), or scope the search to one field with
+`--match name:SEP0`.
 
 ## Reports
 

@@ -30,12 +30,33 @@ const CPS_DEFAULTS = [
     'soap_timeout'    => 60,
     'ris_gap_ms'      => 4000,
     'ris_max_devices' => 1000,
+    // How to enumerate an estate larger than one RisPort response:
+    //   auto (default) - one plain query, and if it returns fewer devices
+    //                    than TotalDevicesFound claims, re-run split by name
+    //   off            - never split; accept whatever one query returns
+    //   <list>         - explicit patterns, e.g. "SEP0*,SEP1*,..."
+    'ris_partitions'  => 'auto',
 
     'phone_url_base'  => 'https://{ip}',
     'phone_user'      => '',
     'phone_pass'      => '',
     'phone_pass_file' => '',
     'phone_pass_env'  => '',
+    // Device-name prefixes worth polling. Defaults to SEP - hard handsets.
+    // Everything else CUCM registers (CSF/TCT/BOT/TAB Jabber clients, CIPC,
+    // ATA analog adapters) has no switch port and no PC port, so there are
+    // no port statistics to collect from it. It matters more than tidiness:
+    // a Jabber client's registered address is the USER'S WORKSTATION, so an
+    // unfiltered sweep fires an HTTPS request at every desk in the estate.
+    // Blank means poll everything; --all-devices overrides for one run.
+    'poll_device_prefixes' => 'SEP',
+
+    // Subnets to leave alone, comma separated CIDR (e.g. "10.20.0.0/16,
+    // 10.30.4.0/24"). Applies to discovery and sweeps alike. An invalid
+    // entry is fatal rather than ignored - a silently dropped exclusion
+    // would let the tool poll a subnet you believe is off limits.
+    'exclude_subnets' => '',
+
     // Schemes bin/cucm-probe.php tries when probing a handset. An estate
     // that is entirely HTTPS should set this to "https": the http attempts
     // do not fail fast, they time out, costing phone_timeout twice per run.
@@ -68,9 +89,28 @@ function cps_load_config(?string $file): array
     }
     if ($file !== null) {
         if (!is_readable($file)) { cps_die("config file not readable: $file"); }
-        $ini = parse_ini_file($file, false, INI_SCANNER_TYPED);
+        // INI_SCANNER_RAW, deliberately.
+        //
+        // The TYPED and NORMAL scanners both reinterpret a value that merely
+        // LOOKS boolean: "off", "no", "false" and "none" come back as false
+        // or "". That silently turned `ris_partitions = off` into an empty
+        // pattern list, so discovery queried nothing and reported zero
+        // phones - a config file that reads correctly, produces no error,
+        // and disables the tool. RAW keeps every value as written; the few
+        // settings that are genuinely boolean or numeric are coerced
+        // explicitly at the point of use.
+        $ini = parse_ini_file($file, false, INI_SCANNER_RAW);
         if ($ini === false) { cps_die("config file is not valid INI: $file"); }
-        foreach ($ini as $k => $v) { $cfg[strtolower($k)] = $v; }
+        foreach ($ini as $k => $v) {
+            if (is_string($v)) {
+                $v = trim($v);
+                // RAW keeps surrounding quotes; strip one matched pair.
+                if (strlen($v) > 1 && ($v[0] === '"' || $v[0] === "'") && $v[-1] === $v[0]) {
+                    $v = substr($v, 1, -1);
+                }
+            }
+            $cfg[strtolower($k)] = $v;
+        }
         cps_log("config loaded from $file", 2);
     }
 
@@ -89,6 +129,22 @@ function cps_load_config(?string $file): array
         );
     }
     return $cfg;
+}
+
+/**
+ * Read a config value that is meant to be a boolean.
+ *
+ * Accepts 1/0, true/false, yes/no, on/off. Anything unrecognised falls back
+ * to $default rather than to PHP's cast, under which the string "false"
+ * is true.
+ */
+function cps_cfg_bool(array $cfg, string $key, bool $default = false): bool
+{
+    $v = $cfg[$key] ?? null;
+    if (is_bool($v)) { return $v; }
+    if ($v === null || $v === '') { return $default; }
+    $t = cps_tri_bool(is_scalar($v) ? (string)$v : '');
+    return $t === null ? $default : (bool)$t;
 }
 
 function cps_resolve_secret(string $inline, string $file, string $envName, string $label): string
@@ -123,7 +179,7 @@ function cps_soap_for(array $cfg, string $baseUrl): CpsSoapClient
         $baseUrl,
         (string)$cfg['axl_user'],
         (string)$cfg['axl_pass'],
-        (bool)$cfg['verify_tls'],
+        cps_cfg_bool($cfg, 'verify_tls'),
         (int)$cfg['soap_timeout'],
         10,
         ((string)$cfg['ca_bundle']) !== '' ? (string)$cfg['ca_bundle'] : null,
@@ -164,7 +220,7 @@ function cps_phone_fetcher(array $cfg, ?array $adapters = null): CpsPhoneFetcher
         (string)$cfg['phone_url_base'],
         ((string)$cfg['phone_user']) !== '' ? (string)$cfg['phone_user'] : null,
         (string)$cfg['phone_pass'],
-        (bool)$cfg['verify_tls'],
+        cps_cfg_bool($cfg, 'verify_tls'),
         (int)$cfg['phone_timeout'],
         (int)$cfg['phone_connect_timeout'],
         (int)$cfg['phone_parallel'],

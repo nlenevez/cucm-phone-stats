@@ -7,13 +7,14 @@
  * Usage:
  *   php bin/cucm-sweep.php [--config FILE] [--status Registered] [--source risport|axl-sql]
  *                          [--adapters network,access,ethernet,device]
- *                          [--sample N] [--limit N] [--match TEXT]
+ *                          [--sample N] [--limit N] [--match TEXT] [--exclude-subnet CIDR]
  *                          [--no-db] [--json] [--skip-no-http] [--verbose]
  *
  * Examples:
  *   php bin/cucm-sweep.php                            # full sweep into the database
  *   php bin/cucm-sweep.php --sample 20 --no-db        # 20 random phones, nothing stored
- *   php bin/cucm-sweep.php --match SEP00112233 --sample 5
+ *   php bin/cucm-sweep.php --match Warehouse --sample 5     # by description
+ *   php bin/cucm-sweep.php --match name:SEP0011            # scoped to one field
  *   php bin/cucm-sweep.php --limit 5 --no-db --json   # the FIRST five (one node, one site)
  *   php bin/cucm-sweep.php --phones-from phones.csv   # poll a list, skip CUCM
  *
@@ -29,7 +30,7 @@ require_once dirname(__DIR__) . '/lib/config.php';
 require_once dirname(__DIR__) . '/lib/discover.php';
 require_once dirname(__DIR__) . '/lib/db.php';
 
-$p    = cps_parse_args($argv, ['json', 'no-db', 'verbose', 'quiet', 'debug', 'skip-no-http', 'help']);
+$p    = cps_parse_args($argv, ['json', 'no-db', 'verbose', 'quiet', 'debug', 'skip-no-http', 'all-devices', 'help']);
 $opts = $p['opts'];
 
 if (!empty($opts['help'])) {
@@ -38,7 +39,13 @@ if (!empty($opts['help'])) {
                  . "       [--phones-from FILE] [--no-db] [--json] [--skip-no-http] [--verbose]\n"
                  . "\n  --sample N   N random phones (use this on a large estate)\n"
                  . "  --limit N    the first N discovered (usually all one node)\n"
-                 . "  --match TEXT substring filter on name/description/model/ip, applied first\n");
+                 . "  --match TEXT substring on name/description/model/ip; 'field:value' scopes it\n"
+                 . "               (for device TYPES use --device-prefixes: --match SEP also\n"
+                 . "                hits CSFJOSEPH, since JO-SEP-H contains it)\n"
+                 . "  --exclude-subnet CIDR[,CIDR]  leave these subnets alone\n"
+                 . "  --device-prefixes SEP[,CSF]   device types to poll (default SEP)\n"
+                 . "  --all-devices                 poll every registered device, soft clients included\n"
+                 . "  --parallel N                  phones in flight at once (default 10)\n");
     exit(0);
 }
 
@@ -48,7 +55,7 @@ $source   = is_string($opts['source'] ?? null) ? $opts['source'] : 'risport';
 $limit    = isset($opts['limit']) && is_string($opts['limit']) ? (int)$opts['limit'] : 0;
 $sample   = isset($opts['sample']) && is_string($opts['sample']) ? (int)$opts['sample'] : 0;
 $match    = is_string($opts['match'] ?? null) ? $opts['match'] : null;
-$useDb    = empty($opts['no-db']) && (bool)$cfg['db_enabled'];
+$useDb    = empty($opts['no-db']) && cps_cfg_bool($cfg, 'db_enabled', true);
 $adapters = is_string($opts['adapters'] ?? null)
     ? preg_split('/[\s,]+/', $opts['adapters'], -1, PREG_SPLIT_NO_EMPTY)
     : preg_split('/[\s,]+/', (string)$cfg['adapters'], -1, PREG_SPLIT_NO_EMPTY);
@@ -64,6 +71,8 @@ if (isset($opts['phones-from']) && is_string($opts['phones-from'])) {
     $phones = cps_discover_phones($cfg, $source, $status);
     cps_log(count($phones) . " phones discovered from CUCM (status=$status, source=$source)");
 }
+$phones     = cps_apply_device_prefixes($phones, $cfg, $opts);
+$phones     = cps_apply_subnet_exclusions($phones, $cfg, $opts);
 $discovered = count($phones);
 
 $pollable = array_values(array_filter($phones, function ($r) use ($opts) {
@@ -79,14 +88,31 @@ $pollable = array_values(array_filter($phones, function ($r) use ($opts) {
 // "--match SEP0011 --sample 20" means twenty of THAT set, not twenty of the
 // estate that happen to match.
 if ($match !== null && $match !== '') {
+    // --match is a SUBSTRING search, and across several fields. That is
+    // useful for "everything at the Warehouse" and a trap for device types:
+    // "--match SEP" also matches CSFJOSEPH, because JO-SEP-H contains it.
+    // Use --device-prefixes for device types; it anchors to the name.
+    //
+    // "field:value" scopes the search to one field for the cases where the
+    // broad form is too broad.
+    $fields = ['name', 'description', 'model', 'ip'];
     $needle = mb_strtolower($match);
-    $pollable = array_values(array_filter($pollable, function ($r) use ($needle) {
-        foreach (['name', 'description', 'model', 'ip'] as $f) {
+    $scope  = $fields;
+    if (($c = strpos($match, ':')) !== false) {
+        $maybe = mb_strtolower(substr($match, 0, $c));
+        if (in_array($maybe, $fields, true)) {
+            $scope  = [$maybe];
+            $needle = mb_strtolower(substr($match, $c + 1));
+        }
+    }
+    $pollable = array_values(array_filter($pollable, function ($r) use ($needle, $scope) {
+        foreach ($scope as $f) {
             if (str_contains(mb_strtolower((string)($r[$f] ?? '')), $needle)) { return true; }
         }
         return false;
     }));
-    cps_log(count($pollable) . " phones match '$match'");
+    cps_log(sprintf("%d phones match '%s' (%s)", count($pollable), $match,
+        count($scope) === 1 ? $scope[0] . ' only' : 'substring across ' . implode('/', $fields)));
 }
 
 // --sample takes a random spread; --limit takes the first N.
@@ -118,6 +144,9 @@ if ($useDb) {
     cps_log("sweep #$sweepId opened");
 }
 
+if (isset($opts['parallel']) && is_string($opts['parallel'])) {
+    $cfg['phone_parallel'] = max(1, (int)$opts['parallel']);
+}
 $fetcher = cps_phone_fetcher($cfg, $adapters);
 $results = $fetcher->fetchMany(array_map(fn($r) => ['name' => $r['name'], 'ip' => $r['ip']], $pollable));
 cps_log(sprintf('polled %d phones in %.1fs', count($results), microtime(true) - $t0));

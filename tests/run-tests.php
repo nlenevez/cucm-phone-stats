@@ -102,6 +102,76 @@ foreach (['2-column' => $two, '3-column with ":"' => $three, 'padded spacers' =>
 // Negative control: a row with only one cell is not a stat.
 eq('single-cell row ignored', cps_parse_stats_html('<table><tr><td>Heading</td></tr></table>'), []);
 
+section('unit: device-name prefixes');
+eq('SEP is a hard phone',        cps_device_prefix('SEP001122334455'), 'SEP');
+eq('CSF is a Jabber desktop',    cps_device_prefix('CSFJOSEPH'), 'CSF');
+eq('TCT is Jabber for iPhone',   cps_device_prefix('TCTJSMITH'), 'TCT');
+eq('CIPC not shadowed by a shorter prefix', cps_device_prefix('CIPCJSMITH'), 'CIPC');
+eq('ATA analog adapter',         cps_device_prefix('ATA001122335501'), 'ATA');
+eq('unknown name buckets as other', cps_device_prefix('WEIRDNAME'), 'other');
+// Case must not decide the answer: CUCM names are conventionally upper, but
+// nothing enforces it.
+eq('lowercase still matches',    cps_device_prefix('sep001122334455'), 'SEP');
+
+$rows = [['name' => 'SEP001122334401'], ['name' => 'CSFJOSEPH'], ['name' => 'TCTJSMITH'], ['name' => 'SEP001122334402']];
+$f = cps_filter_by_device_prefix($rows, ['SEP']);
+eq('SEP filter keeps the handsets', count($f['kept']), 2);
+eq('SEP filter drops the soft clients', count($f['excluded']), 2);
+eq('exclusions are counted per prefix', $f['by_prefix'], ['CSF' => 1, 'TCT' => 1]);
+eq('an empty prefix list keeps everything', count(cps_filter_by_device_prefix($rows, [])['kept']), 4);
+
+section('unit: config values that look boolean');
+// parse_ini_file's TYPED and NORMAL scanners turn "off"/"no"/"false"/"none"
+// into false or "". That silently emptied ris_partitions and made discovery
+// return nothing, so these guard the RAW scanner staying in place.
+$tmpConf = sys_get_temp_dir() . '/cps-bool-test.conf';
+file_put_contents($tmpConf, "ris_partitions = off\nadapters = network\nverify_tls = off\nphone_url_base = https://{ip}\ndb_name = none\n");
+$bc = cps_load_config($tmpConf);
+eq('"off" survives as the string "off"', $bc['ris_partitions'], 'off');
+eq('"none" is not turned into null', $bc['db_name'], 'none');
+eq('verify_tls = off reads as false', cps_cfg_bool($bc, 'verify_tls'), false);
+file_put_contents($tmpConf, "verify_tls = true\ndb_enabled = 0\n");
+$bc = cps_load_config($tmpConf);
+eq('verify_tls = true reads as true', cps_cfg_bool($bc, 'verify_tls'), true);
+eq('db_enabled = 0 reads as false', cps_cfg_bool($bc, 'db_enabled', true), false);
+file_put_contents($tmpConf, "phone_url_base = \"https://{ip}:8443\"\n");
+$bc = cps_load_config($tmpConf);
+eq('quoted values have their quotes stripped', $bc['phone_url_base'], 'https://{ip}:8443');
+@unlink($tmpConf);
+
+section('unit: CIDR matching');
+$cidrCases = [
+    ['10.10.10.5',  '10.10.10.0/24', true],
+    ['10.10.11.5',  '10.10.10.0/24', false],
+    ['10.10.10.5',  '10.10.10.5/32', true],
+    ['10.10.10.6',  '10.10.10.5/32', false],
+    ['10.10.10.5',  '10.10.10.5',    true],   // bare address == /32
+    ['192.168.1.1', '0.0.0.0/0',     true],   // /0 matches everything
+    ['10.10.10.6',  '10.10.10.4/30', true],   // .4-.7
+    ['10.10.10.8',  '10.10.10.4/30', false],
+    ['10.1.2.3',    '10.0.0.0/8',    true],
+    ['11.1.2.3',    '10.0.0.0/8',    false],
+    ['10.10.10.130','10.10.10.128/25', true], // non-byte-boundary prefix
+    ['10.10.10.127','10.10.10.128/25', false],
+];
+foreach ($cidrCases as [$ip, $cidr, $want]) {
+    eq("$ip in $cidr", cps_ip_in_cidr($ip, $cidr), $want);
+}
+// Family mismatch is false, not a crash or a wrong true.
+eq('IPv4 against an IPv6 prefix', cps_ip_in_cidr('10.0.0.1', '2001:db8::/32'), false);
+eq('IPv6 against an IPv4 prefix', cps_ip_in_cidr('2001:db8::1', '10.0.0.0/8'), false);
+eq('garbage address', cps_ip_in_cidr('not-an-ip', '10.0.0.0/8'), false);
+eq('empty address', cps_ip_in_cidr('', '10.0.0.0/8'), false);
+
+$f = cps_filter_by_cidr(
+    [['ip' => '10.0.0.1'], ['ip' => '10.1.0.1'], ['ip' => ''], ['ip' => '10.0.0.9']],
+    ['10.0.0.0/24']
+);
+eq('filter keeps non-matching and IP-less rows', count($f['kept']), 2);
+eq('filter excludes matching rows', count($f['excluded']), 2);
+eq('filter counts per prefix', $f['by_cidr']['10.0.0.0/24'], 2);
+eq('excluded rows record which prefix hit', $f['excluded'][0]['excluded_by'], '10.0.0.0/24');
+
 section('unit: phone URL construction');
 ok('IPv4 unbracketed',
    str_contains(cps_phone_url('10.0.0.5', 'a'), 'https://10.0.0.5/CGI/'), cps_phone_url('10.0.0.5','a'));
@@ -148,8 +218,11 @@ $root = dirname(__DIR__);
 
 section("integration: starting mock CUCM on 127.0.0.1:$port");
 $desc = [1 => ['file', '/tmp/cps-mock.log', 'a'], 2 => ['file', '/tmp/cps-mock.log', 'a']];
+// PHP_CLI_SERVER_WORKERS: without it the built-in server handles one
+// request at a time and every concurrency assertion below would pass or
+// fail for reasons having nothing to do with the client.
 $srv  = proc_open(
-    sprintf('exec php -S 127.0.0.1:%d %s', $port, escapeshellarg(__DIR__ . '/mock-server.php')),
+    sprintf('exec env PHP_CLI_SERVER_WORKERS=12 php -S 127.0.0.1:%d %s', $port, escapeshellarg(__DIR__ . '/mock-server.php')),
     $desc, $pipes
 );
 if (!is_resource($srv)) { fwrite(STDERR, "cannot start mock server\n"); exit(1); }
@@ -325,6 +398,157 @@ $tr = json_decode($r['out'], true);
 $stillNeg = false;
 foreach ($tr ?: [] as $row) { if ((int)$row['errors_delta'] < 0) { $stillNeg = true; } }
 ok('trend report contains no negative deltas', !$stillNeg);
+
+// ------------------------------------------- large estate / RisPort cap ---
+section('integration: RisPort response cap and the partitioning fallback');
+file_get_contents("http://127.0.0.1:$port/_big/300");   // 300 phones, cap 120
+
+// Reproduce the fault first. If this ever stops returning a short count the
+// mock has stopped modelling the bug, and the next assertion proves nothing.
+$confOff = "$root/tests/.cucm-test-off.conf";
+file_put_contents($confOff, file_get_contents($conf) . "\nris_partitions = off\n");
+$r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confOff) . " --json");
+$off = json_decode($r['out'], true);
+eq('unpartitioned query is truncated by the cap', count($off ?: []), 120);
+
+// And now the fix.
+$r = run("$php $root/bin/cucm-phones.php --config $C --json");
+$auto = json_decode($r['out'], true);
+eq('auto partitioning recovers the full estate', count($auto ?: []), 300);
+ok('truncation is reported, not silent',
+   str_contains($r['err'], 'of 300 devices it says exist'), substr($r['err'], 0, 200));
+
+// Unique device names: a merge bug would inflate or collapse the count.
+$names = array_column($auto ?: [], 'name');
+eq('no duplicates across partitions', count(array_unique($names)), count($names));
+
+// A sweep over the recovered estate must poll all of them.
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --sample 25 --json");
+$bs = json_decode($r['out'], true);
+eq('sweep sees the full estate after partitioning', $bs['discovered'] ?? null, 300);
+eq('sample still honoured on a large estate', $bs['polled'] ?? null, 25);
+
+@unlink($confOff);
+file_get_contents("http://127.0.0.1:$port/_big/0");     // back to the small estate
+
+// -------------------------------------------------------- concurrency -----
+section('integration: phones are polled concurrently, not in batches');
+file_get_contents("http://127.0.0.1:$port/_big/24");
+file_get_contents("http://127.0.0.1:$port/_slow/250");   // 250ms per page
+file_get_contents("http://127.0.0.1:$port/_conc/reset");
+
+$confPar = "$root/tests/.cucm-test-par.conf";
+file_put_contents($confPar, file_get_contents($conf) . "\nadapters = network\n");
+
+$t = microtime(true);
+$r = run("$php $root/bin/cucm-sweep.php --config " . escapeshellarg($confPar) . " --no-db --parallel 8 --json");
+$elapsed = microtime(true) - $t;
+$pr = json_decode($r['out'], true);
+eq('all 24 phones polled', $pr['polled'] ?? null, 24);
+
+$conc = json_decode((string)file_get_contents("http://127.0.0.1:$port/_conc"), true);
+$max  = (int)($conc['max'] ?? 0);
+// The server itself observed the overlap, so this is not an inference from
+// elapsed time. 8 requested; anything above 3 proves a rolling window
+// rather than one-at-a-time, with slack for worker scheduling.
+ok("server saw concurrent requests (max in flight = $max, asked for 8)", $max >= 4, json_encode($conc));
+
+// And a loose upper bound on time: 24 pages at 250ms serially is 6s. Under
+// half of that cannot happen without real concurrency. Deliberately not
+// tight, so it does not go flaky on a loaded machine.
+ok(sprintf('24 x 250ms pages finished in %.1fs, well under the %.1fs serial cost', $elapsed, 6.0),
+   $elapsed < 3.0, sprintf('%.2fs', $elapsed));
+
+// A slow phone must not hold up phones that already answered: with the old
+// chunked implementation the window drained to zero between batches.
+file_get_contents("http://127.0.0.1:$port/_conc/reset");
+$r = run("$php $root/bin/cucm-sweep.php --config " . escapeshellarg($confPar) . " --no-db --parallel 4 --json");
+$conc2 = json_decode((string)file_get_contents("http://127.0.0.1:$port/_conc"), true);
+ok('window is respected, not exceeded (max ' . ($conc2['max'] ?? '?') . ' for --parallel 4)',
+   (int)($conc2['max'] ?? 99) <= 6, json_encode($conc2));
+
+@unlink($confPar);
+file_get_contents("http://127.0.0.1:$port/_slow/0");
+file_get_contents("http://127.0.0.1:$port/_big/0");
+
+// ------------------------------------------------- device-prefix filter ---
+section('integration: soft clients are not polled by default');
+file_get_contents("http://127.0.0.1:$port/_soft/1");   // + CSF, TCT, BOT, ATA
+
+$r = run("$php $root/bin/cucm-phones.php --config $C --json");
+$def = array_column(json_decode($r['out'], true) ?: [], 'name');
+eq('default lists only SEP handsets', count($def), 7);
+ok('no Jabber desktop in the default list', !in_array('CSFJOSEPH', $def, true), implode(',', $def));
+ok('no analog adapter in the default list', !in_array('ATA001122335501', $def, true), implode(',', $def));
+
+$r = run("$php $root/bin/cucm-phones.php --config $C --all-devices --json");
+$all = array_column(json_decode($r['out'], true) ?: [], 'name');
+eq('--all-devices shows every registered device', count($all), 11);
+ok('soft clients are visible when asked for', in_array('CSFJOSEPH', $all, true), implode(',', $all));
+
+// The skip must be reported, not silent - this is the answer to "CUCM says
+// 3000 and I only see 2000".
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --json");
+ok('the skip is reported with a per-prefix breakdown',
+   str_contains($r['err'], 'skipped as not SEP') && str_contains($r['err'], 'CSF=1'),
+   substr($r['err'], 0, 300));
+eq('sweep polls only the handsets', (json_decode($r['out'], true)['polled'] ?? null), 7);
+
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --all-devices --json");
+eq('--all-devices sweeps everything', (json_decode($r['out'], true)['polled'] ?? null), 11);
+
+// An explicit list must be honoured over the default.
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --device-prefixes SEP,CSF --json");
+eq('explicit prefix list is honoured', (json_decode($r['out'], true)['polled'] ?? null), 8);
+
+// The reported trap, pinned: --match is a substring search, so "SEP" also
+// matches CSFJOSEPH (JO-SEP-H). This asserts the behaviour deliberately so
+// nobody "fixes" it into a silent anchored match, and proves the two safe
+// routes out of it.
+section('integration: --match SEP is a substring, and catches CSFJOSEPH');
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --all-devices --match SEP --json");
+$m = array_column(json_decode($r['out'], true)['phones'] ?? [], 'name');
+ok('--match SEP does catch CSFJOSEPH (substring, as designed)',
+   in_array('CSFJOSEPH', $m, true), implode(',', $m));
+
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --all-devices --match name:SEP0 --json");
+$m2 = array_column(json_decode($r['out'], true)['phones'] ?? [], 'name');
+ok('field-scoped --match name:SEP0 excludes it', !in_array('CSFJOSEPH', $m2, true), implode(',', $m2));
+ok('field-scoped --match still returns the handsets', count($m2) === 7, implode(',', $m2));
+
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --match SEP --json");
+$m3 = array_column(json_decode($r['out'], true)['phones'] ?? [], 'name');
+ok('the device-prefix default also excludes it', !in_array('CSFJOSEPH', $m3, true), implode(',', $m3));
+
+file_get_contents("http://127.0.0.1:$port/_soft/0");
+
+// -------------------------------------------------------- subnet excludes --
+section('integration: --exclude-subnet');
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --exclude-subnet 10.10.10.8/32 --json");
+eq('/32 excludes exactly one phone', (json_decode($r['out'], true)['polled'] ?? null), 6);
+
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --exclude-subnet 10.10.10.4/30 --json");
+$ex = json_decode($r['out'], true);
+eq('/30 excludes .4 .5 .6', $ex['polled'] ?? null, 4);
+$left = array_column($ex['phones'] ?? [], 'ip');
+ok('excluded addresses really are gone',
+   !in_array('10.10.10.4', $left, true) && !in_array('10.10.10.5', $left, true)
+   && !in_array('10.10.10.6', $left, true), implode(',', $left));
+ok('addresses outside the prefix survive', in_array('10.10.10.8', $left, true), implode(',', $left));
+
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --exclude-subnet '10.10.10.0/24,10.99.0.0/16' --json");
+ok('multiple prefixes: everything excluded leaves nothing to poll', $r['rc'] !== 0, "rc={$r['rc']}");
+
+// The listing must agree with the sweep, or a CSV carried between them
+// silently puts the excluded phones back.
+$r = run("$php $root/bin/cucm-phones.php --config $C --exclude-subnet 10.10.10.4/30 --json");
+eq('cucm-phones.php applies the same exclusions', count(json_decode($r['out'], true) ?: []), 4);
+
+// Negative controls: a bad prefix must stop the run, not be ignored.
+foreach (['10.10.10.0/33', 'not-a-subnet', '10.10.10.0/x'] as $bad) {
+    $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --exclude-subnet " . escapeshellarg($bad) . " --json");
+    ok("invalid prefix '$bad' is fatal, not ignored", $r['rc'] !== 0, "rc={$r['rc']} err={$r['err']}");
+}
 
 // ------------------------------------------------------- sampling knobs ---
 section('integration: --sample / --limit / --match');
