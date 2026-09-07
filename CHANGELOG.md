@@ -41,6 +41,20 @@
 - `cucm-probe.php` now probes the configured `phone_url_base` as well as
   `https://{ip}` and `http://{ip}`.
 
+### Added
+- `--sample N` on `cucm-sweep.php` for a random spread across the estate,
+  plus `--match TEXT` (name/description/model/IP) applied before sampling.
+  `--limit N` still takes the first N, which on a real cluster means one
+  node's worth of phones.
+- `phone_probe_schemes` / `--schemes` controls which schemes the probe tries
+  against a handset. Set to `https` on an all-HTTPS estate; the HTTP attempts
+  time out rather than failing fast.
+- RisPort probe now records TotalDevicesFound vs the number returned, the
+  per-node breakdown from `CmNodes`, the status histogram, the paging rounds
+  and one `CmDevice` element verbatim, and repeats the query with
+  `Status=Any`. A short-but-clean answer is otherwise indistinguishable from
+  a complete one.
+
 ### Fixed
 - **`&nbsp;` spacer cells corrupted parsed values.** These pages pad tables
   with `&nbsp;`, which decodes to U+00A0; PCRE's `\s` does not match U+00A0
@@ -56,3 +70,14 @@
 - `cucm-probe.php` ignored `phone_url_base`, so an estate serving the phone
   pages on a non-standard base saw every phone probe fail while the sweep
   worked - the probe contradicting the tool it exists to validate.
+- **`listPhones()` walked the entire estate when only a sample was wanted.**
+  Its second argument is the page size, not a row cap, so the probe's
+  `listPhones([...], 3)` fetched all 6,757 configured phones three at a time
+  - over two thousand SOAP round trips for what should be one. Added a
+  `$maxRows` cap; the probe now pulls two pages of two, which still proves
+  skip/first paging advances.
+- An `https://` base could be redirected to `http://`, re-sending basic-auth
+  credentials in cleartext. Redirect protocols are now pinned to the base's
+  scheme (never downgrade; an http base may still upgrade).
+- `cps_phone_url()` bracketed any address containing a colon as IPv6, so
+  `10.0.0.5:8443` became `[10.0.0.5:8443]` and curl rejected it.

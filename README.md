@@ -114,11 +114,39 @@ php bin/cucm-report.php error-trend
 | Script | What it is for |
 |---|---|
 | `bin/cucm-probe.php` | Verifies each assumption against a real cluster, one request at a time, and writes JSON evidence. **Run this first on a new cluster.** |
+
+> **All-HTTPS estate?** Set `phone_probe_schemes = https` (or pass
+> `--schemes https`). Only the *probe* ever tries plaintext, and only to
+> discover what a handset answers on; sweeps build every URL from
+> `phone_url_base` and never attempt HTTP. The http attempts time out rather
+> than failing fast, so turning them off saves two timeouts per probe run.
+>
+> Collection is additionally pinned: with an `https://` base, curl is
+> configured to refuse a redirect to `http://`. Web Access = Authenticated
+> sends credentials, and a phone bouncing to a plaintext page would otherwise
+> have them re-sent in the clear.
 | `bin/cucm-phones.php` | Lists registered phones and their IPs. `--json`, `--csv`, `--table`. |
-| `bin/cucm-sweep.php` | The whole job: discover → poll every phone → store. |
+| `bin/cucm-sweep.php` | The whole job: discover → poll every phone → store. `--sample N` for a small batch. |
 | `bin/cucm-phone-netstats.php` | One phone by IP. Successor to `patching-tools/cisco-phone-netstats.php`. |
 | `bin/cucm-report.php` | The reports, over one sweep or all of them. |
 | `bin/cucm-initdb.php` | Creates/updates tables and views. Safe to re-run. |
+
+### Testing against a subset
+
+On an estate of thousands, do not sweep the lot to find out whether it works:
+
+```bash
+php bin/cucm-sweep.php --sample 20 --no-db          # 20 random phones, nothing stored
+php bin/cucm-sweep.php --match SEP0011 --sample 5   # narrow first, then sample
+php bin/cucm-sweep.php --sample 50                  # 50 random, stored as a real sweep
+```
+
+`--sample N` takes a **random** spread; `--limit N` takes the **first** N.
+They are not the same test. RisPort returns devices grouped by node, so the
+first N are typically all from one subscriber, one site, often one switch —
+the population least likely to show up a problem only part of the estate
+has. `--match` filters on name, description, model or IP and is applied
+before sampling.
 
 ## Reports
 

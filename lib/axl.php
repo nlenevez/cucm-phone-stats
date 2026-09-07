@@ -143,10 +143,20 @@ class CpsAxlClient
      * throttles a single list response (1000 rows by default, and an admin
      * can lower it).
      *
+     * $maxRows caps the total fetched; 0 means every phone. Without it, a
+     * small $pageSize does NOT mean "fetch a few" - it means "fetch all of
+     * them, a few at a time", which on a 6,757-phone cluster with pageSize 3
+     * is over two thousand SOAP round trips. Callers that only want a sample
+     * must say so.
+     *
      * @return array<int,array<string,string>>
      */
-    public function listPhones(array $returnedTags = [], int $pageSize = 500, ?string $nameLike = null): array
-    {
+    public function listPhones(
+        array $returnedTags = [],
+        int $pageSize = 500,
+        ?string $nameLike = null,
+        int $maxRows = 0,
+    ): array {
         if (!$returnedTags) {
             $returnedTags = ['name', 'description', 'model', 'devicePoolName', 'callingSearchSpaceName', 'product', 'class'];
         }
@@ -172,9 +182,10 @@ class CpsAxlClient
             $out = array_merge($out, $page);
             cps_log('listPhone: ' . count($page) . " rows (skip=$skip), " . count($out) . ' total', 2);
             if (count($page) < $pageSize) { break; }
+            if ($maxRows > 0 && count($out) >= $maxRows) { break; }
             $skip += $pageSize;
         }
-        return $out;
+        return $maxRows > 0 ? array_slice($out, 0, $maxRows) : $out;
     }
 
     /**

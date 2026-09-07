@@ -7,12 +7,18 @@
  * Usage:
  *   php bin/cucm-sweep.php [--config FILE] [--status Registered] [--source risport|axl-sql]
  *                          [--adapters network,access,ethernet,device]
- *                          [--limit N] [--no-db] [--json] [--skip-no-http] [--verbose]
+ *                          [--sample N] [--limit N] [--match TEXT]
+ *                          [--no-db] [--json] [--skip-no-http] [--verbose]
  *
  * Examples:
- *   php bin/cucm-sweep.php                       # full sweep into the database
- *   php bin/cucm-sweep.php --limit 5 --no-db --json   # dry run against five phones
+ *   php bin/cucm-sweep.php                            # full sweep into the database
+ *   php bin/cucm-sweep.php --sample 20 --no-db        # 20 random phones, nothing stored
+ *   php bin/cucm-sweep.php --match SEP00112233 --sample 5
+ *   php bin/cucm-sweep.php --limit 5 --no-db --json   # the FIRST five (one node, one site)
  *   php bin/cucm-sweep.php --phones-from phones.csv   # poll a list, skip CUCM
+ *
+ * On a large estate reach for --sample, not --limit: RisPort returns devices
+ * grouped by node, so the first N are usually all from one subscriber.
  *
  * --phones-from exists for the airgapped case where discovery and polling
  * may not happen from the same host or at the same time: cucm-phones.php
@@ -28,8 +34,11 @@ $opts = $p['opts'];
 
 if (!empty($opts['help'])) {
     fwrite(STDERR, "Usage: php bin/cucm-sweep.php [--config FILE] [--status S] [--source risport|axl-sql]\n"
-                 . "       [--adapters a,b,c] [--limit N] [--phones-from FILE] [--no-db] [--json]\n"
-                 . "       [--skip-no-http] [--verbose]\n");
+                 . "       [--adapters a,b,c] [--sample N] [--limit N] [--match TEXT]\n"
+                 . "       [--phones-from FILE] [--no-db] [--json] [--skip-no-http] [--verbose]\n"
+                 . "\n  --sample N   N random phones (use this on a large estate)\n"
+                 . "  --limit N    the first N discovered (usually all one node)\n"
+                 . "  --match TEXT substring filter on name/description/model/ip, applied first\n");
     exit(0);
 }
 
@@ -37,6 +46,8 @@ $cfg      = cps_load_config(cps_common_opts($opts));
 $status   = is_string($opts['status'] ?? null) ? $opts['status'] : 'Registered';
 $source   = is_string($opts['source'] ?? null) ? $opts['source'] : 'risport';
 $limit    = isset($opts['limit']) && is_string($opts['limit']) ? (int)$opts['limit'] : 0;
+$sample   = isset($opts['sample']) && is_string($opts['sample']) ? (int)$opts['sample'] : 0;
+$match    = is_string($opts['match'] ?? null) ? $opts['match'] : null;
 $useDb    = empty($opts['no-db']) && (bool)$cfg['db_enabled'];
 $adapters = is_string($opts['adapters'] ?? null)
     ? preg_split('/[\s,]+/', $opts['adapters'], -1, PREG_SPLIT_NO_EMPTY)
@@ -64,10 +75,38 @@ $pollable = array_values(array_filter($phones, function ($r) use ($opts) {
     if (!empty($opts['skip-no-http']) && cps_tri_bool($r['http_supported'] ?? '') === 0) { return false; }
     return true;
 }));
+// --match narrows to a site or a model before any sampling, so
+// "--match SEP0011 --sample 20" means twenty of THAT set, not twenty of the
+// estate that happen to match.
+if ($match !== null && $match !== '') {
+    $needle = mb_strtolower($match);
+    $pollable = array_values(array_filter($pollable, function ($r) use ($needle) {
+        foreach (['name', 'description', 'model', 'ip'] as $f) {
+            if (str_contains(mb_strtolower((string)($r[$f] ?? '')), $needle)) { return true; }
+        }
+        return false;
+    }));
+    cps_log(count($pollable) . " phones match '$match'");
+}
+
+// --sample takes a random spread; --limit takes the first N.
+//
+// They are not the same test. RisPort returns devices grouped by node, so
+// the first N are typically all from one subscriber, one site and often one
+// switch - exactly the population least likely to expose a problem that only
+// some of the estate has. For a smoke test across thousands of handsets,
+// --sample is the honest one.
+if ($sample > 0 && $sample < count($pollable)) {
+    $keys = array_rand($pollable, $sample);
+    $picked = [];
+    foreach ((array)$keys as $k) { $picked[] = $pollable[$k]; }
+    $pollable = $picked;
+    cps_log("randomly sampled $sample phones from the pollable set");
+}
 if ($limit > 0) { $pollable = array_slice($pollable, 0, $limit); }
 
 cps_log(sprintf('%d of %d phones are pollable%s', count($pollable), $discovered,
-    $limit > 0 ? " (limited to $limit)" : ''));
+    $sample > 0 ? " (random sample of $sample)" : ($limit > 0 ? " (first $limit)" : '')));
 if (!$pollable) { cps_die('no phones with an IP address to poll'); }
 
 // ------------------------------------------------------------------ polling

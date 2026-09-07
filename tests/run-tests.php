@@ -102,6 +102,26 @@ foreach (['2-column' => $two, '3-column with ":"' => $three, 'padded spacers' =>
 // Negative control: a row with only one cell is not a stat.
 eq('single-cell row ignored', cps_parse_stats_html('<table><tr><td>Heading</td></tr></table>'), []);
 
+section('unit: phone URL construction');
+ok('IPv4 unbracketed',
+   str_contains(cps_phone_url('10.0.0.5', 'a'), 'https://10.0.0.5/CGI/'), cps_phone_url('10.0.0.5','a'));
+ok('IPv6 literal bracketed',
+   str_contains(cps_phone_url('2001:db8::1', 'a'), 'https://[2001:db8::1]/CGI/'), cps_phone_url('2001:db8::1','a'));
+ok('host:port is NOT mistaken for IPv6',
+   str_contains(cps_phone_url('10.0.0.5:8443', 'a'), 'https://10.0.0.5:8443/CGI/'), cps_phone_url('10.0.0.5:8443','a'));
+ok('already-bracketed IPv6 not double-bracketed',
+   !str_contains(cps_phone_url('[2001:db8::1]', 'a'), '[['), cps_phone_url('[2001:db8::1]','a'));
+
+section('unit: scheme confinement');
+$https = cps_curl_scheme_limits('https://{ip}');
+eq('https base never permits a redirect to http',
+   $https[CURLOPT_REDIR_PROTOCOLS], CURLPROTO_HTTPS);
+$http = cps_curl_scheme_limits('http://{ip}');
+eq('http base may still upgrade to https',
+   $http[CURLOPT_REDIR_PROTOCOLS], CURLPROTO_HTTP | CURLPROTO_HTTPS);
+eq('non-default https base is still pinned',
+   cps_curl_scheme_limits('https://{ip}:8443/x')[CURLOPT_REDIR_PROTOCOLS], CURLPROTO_HTTPS);
+
 eq('MAC from device name', cps_mac_from_device_name('SEP001122334455'), '001122334455');
 eq('non-device name gives null', cps_mac_from_device_name('not-a-phone'), null);
 eq('tri-bool Yes', cps_tri_bool('Yes'), 1);
@@ -306,6 +326,37 @@ $stillNeg = false;
 foreach ($tr ?: [] as $row) { if ((int)$row['errors_delta'] < 0) { $stillNeg = true; } }
 ok('trend report contains no negative deltas', !$stillNeg);
 
+// ------------------------------------------------------- sampling knobs ---
+section('integration: --sample / --limit / --match');
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --sample 3 --json");
+$s3 = json_decode($r['out'], true);
+eq('--sample 3 polls exactly 3', $s3['polled'] ?? null, 3);
+eq('--sample still reports the full discovered count', $s3['discovered'] ?? null, 7);
+
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --limit 2 --json");
+eq('--limit 2 polls exactly 2', (json_decode($r['out'], true)['polled'] ?? null), 2);
+
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --match 334404 --json");
+$sm = json_decode($r['out'], true);
+eq('--match narrows to the one phone', $sm['polled'] ?? null, 1);
+eq('--match picked the right one', $sm['phones'][0]['name'] ?? null, 'SEP001122334404');
+
+// Negative control: a sample larger than the population must not shrink it
+// or duplicate rows - array_rand() with n == count() behaves differently.
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --sample 99 --json");
+eq('--sample larger than the estate polls everything', (json_decode($r['out'], true)['polled'] ?? null), 7);
+
+// Sampling must actually vary, or it is just --limit wearing a hat.
+$seen = [];
+for ($i = 0; $i < 6; $i++) {
+    $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --sample 2 --json");
+    $names = array_column(json_decode($r['out'], true)['phones'] ?? [], 'name');
+    sort($names);
+    $seen[implode(',', $names)] = true;
+}
+ok('--sample returns differing sets across runs', count($seen) > 1,
+   'always picked: ' . implode(' | ', array_keys($seen)));
+
 // --------------------------------------------------------------- phone list
 section('integration: --phones-from round trip');
 $csv = '/tmp/cps-phones.csv';
@@ -332,6 +383,13 @@ $r = run("$php $root/bin/cucm-phone-netstats.php 10.10.10.5 --config $C --json")
 eq('auth-required phone exits 2', $r['rc'], 2);
 
 // ------------------------------------------------------------------- probe
+section('integration: probe honours --schemes');
+$r = run("$php $root/bin/cucm-probe.php --config $C --phone 10.10.10.4 --schemes https --out /tmp/cps-probe-https");
+ok('no http phone probe when --schemes https', !str_contains($r['out'], 'phone:http:'),
+   implode(' ', array_filter(explode("\n", $r['out']), fn($l) => str_contains($l, 'phone:'))));
+$r = run("$php $root/bin/cucm-probe.php --config $C --phone 10.10.10.4 --schemes https,http --out /tmp/cps-probe-both");
+ok('http phone probe present when asked for', str_contains($r['out'], 'phone:http:'));
+
 section('integration: probe script');
 $r = run("$php $root/bin/cucm-probe.php --config $C --phone 10.10.10.4 --out /tmp/cps-probe");
 ok('probe runs', str_contains($r['out'], 'PASS'), substr($r['out'], -400));

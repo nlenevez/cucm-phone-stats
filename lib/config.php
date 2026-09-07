@@ -36,6 +36,11 @@ const CPS_DEFAULTS = [
     'phone_pass'      => '',
     'phone_pass_file' => '',
     'phone_pass_env'  => '',
+    // Schemes bin/cucm-probe.php tries when probing a handset. An estate
+    // that is entirely HTTPS should set this to "https": the http attempts
+    // do not fail fast, they time out, costing phone_timeout twice per run.
+    // This does NOT affect collection - sweeps only ever use phone_url_base.
+    'phone_probe_schemes' => 'https,http',
     'phone_parallel'  => 10,
     'phone_timeout'   => 10,
     'phone_connect_timeout' => 5,

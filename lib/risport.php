@@ -37,6 +37,15 @@ const CPS_RIS_PATH = '/realtimeservice2/services/RISService70';
 
 class CpsRisportClient
 {
+    /**
+     * Diagnostics from the most recent selectCmDevice call. Populated even
+     * when the result looks fine, because the interesting failure here is a
+     * quiet undercount - a node that answers cleanly with a fraction of the
+     * estate looks identical to a healthy full answer unless you compare the
+     * returned count against TotalDevicesFound and the per-node breakdown.
+     */
+    private array $lastDiag = [];
+
     public function __construct(
         private CpsSoapClient $soap,
         private int $maxReturnedDevices = 1000,
@@ -44,6 +53,8 @@ class CpsRisportClient
     ) {}
 
     public function baseUrl(): string { return $this->soap->baseUrl(); }
+
+    public function lastDiagnostics(): array { return $this->lastDiag; }
 
     /**
      * selectCmDevice, following StateInfo until the cluster is exhausted.
@@ -63,6 +74,15 @@ class CpsRisportClient
         $stateInfo = '';
         $seenState = [];
         $round     = 0;
+        $this->lastDiag = [
+            'server'        => $this->soap->baseUrl(),
+            'status_filter' => $status,
+            'device_class'  => $deviceClass,
+            'max_returned'  => $this->maxReturnedDevices,
+            'rounds'        => [],
+            'nodes'         => [],
+            'sample_device_xml' => null,
+        ];
 
         while (true) {
             $round++;
@@ -91,12 +111,41 @@ class CpsRisportClient
             $found = cps_xml_text($doc, 'TotalDevicesFound');
             $batch = $this->parseDevices($doc);
             $devices = array_merge($devices, $batch);
+
+            // Per-node counts: RIS answers per node, and a node that is not
+            // contributing is invisible in the flat device list.
+            foreach (cps_xml_find($doc, 'CmNodes') as $nodesEl) {
+                foreach (cps_xml_children($nodesEl) as $nodeItem) {
+                    $nn = cps_xml_text($nodeItem, 'Name', '(unnamed)');
+                    $cd = cps_xml_first($nodeItem, 'CmDevices');
+                    $cnt = $cd === null ? 0 : count(cps_xml_children($cd));
+                    $this->lastDiag['nodes'][$nn] = ($this->lastDiag['nodes'][$nn] ?? 0) + $cnt;
+                }
+            }
+            // Keep one raw device element verbatim. Field names in this
+            // response are the thing most likely to differ from the docs,
+            // and a real sample settles it without another trip.
+            if ($this->lastDiag['sample_device_xml'] === null) {
+                foreach (cps_xml_find($doc, 'CmDevices') as $cdEl) {
+                    $kids = cps_xml_children($cdEl);
+                    if ($kids) {
+                        $this->lastDiag['sample_device_xml'] = $doc->saveXML($kids[0]);
+                        break;
+                    }
+                }
+            }
+            $this->lastDiag['rounds'][] = [
+                'round' => $round, 'returned' => count($batch),
+                'total_devices_found' => $found, 'state_info_present' => false,
+            ];
             cps_log(sprintf(
                 'RisPort %s round %d: %d devices (TotalDevicesFound=%s), %d accumulated',
                 $this->soap->baseUrl(), $round, count($batch), $found ?? '?', count($devices)
             ), 2);
 
             $next = cps_xml_text($doc, 'StateInfo', '');
+            $this->lastDiag['rounds'][count($this->lastDiag['rounds']) - 1]['state_info_present'] =
+                ($next !== null && $next !== '');
             // Stop on: no more devices, no StateInfo, or a StateInfo we have
             // already followed. That last guard matters - a cluster that
             // returns the same StateInfo forever would otherwise loop until
@@ -111,6 +160,10 @@ class CpsRisportClient
 
             if ($this->requestGapMs > 0) { usleep($this->requestGapMs * 1000); }
         }
+        $this->lastDiag['returned_total'] = count($devices);
+        $statuses = [];
+        foreach ($devices as $d) { $statuses[$d['status'] ?: '(empty)'] = ($statuses[$d['status'] ?: '(empty)'] ?? 0) + 1; }
+        $this->lastDiag['status_histogram'] = $statuses;
         return $devices;
     }
 

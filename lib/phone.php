@@ -292,9 +292,35 @@ function cps_parse_stats_html(string $html): array {
  * "{ip}" is substituted, and an IPv6 literal is bracketed.
  */
 function cps_phone_url(string $ip, string $adapter, string $base = 'https://{ip}'): string {
-    $host = (str_contains($ip, ':') && !str_starts_with($ip, '[')) ? "[$ip]" : $ip;
+    // Bracket only a genuine IPv6 literal. Testing merely for ":" also
+    // catches "10.0.0.5:8443", turning it into "[10.0.0.5:8443]" and a curl
+    // "Bad IPv6 address" - a confusing failure for what is a reasonable
+    // thing to type at --phone.
+    $isV6 = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false;
+    $host = ($isV6 && !str_starts_with($ip, '[')) ? "[$ip]" : $ip;
     $root = str_replace('{ip}', $host, $base);
     return rtrim($root, '/') . '/CGI/Java/Serviceability?adapter=' . rawurlencode($adapter);
+}
+
+/**
+ * curl options confining a request to a safe set of schemes.
+ *
+ * Redirects are followed (some firmware bounces /CGI/... through a login
+ * page), and CURLOPT_USERPWD is set whenever Web Access is Authenticated.
+ * Together those mean a phone answering https:// with a 302 to http:// would
+ * have curl re-send the Authorization header in cleartext. Restricting the
+ * redirect protocols makes that impossible rather than unlikely.
+ *
+ * An https base is pinned to https - never downgrade. An http base may
+ * upgrade to https, which is only ever an improvement.
+ */
+function cps_curl_scheme_limits(string $base): array {
+    $scheme = strtolower((string)parse_url(str_replace('{ip}', '0.0.0.0', $base), PHP_URL_SCHEME));
+    $allowed = $scheme === 'https' ? CURLPROTO_HTTPS : (CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    return [
+        CURLOPT_PROTOCOLS       => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_REDIR_PROTOCOLS => $allowed,
+    ];
 }
 
 class CpsPhoneFetcher
@@ -327,7 +353,7 @@ class CpsPhoneFetcher
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_MAXREDIRS      => 3,
             CURLOPT_USERAGENT      => 'cucm-phone-stats/1.0',
-        ]);
+        ] + cps_curl_scheme_limits($this->urlBase));
         if ($this->username !== null && $this->username !== '') {
             curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
             curl_setopt($ch, CURLOPT_USERPWD, $this->username . ':' . (string)$this->password);

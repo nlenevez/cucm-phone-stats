@@ -28,7 +28,8 @@ require_once dirname(__DIR__) . '/lib/config.php';
 $p    = cps_parse_args($argv, ['verbose', 'quiet', 'debug', 'help']);
 $opts = $p['opts'];
 if (!empty($opts['help'])) {
-    fwrite(STDERR, "Usage: php bin/cucm-probe.php [--config FILE] [--phone IP] [--out DIR]\n");
+    fwrite(STDERR, "Usage: php bin/cucm-probe.php [--config FILE] [--phone IP] [--out DIR]\n"
+                 . "       [--schemes https[,http]]   schemes to try against the handset\n");
     exit(0);
 }
 $cfg     = cps_load_config(cps_common_opts($opts));
@@ -164,30 +165,81 @@ $sqlProbe('axl:sql:regdyn-join', 'the full registration query runs as one statem
   . 'LEFT JOIN typemodel tm ON tm.enum = d.tkmodel');
 
 // ---------------------------------------------------------- F. listPhone --
-probe($probes, 'axl:listPhone', 'listPhone returns rows with skip/first paging',
+// Two pages of two, then stop: enough to prove skip/first paging works
+// without walking the entire configured estate. A probe should cost one
+// short conversation, not thousands of round trips.
+probe($probes, 'axl:listPhone', 'listPhone returns rows, and skip/first paging advances',
     function () use ($axl, $axlUsable) {
         if (!$axlUsable) { return ['status' => 'SKIP', 'note' => 'AXL not usable']; }
-        $rows = $axl->listPhones(['name', 'description', 'model'], 3);
-        return ['status' => 'PASS', 'row_count' => count($rows),
-                'sample' => array_slice($rows, 0, 2), 'note' => count($rows) . ' phones'];
+        $rows  = $axl->listPhones(['name', 'description', 'model'], 2, null, 4);
+        $names = array_column($rows, 'name');
+        $paged = count($names) === count(array_unique($names));
+        return ['status' => $paged ? 'PASS' : 'FAIL',
+                'row_count' => count($rows),
+                'sample' => array_slice($rows, 0, 4),
+                'error' => $paged ? null : 'page 2 repeated page 1 - skip/first is not advancing',
+                'note' => count($rows) . ' phones sampled (paging verified, estate not walked)'];
     });
 
 // ---------------------------------------------------------- G. RisPort70 --
+$risCounts = [];
 foreach ($servers as $srv) {
-    probe($probes, "ris:selectCmDevice:$srv", 'RisPort70 returns registered phones with IP addresses',
-        function () use ($cfg, $srv) {
-            $ris  = new CpsRisportClient(cps_soap_for($cfg, $srv), 200, 0);
+    $rec = probe($probes, "ris:selectCmDevice:$srv", 'RisPort70 returns registered phones with IP addresses',
+        function () use ($cfg, $srv, &$risCounts) {
+            $ris  = new CpsRisportClient(cps_soap_for($cfg, $srv), 1000, 0);
             $rows = $ris->selectCmDevice('Registered', 'Phone');
+            $diag = $ris->lastDiagnostics();
             $withIp   = count(array_filter($rows, fn($r) => !empty($r['ip'])));
             $withHttp = count(array_filter($rows, fn($r) => cps_tri_bool($r['http_supported']) !== null));
-            $status = $rows ? 'PASS' : 'FAIL';
-            return ['status' => $status,
+            $risCounts[$srv]['registered'] = count($rows);
+            // TotalDevicesFound is what the node believes exists; a returned
+            // count below it means paging stopped early, which is a very
+            // different fault from the node simply knowing fewer devices.
+            $totals = array_values(array_filter(array_column($diag['rounds'], 'total_devices_found')));
+            $claimed = $totals ? max(array_map('intval', $totals)) : null;
+            $short   = $claimed !== null && count($rows) < $claimed;
+            return ['status' => $rows ? ($short ? 'FAIL' : 'PASS') : 'FAIL',
                     'device_count' => count($rows),
+                    'total_devices_found' => $claimed,
                     'with_ip' => $withIp,
                     'with_http_supported' => $withHttp,
+                    'per_node_counts' => $diag['nodes'] ?? [],
+                    'rounds' => $diag['rounds'] ?? [],
+                    'status_histogram' => $diag['status_histogram'] ?? [],
+                    'sample_device_xml' => $diag['sample_device_xml'] ?? null,
                     'sample' => array_slice($rows, 0, 3),
-                    'error' => $rows ? null : 'no devices returned',
-                    'note' => count($rows) . " devices, $withIp with an IP, $withHttp reporting HttpSupported"];
+                    'error' => $rows
+                        ? ($short ? "returned " . count($rows) . " but TotalDevicesFound said $claimed - paging stopped early" : null)
+                        : 'no devices returned',
+                    'note' => sprintf('%d devices, %d with an IP, %d reporting HttpSupported; nodes: %s',
+                        count($rows), $withIp, $withHttp,
+                        $diag['nodes'] ? json_encode($diag['nodes']) : 'none reported')];
+        });
+
+    // Same query with Status=Any. This one comparison separates the two
+    // reasons a cluster-wide count can come back short: if Any returns about
+    // the same number, this node only knows that many devices at all (so the
+    // rest live on other subscribers and every subscriber must be queried);
+    // if Any returns far more, the devices are here and the Status filter is
+    // what is excluding them.
+    probe($probes, "ris:selectCmDevice:$srv:Any", 'Status=Any reveals whether the node knows more devices than it reports as Registered',
+        function () use ($cfg, $srv, &$risCounts) {
+            $ris  = new CpsRisportClient(cps_soap_for($cfg, $srv), 1000, 0);
+            $rows = $ris->selectCmDevice('Any', 'Phone');
+            $diag = $ris->lastDiagnostics();
+            $reg  = $risCounts[$srv]['registered'] ?? null;
+            $hist = $diag['status_histogram'] ?? [];
+            arsort($hist);
+            $verdict = ($reg !== null && count($rows) > $reg * 1.2)
+                ? 'this node HOLDS more devices than it reports Registered - investigate the Status values'
+                : 'this node knows about this many devices in total - the rest of the estate is on OTHER subscribers, list them all in cucm_servers';
+            return ['status' => 'PASS',
+                    'device_count' => count($rows),
+                    'registered_count' => $reg,
+                    'status_histogram' => $hist,
+                    'per_node_counts' => $diag['nodes'] ?? [],
+                    'note' => sprintf('Any=%d vs Registered=%s; statuses: %s. %s',
+                        count($rows), $reg ?? '?', json_encode(array_slice($hist, 0, 6)), $verdict)];
         });
 }
 
@@ -199,9 +251,13 @@ if ($phoneIp !== null) {
     // the sweep worked perfectly - the probe contradicting the tool it exists
     // to validate. Duplicates are dropped so the common case still runs twice,
     // not three times.
-    $bases = array_values(array_unique(array_filter([
-        (string)$cfg['phone_url_base'], 'https://{ip}', 'http://{ip}',
-    ])));
+    $schemes = is_string($opts['schemes'] ?? null)
+        ? $opts['schemes'] : (string)$cfg['phone_probe_schemes'];
+    $bases = [(string)$cfg['phone_url_base']];
+    foreach (preg_split('/[\s,]+/', $schemes, -1, PREG_SPLIT_NO_EMPTY) as $sch) {
+        $bases[] = strtolower($sch) . '://{ip}';
+    }
+    $bases = array_values(array_unique(array_filter($bases)));
     foreach ($bases as $base) {
         foreach (['network', 'access'] as $a) {
             $scheme = parse_url(str_replace('{ip}', '0.0.0.0', $base), PHP_URL_SCHEME) ?: 'http';

@@ -48,7 +48,7 @@ if (!empty($opts['raw'])) {
             CURLOPT_RETURNTRANSFER => true, CURLOPT_SSL_VERIFYPEER => false,
             CURLOPT_SSL_VERIFYHOST => false, CURLOPT_TIMEOUT => (int)$cfg['phone_timeout'],
             CURLOPT_FOLLOWLOCATION => true,
-        ]);
+        ] + cps_curl_scheme_limits((string)$cfg['phone_url_base']));
         if (((string)$cfg['phone_user']) !== '') {
             curl_setopt($ch, CURLOPT_USERPWD, $cfg['phone_user'] . ':' . $cfg['phone_pass']);
         }
