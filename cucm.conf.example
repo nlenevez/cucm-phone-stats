@@ -1,0 +1,69 @@
+; cucm-phone-stats configuration
+;
+; Copy to cucm.conf and edit. Searched for, in order:
+;   ./cucm.conf, <repo>/cucm.conf, ~/.cucm-phone-stats.conf
+; or name one explicitly with --config FILE.
+;
+; Any setting can be overridden from the environment as CPS_<UPPERCASE_KEY>,
+; e.g. CPS_AXL_PASS. Command-line flags beat both.
+
+; ---------------------------------------------------------------- CUCM ----
+; List the SUBSCRIBERS that phones register to, comma or space separated.
+; A bare hostname gets https:// and cucm_port; a full URL is used as given.
+; Each node reports the whole cluster, but a node whose RIS service is
+; unhealthy contributes nothing and says nothing about it - listing several
+; and letting the tool merge is the cheap insurance.
+cucm_servers   = cucm-sub1.example.local, cucm-sub2.example.local
+cucm_port      = 8443
+
+; An application user (not an end user) holding "Standard AXL API Access".
+; See docs/cucm-permissions.md.
+axl_user       = axluser
+; Prefer axl_pass_file or axl_pass_env over an inline password.
+axl_pass       =
+axl_pass_file  =
+axl_pass_env   =
+
+; Leave blank to negotiate automatically (tries 15.0 down to 10.0).
+axl_version    =
+
+; CUCM ships a self-signed certificate unless someone has replaced it.
+; Set verify_tls = 1 and point ca_bundle at the cluster's CA to verify.
+verify_tls     = 0
+ca_bundle      =
+
+soap_timeout   = 60
+; RisPort is rate limited per user; this is the pause between paged calls.
+ris_gap_ms     = 4000
+ris_max_devices = 1000
+
+; --------------------------------------------------------------- phones ---
+; "{ip}" is replaced with each phone's address. Use http://{ip} if the
+; estate has not enabled HTTPS on the handsets.
+phone_url_base = https://{ip}
+; Only needed when Web Access is set to "Authenticated" rather than "Enabled".
+phone_user     =
+phone_pass     =
+phone_pass_file =
+phone_pass_env  =
+
+phone_parallel = 10
+phone_timeout  = 10
+phone_connect_timeout = 5
+
+; Pages to collect. network and access are the two port pages; ethernet is
+; the device-wide counter page; device and config add identity and CDP
+; context. Dropping some makes a large sweep faster.
+adapters       = network,access,ethernet,device
+
+; ------------------------------------------------------------- database ---
+db_enabled     = 1
+db_host        = 127.0.0.1
+db_port        = 3306
+db_name        = cucm_phone_stats
+; The RUNTIME account: SELECT, INSERT, UPDATE only. Schema changes are done
+; separately by an account with DDL rights - see "Database setup" in README.md.
+db_user        = cucm
+db_pass        =
+db_pass_file   =
+db_pass_env    =
