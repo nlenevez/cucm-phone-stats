@@ -526,3 +526,117 @@ class CpsPhoneFetcher
         return ['ok' => true, 'http_code' => 200, 'pairs' => $pairs];
     }
 }
+
+/**
+ * CDP / LLDP neighbour labels, normalised key => canonical field.
+ *
+ * Firmware disagrees about these more than about the counters: some pages
+ * say "CDP Neighbor Device ID", others "Neighbor Device ID" under a CDP
+ * heading, and the LLDP-MED variants add their own spellings. The alias
+ * table covers what is known; cps_normalise_neighbour() then makes a
+ * heuristic pass for anything shaped like a neighbour field that the table
+ * missed, because guessing wrong here costs a switch port lookup, whereas
+ * missing the field entirely costs a site visit.
+ */
+const CPS_NEIGHBOUR_MAP = [
+    // --- CDP ---
+    'cdpneighbordeviceid'      => 'cdp_neighbour',
+    'cdpneighbourdeviceid'     => 'cdp_neighbour',
+    'cdpneighbordevice'        => 'cdp_neighbour',
+    'cdpneighborid'            => 'cdp_neighbour',
+    'cdpneighborport'          => 'cdp_neighbour_port',
+    'cdpneighbourport'         => 'cdp_neighbour_port',
+    'cdpneighborportid'        => 'cdp_neighbour_port',
+    'cdpneighboripaddress'     => 'cdp_neighbour_ip',
+    'cdpneighbouripaddress'    => 'cdp_neighbour_ip',
+    'cdpneighborip'            => 'cdp_neighbour_ip',
+    'cdpneighborplatform'      => 'cdp_neighbour_platform',
+    // --- LLDP (incl. LLDP-MED) ---
+    'lldpneighbordeviceid'     => 'lldp_neighbour',
+    'lldpneighbourdeviceid'    => 'lldp_neighbour',
+    'lldpmedneighbordeviceid'  => 'lldp_neighbour',
+    'lldpneighborsystemname'   => 'lldp_neighbour',
+    'lldpsystemname'           => 'lldp_neighbour',
+    'lldpneighborport'         => 'lldp_neighbour_port',
+    'lldpneighbourport'        => 'lldp_neighbour_port',
+    'lldpneighborportid'       => 'lldp_neighbour_port',
+    'lldpportid'               => 'lldp_neighbour_port',
+    'lldpmedneighborport'      => 'lldp_neighbour_port',
+    'lldpneighboripaddress'    => 'lldp_neighbour_ip',
+    'lldpneighborip'           => 'lldp_neighbour_ip',
+];
+
+/** Neighbour fields, in the order a report should prefer them. */
+const CPS_NEIGHBOUR_FIELDS = [
+    'cdp_neighbour', 'cdp_neighbour_port', 'cdp_neighbour_ip', 'cdp_neighbour_platform',
+    'lldp_neighbour', 'lldp_neighbour_port', 'lldp_neighbour_ip',
+];
+
+/**
+ * Extract the upstream switch and port the phone reports seeing.
+ *
+ * Two passes. The alias table first, then a heuristic for keys the table
+ * does not know: anything whose normalised name starts cdp/lldp and mentions
+ * a device/system name or a port. The heuristic never overwrites an alias
+ * hit, so a known-good mapping always wins.
+ *
+ * A value of "not available", "none" or similar is treated as absent -
+ * phones report the field with a placeholder when CDP is off on the switch,
+ * and storing that placeholder as a switch name is worse than storing null.
+ *
+ * @return array<string,string>
+ */
+function cps_normalise_neighbour(array $pairs): array {
+    $out = [];
+    $placeholder = ['', 'n/a', 'na', 'none', 'not available', 'unknown', '0.0.0.0', '-'];
+
+    foreach ($pairs as $label => $value) {
+        $k = cps_norm_key((string)$label);
+        if (!isset(CPS_NEIGHBOUR_MAP[$k])) { continue; }
+        $v = trim((string)$value);
+        if (in_array(strtolower($v), $placeholder, true)) { continue; }
+        $out[CPS_NEIGHBOUR_MAP[$k]] ??= $v;
+    }
+
+    foreach ($pairs as $label => $value) {
+        $k = cps_norm_key((string)$label);
+        if (!preg_match('/^(cdp|lldp)/', $k, $m)) { continue; }
+        $v = trim((string)$value);
+        if (in_array(strtolower($v), $placeholder, true)) { continue; }
+        $proto = $m[1] === 'cdp' ? 'cdp' : 'lldp';
+        // Order matters: "port" is checked before the name, because
+        // "neighborportid" contains both "port" and "id".
+        if (str_contains($k, 'port')) {
+            $out[$proto . '_neighbour_port'] ??= $v;
+        } elseif (str_contains($k, 'ip') || str_contains($k, 'address')) {
+            $out[$proto . '_neighbour_ip'] ??= $v;
+        } elseif (str_contains($k, 'deviceid') || str_contains($k, 'systemname') || str_contains($k, 'device')) {
+            $out[$proto . '_neighbour'] ??= $v;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Collapse CDP and LLDP into one answer for reporting.
+ *
+ * CDP wins when both are present: on a Cisco switch it carries the switch's
+ * own hostname and an interface name a human can act on, whereas LLDP often
+ * reports a MAC-derived chassis id and a numeric port. LLDP is the fallback
+ * for the estates and switch vendors where CDP is off.
+ *
+ * @return array{switch_name:?string, switch_port:?string, switch_ip:?string, source:?string}
+ */
+function cps_neighbour_summary(array $n): array {
+    foreach (['cdp', 'lldp'] as $proto) {
+        if (!empty($n[$proto . '_neighbour']) || !empty($n[$proto . '_neighbour_port'])) {
+            return [
+                'switch_name' => $n[$proto . '_neighbour'] ?? null,
+                'switch_port' => $n[$proto . '_neighbour_port'] ?? null,
+                'switch_ip'   => $n[$proto . '_neighbour_ip'] ?? null,
+                'source'      => $proto,
+            ];
+        }
+    }
+    return ['switch_name' => null, 'switch_port' => null, 'switch_ip' => null, 'source' => null];
+}

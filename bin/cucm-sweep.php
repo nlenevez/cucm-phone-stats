@@ -201,6 +201,16 @@ foreach ($results as $name => $res) {
         }
     }
 
+    // Neighbour info is harvested from EVERY page, not just the config one.
+    // Firmware disagrees about where CDP/LLDP appears - some builds put it on
+    // the network port page - and looking in only one place means the field
+    // is there, visible in the raw pairs, and silently not collected.
+    $neighbour = [];
+    foreach ($pages as $page) {
+        if (!empty($page['ok'])) { $neighbour += cps_normalise_neighbour($page['pairs']); }
+    }
+    $uplink = cps_neighbour_summary($neighbour);
+
     $row = [
         'name'   => $name,
         'ip'     => $disc['ip'] ?? null,
@@ -208,7 +218,11 @@ foreach ($results as $name => $res) {
         'ok'     => $gotPort,
         'ports'  => [],
         'errors' => [],
+        'switch' => null,
     ];
+    if ($uplink['switch_name'] !== null || $uplink['switch_port'] !== null) {
+        $row['switch'] = trim(($uplink['switch_name'] ?? '?') . ' ' . ($uplink['switch_port'] ?? ''));
+    }
     foreach ($pages as $a => $page) {
         if (empty($page['ok'])) {
             $row['errors'][$a] = $page['error'] ?? 'failed';
@@ -248,6 +262,9 @@ foreach ($results as $name => $res) {
                 : null,
         ]);
         $db->insertRegistration($sweepId, $phoneId, $disc + ['source' => str_starts_with($source, 'file:') ? 'file' : $source]);
+        if ($neighbour || $uplink['switch_name'] !== null) {
+            $db->insertUplink($sweepId, $phoneId, $neighbour, $uplink);
+        }
         foreach ($pages as $a => $page) {
             $db->insertPageFetch($sweepId, $phoneId, CPS_ADAPTERS[$a] ?? $a, $page);
             if (!empty($page['ok']) && in_array($a, CPS_PORT_ADAPTERS, true)) {
@@ -304,6 +321,7 @@ if (!empty($opts['json'])) {
             'acc_speed'  => cps_fmt_link($s['ports']['access'] ?? null),
             'net_errs'   => (string)($s['ports']['network']['errors_total'] ?? ''),
             'acc_errs'   => (string)($s['ports']['access']['errors_total'] ?? ''),
+            'switch'     => (string)($s['switch'] ?? ''),
             'result'     => $s['ok'] ? 'ok' : ('FAILED: ' . implode('; ', array_slice($s['errors'], 0, 1))),
         ];
     }

@@ -66,7 +66,10 @@ const CPS_DEFAULTS = [
     'phone_parallel'  => 10,
     'phone_timeout'   => 10,
     'phone_connect_timeout' => 5,
-    'adapters'        => 'network,access,ethernet,device',
+    // 'config' is included so CDP/LLDP neighbour info is collected. Each
+    // adapter is one more request per phone, so trim this list if a sweep
+    // needs to be faster and the extra context is not wanted.
+    'adapters'        => 'network,access,ethernet,device,config',
 
     'db_enabled'      => 1,
     'db_host'         => '127.0.0.1',

@@ -141,6 +141,42 @@ CREATE TABLE IF NOT EXISTS page_fetches (
   CONSTRAINT fk_pf_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- What the phone itself says it is plugged into, per sweep.
+--
+-- A separate table rather than columns on `phones` or `registrations`: this
+-- is the phone's own view via CDP/LLDP, not CUCM's, and a phone moves desks.
+-- Keeping it per-sweep means the reports can say which switch port a fault
+-- was seen on at the time, not merely where the handset is today.
+--
+-- Being a new table also means an existing database picks it up from
+-- CREATE TABLE IF NOT EXISTS with no migration; adding columns to a table
+-- that already exists would silently do nothing.
+CREATE TABLE IF NOT EXISTS uplinks (
+  id                     BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  sweep_id               BIGINT UNSIGNED NOT NULL,
+  phone_id               BIGINT UNSIGNED NOT NULL,
+  cdp_neighbour          VARCHAR(255) NULL,
+  cdp_neighbour_port     VARCHAR(128) NULL,
+  cdp_neighbour_ip       VARCHAR(45)  NULL,
+  cdp_neighbour_platform VARCHAR(128) NULL,
+  lldp_neighbour         VARCHAR(255) NULL,
+  lldp_neighbour_port    VARCHAR(128) NULL,
+  lldp_neighbour_ip      VARCHAR(45)  NULL,
+  -- Collapsed answer: CDP preferred, LLDP as fallback. Stored rather than
+  -- derived so every report and any external query agree on the choice.
+  switch_name            VARCHAR(255) NULL,
+  switch_port            VARCHAR(128) NULL,
+  switch_ip              VARCHAR(45)  NULL,
+  neighbour_source       ENUM('cdp','lldp') NULL,
+  collected_at           DATETIME     NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_up_sweep_phone (sweep_id, phone_id),
+  KEY idx_up_switch (switch_name, switch_port),
+  KEY idx_up_phone (phone_id),
+  CONSTRAINT fk_up_sweep FOREIGN KEY (sweep_id) REFERENCES sweeps (id) ON DELETE CASCADE,
+  CONSTRAINT fk_up_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- ---------------------------------------------------------------------------
 -- Reporting views
 -- ---------------------------------------------------------------------------
@@ -165,6 +201,9 @@ SELECT
   p.description,
   p.model,
   r.ip_address,
+  u.switch_name,
+  u.switch_port,
+  u.neighbour_source,
   n.speed_mbps    AS network_speed_mbps,
   n.duplex        AS network_duplex,
   a.speed_mbps    AS access_speed_mbps,
@@ -180,6 +219,7 @@ JOIN port_stats a
 JOIN phones  p ON p.id = n.phone_id
 JOIN sweeps  s ON s.id = n.sweep_id
 LEFT JOIN registrations r ON r.sweep_id = n.sweep_id AND r.phone_id = n.phone_id
+LEFT JOIN uplinks       u ON u.sweep_id = n.sweep_id AND u.phone_id = n.phone_id
 WHERE n.port = 'network'
   AND n.link_up = 1 AND a.link_up = 1
   AND (NOT (n.speed_mbps <=> a.speed_mbps) OR NOT (n.duplex <=> a.duplex));
@@ -194,6 +234,9 @@ SELECT
   p.description,
   p.model,
   r.ip_address,
+  u.switch_name,
+  u.switch_port,
+  u.neighbour_source,
   ps.port,
   ps.link_up,
   ps.speed_mbps,
@@ -208,6 +251,7 @@ FROM port_stats ps
 JOIN phones p ON p.id = ps.phone_id
 JOIN sweeps s ON s.id = ps.sweep_id
 LEFT JOIN registrations r ON r.sweep_id = ps.sweep_id AND r.phone_id = ps.phone_id
+LEFT JOIN uplinks       u ON u.sweep_id = ps.sweep_id AND u.phone_id = ps.phone_id
 WHERE ps.errors_total > 0;
 
 -- REPORT 3 (base): consecutive-sweep deltas per phone and port.
@@ -224,6 +268,8 @@ SELECT
   ps.phone_id,
   p.device_name,
   p.description,
+  u.switch_name,
+  u.switch_port,
   ps.port,
   ps.errors_total,
   LAG(ps.errors_total) OVER w AS prev_errors_total,
@@ -241,6 +287,7 @@ SELECT
 FROM port_stats ps
 JOIN phones p ON p.id = ps.phone_id
 JOIN sweeps s ON s.id = ps.sweep_id
+LEFT JOIN uplinks u ON u.sweep_id = ps.sweep_id AND u.phone_id = ps.phone_id
 WHERE s.finished_at IS NOT NULL
 WINDOW w AS (PARTITION BY ps.phone_id, ps.port ORDER BY s.started_at, s.id);
 

@@ -213,6 +213,45 @@ class CpsDb
         $this->pdo->prepare($sql)->execute($vals);
     }
 
+    /**
+     * Store what the phone says it is plugged into for this sweep.
+     *
+     * @param array $n       raw cdp_ and lldp_ fields
+     * @param array $summary collapsed switch_name/switch_port/switch_ip/source
+     */
+    public function insertUplink(int $sweepId, int $phoneId, array $n, array $summary): void
+    {
+        $st = $this->pdo->prepare(
+            'INSERT INTO uplinks
+               (sweep_id, phone_id, cdp_neighbour, cdp_neighbour_port, cdp_neighbour_ip,
+                cdp_neighbour_platform, lldp_neighbour, lldp_neighbour_port, lldp_neighbour_ip,
+                switch_name, switch_port, switch_ip, neighbour_source, collected_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, NOW())
+             ON DUPLICATE KEY UPDATE
+               cdp_neighbour = VALUES(cdp_neighbour),
+               cdp_neighbour_port = VALUES(cdp_neighbour_port),
+               cdp_neighbour_ip = VALUES(cdp_neighbour_ip),
+               cdp_neighbour_platform = VALUES(cdp_neighbour_platform),
+               lldp_neighbour = VALUES(lldp_neighbour),
+               lldp_neighbour_port = VALUES(lldp_neighbour_port),
+               lldp_neighbour_ip = VALUES(lldp_neighbour_ip),
+               switch_name = VALUES(switch_name),
+               switch_port = VALUES(switch_port),
+               switch_ip = VALUES(switch_ip),
+               neighbour_source = VALUES(neighbour_source),
+               collected_at = NOW()'
+        );
+        $st->execute([
+            $sweepId, $phoneId,
+            $n['cdp_neighbour'] ?? null,  $n['cdp_neighbour_port'] ?? null,
+            $n['cdp_neighbour_ip'] ?? null, $n['cdp_neighbour_platform'] ?? null,
+            $n['lldp_neighbour'] ?? null, $n['lldp_neighbour_port'] ?? null,
+            $n['lldp_neighbour_ip'] ?? null,
+            $summary['switch_name'] ?? null, $summary['switch_port'] ?? null,
+            $summary['switch_ip'] ?? null,   $summary['source'] ?? null,
+        ]);
+    }
+
     public function insertPageFetch(int $sweepId, int $phoneId, string $adapter, array $page): void
     {
         $st = $this->pdo->prepare(

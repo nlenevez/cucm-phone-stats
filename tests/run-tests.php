@@ -154,6 +154,57 @@ eq('SEP filter drops the soft clients', count($f['excluded']), 2);
 eq('exclusions are counted per prefix', $f['by_prefix'], ['CSF' => 1, 'TCT' => 1]);
 eq('an empty prefix list keeps everything', count(cps_filter_by_device_prefix($rows, [])['kept']), 4);
 
+section('unit: CDP / LLDP neighbour extraction');
+$n = cps_normalise_neighbour([
+    'CDP Neighbor Device ID'  => 'sw-access-01',
+    'CDP Neighbor Port'       => 'GigabitEthernet1/0/12',
+    'CDP Neighbor IP Address' => '10.0.0.201',
+]);
+eq('CDP switch name',  $n['cdp_neighbour'], 'sw-access-01');
+eq('CDP switch port',  $n['cdp_neighbour_port'], 'GigabitEthernet1/0/12');
+eq('CDP switch IP',    $n['cdp_neighbour_ip'], '10.0.0.201');
+
+// LLDP-MED is a distinct spelling that has to land in the same fields.
+$n = cps_normalise_neighbour([
+    'LLDP-MED Neighbor Device ID' => 'sw-edge-07',
+    'LLDP-MED Neighbor Port'      => 'Gi1/0/33',
+]);
+eq('LLDP-MED name maps to lldp_neighbour', $n['lldp_neighbour'], 'sw-edge-07');
+eq('LLDP-MED port maps to lldp_neighbour_port', $n['lldp_neighbour_port'], 'Gi1/0/33');
+
+// A placeholder must not be stored as a switch name - phones report the
+// field with filler when CDP is off upstream.
+foreach (['not available', 'None', 'N/A', '', '-'] as $ph) {
+    $n = cps_normalise_neighbour(['CDP Neighbor Device ID' => $ph]);
+    ok("placeholder '$ph' is treated as absent", !isset($n['cdp_neighbour']), json_encode($n));
+}
+
+// A spelling the alias table has never seen must still be picked up.
+$n = cps_normalise_neighbour(['CDP Nbr Device'  => 'sw-weird-01', 'CDP Nbr Port Id' => 'Fa0/3']);
+eq('unknown CDP name spelling caught by fallback', $n['cdp_neighbour'] ?? null, 'sw-weird-01');
+eq('unknown CDP port spelling caught by fallback', $n['cdp_neighbour_port'] ?? null, 'Fa0/3');
+// ...and the fallback must not mistake a port field for a name.
+ok('"port id" is not read as a device name',
+   ($n['cdp_neighbour'] ?? '') !== 'Fa0/3', json_encode($n));
+
+$sum = cps_neighbour_summary(cps_normalise_neighbour([
+    'CDP Neighbor Device ID'  => 'sw-access-02',
+    'CDP Neighbor Port'       => 'Gi1/0/7',
+    'LLDP Neighbor Device ID' => '00:11:22:33:44:55',
+    'LLDP Neighbor Port'      => '7',
+]));
+eq('CDP wins over LLDP for the switch name', $sum['switch_name'], 'sw-access-02');
+eq('CDP wins over LLDP for the port', $sum['switch_port'], 'Gi1/0/7');
+eq('and the source is recorded', $sum['source'], 'cdp');
+
+$sum = cps_neighbour_summary(cps_normalise_neighbour(['LLDP Neighbor Device ID' => 'sw-lldp-only']));
+eq('LLDP is used when CDP is absent', $sum['switch_name'], 'sw-lldp-only');
+eq('source says lldp', $sum['source'], 'lldp');
+
+$sum = cps_neighbour_summary([]);
+eq('no neighbour info yields nulls', $sum['switch_name'], null);
+eq('and no source', $sum['source'], null);
+
 section('unit: partition subdivision');
 $sub = new ReflectionMethod(CpsRisportClient::class, 'subdivide');
 $sub->setAccessible(true);
@@ -297,7 +348,7 @@ ris_gap_ms     = 0
 phone_url_base = http://127.0.0.1:$port/phone/{ip}
 phone_parallel = 8
 phone_timeout  = 5
-adapters       = network,access,device
+adapters       = network,access,device,config
 db_host        = $dbHost
 db_port        = $dbPort
 db_name        = $dbName
@@ -403,6 +454,42 @@ eq('402 mismatch kind is speed', $byMm['SEP001122334402']['mismatch_kind'] ?? nu
 eq('403 mismatch kind is duplex', $byMm['SEP001122334403']['mismatch_kind'] ?? null, 'duplex');
 eq('402 network speed', (int)($byMm['SEP001122334402']['network_speed_mbps'] ?? 0), 1000);
 eq('402 access speed',  (int)($byMm['SEP001122334402']['access_speed_mbps'] ?? 0), 100);
+
+section('report: switch name and port reach the CSVs');
+$r = run("$php $root/bin/cucm-report.php uplinks --config $C --json");
+$up = array_column(json_decode($r['out'], true) ?: [], null, 'device_name');
+eq('CDP switch recorded', $up['SEP001122334401']['switch_name'] ?? null, 'sw-access-01');
+eq('CDP port recorded',   $up['SEP001122334401']['switch_port'] ?? null, 'GigabitEthernet1/0/12');
+eq('CDP preferred where both are present', $up['SEP001122334403']['switch_name'] ?? null, 'sw-access-02');
+eq('LLDP used where CDP is a placeholder', $up['SEP001122334404']['switch_name'] ?? null, 'sw-edge-07.example.local');
+eq('and its source is recorded as lldp',   $up['SEP001122334404']['neighbour_source'] ?? null, 'lldp');
+ok('the CDP placeholder is not stored as a switch name',
+   ($up['SEP001122334404']['cdp_neighbour'] ?? null) === null, json_encode($up['SEP001122334404'] ?? null));
+ok('a phone reporting no neighbour has no uplink row',
+   !isset($up['SEP001122334408']), implode(',', array_keys($up)));
+
+// The point of the exercise: an errors CSV must name the switch port.
+$r = run("$php $root/bin/cucm-report.php errors --config $C --csv");
+$hdr = explode("\n", trim($r['out']))[0] ?? '';
+ok('errors CSV header carries switch_name and switch_port',
+   str_contains($hdr, 'switch_name') && str_contains($hdr, 'switch_port'), $hdr);
+ok('errors CSV rows carry an actual switch', str_contains($r['out'], 'sw-edge-07'), substr($r['out'], 0, 300));
+
+foreach (['speed-mismatch', 'error-trend'] as $rep) {
+    $r = run("$php $root/bin/cucm-report.php $rep --config $C --csv");
+    $h = explode("\n", trim($r['out']))[0] ?? '';
+    ok("$rep CSV carries switch columns",
+       str_contains($h, 'switch_name') && str_contains($h, 'switch_port'), $h);
+}
+
+section('report: labels tells us what the phones actually send');
+$r = run("$php $root/bin/cucm-report.php labels --config $C --grep neighbor --json");
+$lb = json_decode($r['out'], true) ?: [];
+ok('labels finds the CDP fields', count($lb) > 0, substr($r['out'], 0, 200));
+$unmapped = array_filter($lb, fn($x) => $x['mapped_to'] === '- NOT MAPPED -');
+eq('every neighbour label the mock sends is mapped', count($unmapped), 0);
+ok('labels reports which adapter carried them',
+   str_contains($r['out'], 'device.statistics.configuration'), substr($r['out'], 0, 200));
 
 section('report: CSV output');
 foreach (['speed-mismatch', 'errors', 'error-trend', 'phones', 'sweeps'] as $rep) {

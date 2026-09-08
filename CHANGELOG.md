@@ -58,6 +58,24 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
 - `--parallel N`, and progress logging at `--verbose` so a long sweep does
   not look hung.
 
+**Uplink / CDP**
+- **Switch name and port in every report.** The phone's CDP/LLDP view of what
+  it is plugged into is collected per sweep into a new `uplinks` table and
+  joined into `v_port_speed_mismatch`, `v_port_errors` and
+  `v_port_error_deltas`, so an errors row names the switch port to go and
+  look at. CDP is preferred over LLDP where both exist; a placeholder value
+  is treated as absent; `neighbour_source` records which was used. A new
+  `uplinks` report lists it on its own.
+- Neighbour fields are harvested from **every** adapter page, not just
+  `config`, because some firmware puts CDP on the network port page.
+  `config` is now in the default `adapters` list.
+- **`labels` report** — histograms every label the phones actually returned,
+  which adapter carried it, and how the normaliser interprets it, with
+  `--grep` and `--unmapped-only`. Because raw pairs are stored verbatim this
+  confirms real field names from sweeps already taken rather than guessing
+  them, and a missed spelling can be added and the reports re-run without
+  re-sweeping the estate.
+
 **Probe**
 - `phone_probe_schemes` / `--schemes` controls which schemes the probe tries
   against a handset. Set to `https` on an all-HTTPS estate; the HTTP

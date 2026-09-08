@@ -27,14 +27,18 @@
 require_once dirname(__DIR__) . '/lib/config.php';
 require_once dirname(__DIR__) . '/lib/db.php';
 
-$p      = cps_parse_args($argv, ['json', 'csv', 'table', 'all', 'verbose', 'quiet', 'debug', 'help', 'include-resets']);
+$p      = cps_parse_args($argv, ['json', 'csv', 'table', 'all', 'verbose', 'quiet', 'debug', 'help',
+                                'include-resets', 'unmapped-only']);
 $opts   = $p['opts'];
 $report = $p['args'][0] ?? null;
 
-$known = ['speed-mismatch', 'errors', 'error-trend', 'phones', 'sweeps'];
+$known = ['speed-mismatch', 'errors', 'error-trend', 'phones', 'sweeps', 'uplinks', 'labels'];
 if (!empty($opts['help']) || $report === null) {
     fwrite(STDERR, "Usage: php bin/cucm-report.php <" . implode('|', $known) . "> [--sweep N|--all]\n"
-                 . "       [--min N] [--since YYYY-MM-DD] [--json|--csv|--table]\n");
+                 . "       [--min N] [--since YYYY-MM-DD] [--json|--csv|--table]\n"
+                 . "\n  uplinks  what each phone reports being plugged into (CDP/LLDP)\n"
+                 . "  labels   every label the phones returned and how it is interpreted;\n"
+                 . "           --grep TEXT to filter, --unmapped-only for the gaps\n");
     exit($report === null ? 1 : 0);
 }
 if (!in_array($report, $known, true)) {
@@ -58,6 +62,19 @@ if (!empty($opts['all'])) {
     }
 }
 
+// 'labels' is not a SQL report: it decodes the stored raw label/value pairs
+// and says which labels the normaliser recognises and which it ignores.
+//
+// This is how a field name gets confirmed rather than guessed. Every label a
+// phone returned is kept verbatim in page_fetches.pairs, so the real
+// spellings on this estate's firmware - CDP neighbour fields included - can
+// be read straight out of sweeps already taken, with no new sweep and no
+// trip to site.
+if ($report === 'labels') {
+    cps_report_labels($db, $sweepId, $opts);
+    exit(0);
+}
+
 [$sql, $params, $cols] = cps_build_report($report, $sweepId, $opts);
 $res     = $db->queryWithColumns($sql, $params);
 $rows    = $res['rows'];
@@ -73,6 +90,63 @@ else {
         $sweepId !== null && $report !== 'error-trend' && $report !== 'sweeps' ? " (sweep #$sweepId)" : ''));
 }
 
+/**
+ * Histogram every label the phones actually returned, and say how each one
+ * is being interpreted.
+ */
+function cps_report_labels(CpsDb $db, ?int $sweepId, array $opts): void
+{
+    $sql = 'SELECT adapter, pairs FROM page_fetches WHERE ok = 1 AND pairs IS NOT NULL';
+    $params = [];
+    if ($sweepId !== null) { $sql .= ' AND sweep_id = ?'; $params[] = $sweepId; }
+    $rows = $db->query($sql, $params);
+
+    $seen = [];
+    foreach ($rows as $r) {
+        $pairs = json_decode((string)$r['pairs'], true);
+        if (!is_array($pairs)) { continue; }
+        foreach ($pairs as $label => $value) {
+            $key = $r['adapter'] . "\0" . $label;
+            if (!isset($seen[$key])) {
+                $seen[$key] = ['adapter' => $r['adapter'], 'label' => (string)$label,
+                               'count' => 0, 'example' => (string)$value];
+            }
+            $seen[$key]['count']++;
+        }
+    }
+
+    $filter = is_string($opts['grep'] ?? null) ? mb_strtolower($opts['grep']) : null;
+    $out = [];
+    foreach ($seen as $e) {
+        $k = cps_norm_key($e['label']);
+        $mapped = CPS_COUNTER_MAP[$k]
+            ?? CPS_NEIGHBOUR_MAP[$k]
+            ?? CPS_DEVICE_MAP[$k]
+            ?? (in_array($k, CPS_LINK_LABELS, true) ? 'link state' : null);
+        if ($mapped === null && preg_match('/^(cdp|lldp)/', $k)) {
+            $mapped = 'neighbour (matched by fallback)';
+        }
+        if (!empty($opts['unmapped-only']) && $mapped !== null) { continue; }
+        if ($filter !== null && !str_contains(mb_strtolower($e['label']), $filter)) { continue; }
+        $out[] = [
+            'adapter'   => $e['adapter'],
+            'label'     => $e['label'],
+            'seen_on'   => $e['count'],
+            'mapped_to' => $mapped ?? '- NOT MAPPED -',
+            'example'   => mb_substr($e['example'], 0, 40),
+        ];
+    }
+    usort($out, fn($a, $b) => [$a['adapter'], -$a['seen_on']] <=> [$b['adapter'], -$b['seen_on']]);
+
+    if (!empty($opts['json']))    { echo cps_json($out); }
+    elseif (!empty($opts['csv'])) { echo cps_render_csv($out, ['adapter','label','seen_on','mapped_to','example']); }
+    else {
+        echo cps_render_table($out, ['adapter', 'label', 'seen_on', 'mapped_to', 'example']);
+        $un = count(array_filter($out, fn($r) => $r['mapped_to'] === '- NOT MAPPED -'));
+        fwrite(STDERR, sprintf("\n%d distinct labels, %d not mapped\n", count($out), $un));
+    }
+}
+
 /** @return array{0:string,1:array,2:array} sql, params, preferred columns */
 function cps_build_report(string $report, ?int $sweepId, array $opts): array
 {
@@ -80,17 +154,20 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
     switch ($report) {
         case 'speed-mismatch':
             $sql = 'SELECT device_name, description, model, ip_address,
+                           switch_name, switch_port, neighbour_source,
                            network_speed_mbps, network_duplex,
                            access_speed_mbps, access_duplex, mismatch_kind, started_at
                     FROM v_port_speed_mismatch';
             if ($sweepId !== null) { $sql .= ' WHERE sweep_id = ?'; $params[] = $sweepId; }
             $sql .= ' ORDER BY device_name';
-            return [$sql, $params, ['device_name', 'ip_address', 'model',
+            return [$sql, $params, ['device_name', 'ip_address', 'switch_name', 'switch_port',
                 'network_speed_mbps', 'network_duplex', 'access_speed_mbps', 'access_duplex', 'mismatch_kind']];
 
         case 'errors':
             $min = isset($opts['min']) && is_string($opts['min']) ? (int)$opts['min'] : 1;
-            $sql = 'SELECT device_name, description, ip_address, port, speed_mbps, duplex,
+            $sql = 'SELECT device_name, description, ip_address,
+                           switch_name, switch_port, neighbour_source,
+                           port, speed_mbps, duplex,
                            errors_total, rx_crc_err, rx_align_err, rx_short_err, rx_long_err,
                            tx_collisions, tx_late_collision, tx_excess_collision,
                            rx_total_pkt, tx_total_pkt, started_at
@@ -98,8 +175,8 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
             $params[] = $min;
             if ($sweepId !== null) { $sql .= ' AND sweep_id = ?'; $params[] = $sweepId; }
             $sql .= ' ORDER BY errors_total DESC, device_name';
-            return [$sql, $params, ['device_name', 'ip_address', 'port', 'speed_mbps', 'duplex',
-                'errors_total', 'rx_crc_err', 'tx_collisions', 'tx_late_collision', 'rx_total_pkt']];
+            return [$sql, $params, ['device_name', 'ip_address', 'switch_name', 'switch_port',
+                'port', 'speed_mbps', 'duplex', 'errors_total', 'rx_crc_err', 'tx_collisions']];
 
         case 'error-trend':
             // Deliberately not scoped to one sweep: a delta is between two.
@@ -113,11 +190,12 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
                 $where[] = 'started_at >= ?';
                 $params[] = $opts['since'];
             }
-            $sql = 'SELECT device_name, description, port, prev_started_at, started_at,
+            $sql = 'SELECT device_name, description, switch_name, switch_port, port,
+                           prev_started_at, started_at,
                            prev_errors_total, errors_total, errors_delta, counter_reset
                     FROM v_port_error_deltas WHERE ' . implode(' AND ', $where)
                  . ' ORDER BY errors_delta DESC, started_at DESC, device_name';
-            return [$sql, $params, ['device_name', 'port', 'prev_started_at', 'started_at',
+            return [$sql, $params, ['device_name', 'switch_name', 'switch_port', 'port',
                 'prev_errors_total', 'errors_total', 'errors_delta', 'counter_reset']];
 
         case 'phones':
@@ -125,6 +203,19 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
                            serial_number, last_ip, first_seen, last_seen
                     FROM phones ORDER BY device_name';
             return [$sql, [], ['device_name', 'last_ip', 'model', 'dir_number', 'description', 'last_seen']];
+
+        case 'uplinks':
+            $sql = 'SELECT p.device_name, p.description, r.ip_address,
+                           u.switch_name, u.switch_port, u.switch_ip, u.neighbour_source,
+                           u.cdp_neighbour, u.cdp_neighbour_port,
+                           u.lldp_neighbour, u.lldp_neighbour_port, u.collected_at
+                    FROM uplinks u
+                    JOIN phones p ON p.id = u.phone_id
+                    LEFT JOIN registrations r ON r.sweep_id = u.sweep_id AND r.phone_id = u.phone_id';
+            if ($sweepId !== null) { $sql .= ' WHERE u.sweep_id = ?'; $params[] = $sweepId; }
+            $sql .= ' ORDER BY u.switch_name, u.switch_port, p.device_name';
+            return [$sql, $params, ['device_name', 'ip_address', 'switch_name', 'switch_port',
+                'neighbour_source', 'description']];
 
         case 'sweeps':
             $sql = 'SELECT id, started_at, finished_at, source, phones_discovered,

@@ -532,13 +532,44 @@ function phone_page(string $behaviour, string $adapter, string $name, int $gen):
         ]);
     }
     if (str_contains($adapter, 'configuration')) {
-        return table3([
-            'DHCP Server'  => '10.0.0.1',
-            'Domain Name'  => 'example.local',
-            'TFTP Server 1'=> '10.0.0.10',
-            'CDP Neighbor Device ID' => 'sw-access-01',
-            'CDP Neighbor Port'      => 'GigabitEthernet1/0/12',
-        ]);
+        $kv = [
+            'DHCP Server'   => '10.0.0.1',
+            'Domain Name'   => 'example.local',
+            'TFTP Server 1' => '10.0.0.10',
+        ];
+        // Deliberately varied, because firmware is:
+        //  - the clean phone reports CDP only
+        //  - the errors phone reports LLDP only, and a CDP placeholder that
+        //    must NOT be stored as a switch name
+        //  - the duplex-mismatch phone reports both, so CDP must win
+        //  - access-down reports neither
+        switch ($behaviour) {
+            case 'errors':
+                $kv += [
+                    'CDP Neighbor Device ID'      => 'not available',
+                    'LLDP-MED Neighbor Device ID' => 'sw-edge-07.example.local',
+                    'LLDP-MED Neighbor Port'      => 'Gi1/0/33',
+                ];
+                break;
+            case 'duplex-mismatch':
+                $kv += [
+                    'CDP Neighbor Device ID'  => 'sw-access-02',
+                    'CDP Neighbor Port'       => 'GigabitEthernet1/0/7',
+                    'CDP Neighbor IP Address' => '10.0.0.202',
+                    'LLDP Neighbor Device ID' => '00:11:22:33:44:55',
+                    'LLDP Neighbor Port'      => '7',
+                ];
+                break;
+            case 'access-down':
+                break;   // no neighbour info at all
+            default:
+                $kv += [
+                    'CDP Neighbor Device ID'  => 'sw-access-01',
+                    'CDP Neighbor Port'       => 'GigabitEthernet1/0/12',
+                    'CDP Neighbor IP Address' => '10.0.0.201',
+                ];
+        }
+        return table3($kv);
     }
 
     // Counters grow with the generation; generation 3 models a reboot, where
