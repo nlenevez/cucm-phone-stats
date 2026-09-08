@@ -334,6 +334,13 @@ multicast, unicast) are deliberately *not* errors.
 **`error-trend`** — ports whose error counters actually grew between two
 sweeps, with the growth, not just the total.
 
+**One row per phone and port**, being the most recent growth, plus
+`times_grown` (how many sweeps it grew in) and `total_growth` (how much
+across them). This is a time series underneath, so without collapsing it a
+port that has grown across five sweeps appears five times with five
+different counts — which reads as duplicate rows rather than as history.
+`--history` gives every transition when that is what you actually want.
+
 Phone counters are free-running and clear when the handset reboots, so a
 naive delta goes sharply negative on every reboot. A drop is reported as
 `counter_reset = 1` with a NULL delta instead, so a rebooting phone can never

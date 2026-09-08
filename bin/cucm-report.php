@@ -28,7 +28,7 @@ require_once dirname(__DIR__) . '/lib/config.php';
 require_once dirname(__DIR__) . '/lib/db.php';
 
 $p      = cps_parse_args($argv, ['json', 'csv', 'table', 'all', 'verbose', 'quiet', 'debug', 'help',
-                                'include-resets', 'unmapped-only']);
+                                'include-resets', 'unmapped-only', 'history']);
 $opts   = $p['opts'];
 $report = $p['args'][0] ?? null;
 
@@ -38,7 +38,9 @@ if (!empty($opts['help']) || $report === null) {
                  . "       [--min N] [--since YYYY-MM-DD] [--json|--csv|--table]\n"
                  . "\n  uplinks  what each phone reports being plugged into (CDP/LLDP)\n"
                  . "  labels   every label the phones returned and how it is interpreted;\n"
-                 . "           --grep TEXT to filter, --unmapped-only for the gaps\n");
+                 . "           --grep TEXT to filter, --unmapped-only for the gaps\n"
+                 . "\n  error-trend gives one row per phone and port (the most recent growth,\n"
+                 . "  with times_grown / total_growth); --history for every transition\n");
     exit($report === null ? 1 : 0);
 }
 if (!in_array($report, $known, true)) {
@@ -190,13 +192,43 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
                 $where[] = 'started_at >= ?';
                 $params[] = $opts['since'];
             }
+            $inner = 'SELECT device_name, description, switch_name, switch_port, phone_id, port,
+                             prev_started_at, started_at,
+                             prev_errors_total, errors_total, errors_delta, counter_reset
+                      FROM v_port_error_deltas WHERE ' . implode(' AND ', $where);
+
+            if (!empty($opts['history'])) {
+                // Every transition: the full time series for a port.
+                return [$inner . ' ORDER BY device_name, port, started_at DESC',
+                    $params,
+                    ['device_name', 'switch_name', 'switch_port', 'port', 'started_at',
+                     'prev_errors_total', 'errors_total', 'errors_delta', 'counter_reset']];
+            }
+
+            // Default: ONE row per phone and port - the most recent growth.
+            //
+            // This is a time series, so without collapsing it a port that has
+            // grown across five sweeps appears five times with five different
+            // counts, which reads as duplicate rows rather than as history.
+            // The question the report exists to answer is "which ports are
+            // getting worse", and that wants the current state plus how
+            // persistent the problem is, not every step that got there.
             $sql = 'SELECT device_name, description, switch_name, switch_port, port,
                            prev_started_at, started_at,
-                           prev_errors_total, errors_total, errors_delta, counter_reset
-                    FROM v_port_error_deltas WHERE ' . implode(' AND ', $where)
-                 . ' ORDER BY errors_delta DESC, started_at DESC, device_name';
+                           prev_errors_total, errors_total, errors_delta, counter_reset,
+                           times_grown, total_growth
+                    FROM (
+                      SELECT t.*,
+                             ROW_NUMBER() OVER (PARTITION BY t.phone_id, t.port
+                                                ORDER BY t.started_at DESC) AS rn,
+                             COUNT(*)      OVER (PARTITION BY t.phone_id, t.port) AS times_grown,
+                             SUM(t.errors_delta) OVER (PARTITION BY t.phone_id, t.port) AS total_growth
+                      FROM (' . $inner . ') t
+                    ) x
+                    WHERE x.rn = 1
+                    ORDER BY x.errors_delta DESC, x.device_name';
             return [$sql, $params, ['device_name', 'switch_name', 'switch_port', 'port',
-                'prev_errors_total', 'errors_total', 'errors_delta', 'counter_reset']];
+                'prev_errors_total', 'errors_total', 'errors_delta', 'times_grown', 'total_growth']];
 
         case 'phones':
             $sql = 'SELECT device_name, mac_address, description, model, dir_number,

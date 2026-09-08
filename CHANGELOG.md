@@ -147,6 +147,13 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
   `https://{ip}` and `http://{ip}`.
 
 ### Fixed
+- **`error-trend` repeated the same phone and port once per sweep
+  transition**, each with a different error count, which reads as duplicate
+  rows rather than as the time series it is. It now returns **one row per
+  phone and port** — the most recent growth — with `times_grown` and
+  `total_growth` summarising the rest, since "this port has grown in four of
+  the last four sweeps" is a stronger signal than any single delta.
+  `--history` restores the full series.
 - **`dir_number` overflowed its column and cost the whole phone.** RisPort
   returns `DirNumber` as a comma-separated list of *every* line appearance,
   so a phone with many lines runs past `VARCHAR(64)` and MySQL rejects the

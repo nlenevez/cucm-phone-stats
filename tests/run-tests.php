@@ -609,6 +609,33 @@ foreach ($tr ?: [] as $row) { if ($row['device_name'] === 'SEP001122334404' && $
 eq('delta is the increase', (int)($t404['errors_delta'] ?? 0), 24);   // 17 crc + 3 align + 4 late
 ok('clean phone absent from the trend', !in_array('SEP001122334401', $trNames, true), implode(',', $trNames));
 
+section('report: error-trend gives one row per phone and port');
+// A time series shows the same phone and port once per transition, which
+// reads as duplicate rows with contradictory counts rather than as history.
+// Several more growing sweeps, then the default must collapse them.
+foreach ([4, 5, 6] as $g) {
+    file_get_contents("http://127.0.0.1:$port/_gen/$g");
+    run("$php $root/bin/cucm-sweep.php --config $C --json");
+    sleep(1);   // DATETIME is second-resolution; keep the order unambiguous
+}
+$r  = run("$php $root/bin/cucm-report.php error-trend --config $C --json");
+$tr = json_decode($r['out'], true) ?: [];
+$pairs = array_map(fn($x) => $x['device_name'] . '|' . $x['port'], $tr);
+eq('no phone and port appears twice', count($pairs), count(array_unique($pairs)));
+ok('and there is still something to report', count($tr) > 0, $r['out']);
+
+$one = null;
+foreach ($tr as $x) { if ($x['device_name'] === 'SEP001122334404' && $x['port'] === 'network') { $one = $x; } }
+ok('the row kept is the most recent growth', $one !== null, json_encode(array_slice($tr, 0, 2)));
+ok('times_grown counts the sweeps it grew in', (int)($one['times_grown'] ?? 0) >= 3, json_encode($one));
+ok('total_growth exceeds the last delta alone',
+   (int)($one['total_growth'] ?? 0) > (int)($one['errors_delta'] ?? 0), json_encode($one));
+
+// The full series is still available when it is actually wanted.
+$r = run("$php $root/bin/cucm-report.php error-trend --config $C --history --json");
+$hist = json_decode($r['out'], true) ?: [];
+ok('--history returns the whole series', count($hist) > count($tr), count($hist) . ' vs ' . count($tr));
+
 section('report: a reboot is a reset, not an improvement');
 file_get_contents("http://127.0.0.1:$port/_gen/3");   // counters clear
 $r = run("$php $root/bin/cucm-sweep.php --config $C --json");
