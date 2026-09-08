@@ -239,6 +239,33 @@ class CpsDb
         if ($this->pdo->inTransaction()) { $this->pdo->rollBack(); }
     }
 
+    /**
+     * Run a query and return both the rows and the SELECT's column names.
+     *
+     * The column list comes from the statement rather than from the first
+     * row, so a result with no rows still knows its shape. CSV output needs
+     * that: a report with nothing to say should be a header and no data
+     * rows, not a zero-byte file, which is indistinguishable from the
+     * command having failed.
+     *
+     * @return array{rows: array<int,array<string,mixed>>, columns: string[]}
+     */
+    public function queryWithColumns(string $sql, array $params = []): array
+    {
+        $st = $this->pdo->prepare($sql);
+        $st->execute($params);
+        $rows = $st->fetchAll();
+        $cols = [];
+        for ($i = 0, $n = $st->columnCount(); $i < $n; $i++) {
+            $meta = @$st->getColumnMeta($i);
+            if (is_array($meta) && isset($meta['name'])) { $cols[] = (string)$meta['name']; }
+        }
+        // Drivers are allowed to refuse metadata; fall back to the keys of
+        // the first row, and to nothing if there is not one.
+        if (!$cols && $rows) { $cols = array_keys($rows[0]); }
+        return ['rows' => $rows, 'columns' => $cols];
+    }
+
     /** @return array<int,array<string,mixed>> */
     public function query(string $sql, array $params = []): array
     {

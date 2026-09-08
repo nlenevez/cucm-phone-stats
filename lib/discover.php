@@ -18,7 +18,7 @@ function cps_discover_phones(array $cfg, string $source, string $status): array
 {
     if ($source === 'risport') {
         $parts = (string)($cfg['ris_partitions'] ?? 'auto');
-        $mode  = in_array(strtolower(trim($parts)), ['auto', 'off'], true)
+        $mode  = in_array(strtolower(trim($parts)), ['auto', 'off', 'always'], true)
             ? strtolower(trim($parts))
             : preg_split('/[\s,]+/', $parts, -1, PREG_SPLIT_NO_EMPTY);
         $res = CpsRisportClient::discover(cps_risport_clients($cfg), $status, 'Phone', $mode);

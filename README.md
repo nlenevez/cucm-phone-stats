@@ -149,10 +149,17 @@ so a short answer is well formed, error free and indistinguishable from a
 complete one. On a multi-thousand-phone cluster that means a confidently
 wrong estate size.
 
-The only reliable signal is the cluster's own `TotalDevicesFound` against
-what actually arrived. `ris_partitions = auto` (the default) does one plain
-query, compares the two, and if it came up short re-runs the enumeration
-split by device-name prefix — 16 buckets on the first hex digit of the MAC
+**`TotalDevicesFound` alone is not enough.** On a capped response some
+releases report the *capped* number, so a cluster with 2,300 phones answers
+with 1,000 devices and says 1,000 exist — internally consistent, and a
+comparison concludes the answer is complete.
+
+`ris_partitions = auto` (the default) therefore uses two signals: fewer
+devices than `TotalDevicesFound` claims, **or** a result sitting at or near
+the cap. An estate having exactly 1,000 registered phones is vanishingly
+unlikely; splitting when it does costs one extra pass, whereas not splitting
+when it has been truncated loses devices silently. When either fires, the
+enumeration re-runs split by device-name prefix — 16 buckets on the first hex digit of the MAC
 for `SEP*`, plus the soft-client prefixes — merging by device name. The
 truncation is logged rather than swallowed:
 
@@ -165,8 +172,13 @@ Discovery also reports **per server**: how many devices each one returned,
 how many were new, and the per-node breakdown from `CmNodes`. With more than
 one cluster in play, a single total cannot show which one came up short.
 
-Set `ris_partitions = off` to reproduce the untruncated behaviour, or give an
-explicit pattern list.
+A bucket that itself comes back at the cap is subdivided a character deeper
+(`SEP0*` → `SEP00*`…`SEP0Z*`), up to three levels. Results merge by device
+name throughout, so subdividing can only add devices, never lose them.
+
+`ris_partitions = always` forces the split regardless — reach for it if
+counts still look low. `off` reproduces the untruncated behaviour, and an
+explicit pattern list is also accepted.
 
 ### Speed
 

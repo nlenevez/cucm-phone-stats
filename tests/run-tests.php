@@ -102,6 +102,40 @@ foreach (['2-column' => $two, '3-column with ":"' => $three, 'padded spacers' =>
 // Negative control: a row with only one cell is not a stat.
 eq('single-cell row ignored', cps_parse_stats_html('<table><tr><td>Heading</td></tr></table>'), []);
 
+// A phone answering 200 with nothing in it reached DOMDocument::loadHTML(''),
+// which throws a ValueError under PHP 8 and killed a whole sweep. These must
+// return no pairs, not throw.
+eq('empty body parses to nothing', cps_parse_stats_html(''), []);
+eq('whitespace-only body parses to nothing', cps_parse_stats_html("  \n\t "), []);
+eq('markup with no table parses to nothing',
+   cps_parse_stats_html('<html><body><h1>Service unavailable</h1></body></html>'), []);
+
+section('unit: CSV rendering');
+// CUCM descriptions really do contain commas, quotes and the occasional
+// pasted newline. A report that corrupts the file on those is worse than no
+// report, because the damage is invisible until someone reads a spreadsheet.
+$csv = cps_render_csv([
+    ['name' => 'SEP001122334401', 'description' => 'Level 2, Room 3 "Boardroom"', 'errors' => 7],
+    ['name' => 'SEP001122334402', 'description' => "Line1\nLine2", 'errors' => 0],
+    ['name' => 'SEP001122334403', 'description' => null, 'errors' => 12],
+]);
+$fh = fopen('php://memory', 'r+');
+fwrite($fh, $csv);
+rewind($fh);
+$head = fgetcsv($fh, 0, ',', '"', '\\');
+$back = [];
+while (($row = fgetcsv($fh, 0, ',', '"', '\\')) !== false) {
+    if ($row === [null] || $row === ['']) { continue; }
+    $back[] = array_combine($head, $row);
+}
+fclose($fh);
+eq('header is the union of keys', $head, ['name', 'description', 'errors']);
+eq('all rows survive a round trip', count($back), 3);
+eq('comma and embedded quotes preserved', $back[0]['description'], 'Level 2, Room 3 "Boardroom"');
+eq('embedded newline preserved', $back[1]['description'], "Line1\nLine2");
+eq('null renders as empty, not the word null', $back[2]['description'], '');
+eq('numeric column intact', $back[2]['errors'], '12');
+
 section('unit: device-name prefixes');
 eq('SEP is a hard phone',        cps_device_prefix('SEP001122334455'), 'SEP');
 eq('CSF is a Jabber desktop',    cps_device_prefix('CSFJOSEPH'), 'CSF');
@@ -119,6 +153,17 @@ eq('SEP filter keeps the handsets', count($f['kept']), 2);
 eq('SEP filter drops the soft clients', count($f['excluded']), 2);
 eq('exclusions are counted per prefix', $f['by_prefix'], ['CSF' => 1, 'TCT' => 1]);
 eq('an empty prefix list keeps everything', count(cps_filter_by_device_prefix($rows, [])['kept']), 4);
+
+section('unit: partition subdivision');
+$sub = new ReflectionMethod(CpsRisportClient::class, 'subdivide');
+$sub->setAccessible(true);
+$kids = $sub->invoke(null, 'SEP0*');
+eq('one child per 0-9A-Z', count($kids), 36);
+eq('first child extends the stem', $kids[0], 'SEP00*');
+eq('last child is Z, not F - names are not always hex', $kids[35], 'SEP0Z*');
+eq('a soft-client prefix subdivides too', $sub->invoke(null, 'CSF*')[0], 'CSF0*');
+ok('every child keeps the parent stem',
+   count(array_filter($kids, fn($k) => str_starts_with($k, 'SEP0'))) === 36, implode(',', array_slice($kids, 0, 3)));
 
 section('unit: config values that look boolean');
 // parse_ini_file's TYPED and NORMAL scanners turn "off"/"no"/"false"/"none"
@@ -359,6 +404,33 @@ eq('403 mismatch kind is duplex', $byMm['SEP001122334403']['mismatch_kind'] ?? n
 eq('402 network speed', (int)($byMm['SEP001122334402']['network_speed_mbps'] ?? 0), 1000);
 eq('402 access speed',  (int)($byMm['SEP001122334402']['access_speed_mbps'] ?? 0), 100);
 
+section('report: CSV output');
+foreach (['speed-mismatch', 'errors', 'error-trend', 'phones', 'sweeps'] as $rep) {
+    $r = run("$php $root/bin/cucm-report.php $rep --config $C --csv");
+    $lines = array_values(array_filter(explode("\n", trim($r['out'])), fn($l) => $l !== ''));
+    ok("$rep --csv exits 0 and emits a header", $r['rc'] === 0 && count($lines) >= 1,
+       "rc={$r['rc']} out=" . substr($r['out'], 0, 120));
+    ok("$rep --csv header has no stray table formatting",
+       !str_contains($lines[0] ?? '', '  ') && str_contains($lines[0] ?? '', ','),
+       $lines[0] ?? '(empty)');
+}
+// The count footer must not land in the CSV - it goes to stderr.
+$r = run("$php $root/bin/cucm-report.php errors --config $C --csv");
+ok('row-count footer stays out of the CSV body', !str_contains($r['out'], 'row(s)'), substr($r['out'], -120));
+
+// A report with no findings must still be a valid CSV. error-trend has
+// nothing to say until a second sweep exists, which makes it the natural
+// case to check.
+$r = run("$php $root/bin/cucm-report.php error-trend --config $C --csv");
+$tl = array_values(array_filter(explode("\n", trim($r['out'])), fn($l) => $l !== ''));
+eq('an empty report is a header and no data rows', count($tl), 1);
+ok('that header names the real columns',
+   str_contains($tl[0] ?? '', 'device_name') && str_contains($tl[0] ?? '', 'errors_delta'), $tl[0] ?? '(empty)');
+// And it must parse as CSV, not merely be non-empty.
+$fh = fopen('php://memory', 'r+'); fwrite($fh, $r['out']); rewind($fh);
+$hdr = fgetcsv($fh, 0, ',', '"', '\\'); fclose($fh);
+ok('empty-report header parses as CSV', is_array($hdr) && count($hdr) > 3, json_encode($hdr));
+
 section('report: non-zero errors');
 $r = run("$php $root/bin/cucm-report.php errors --config $C --json");
 $er = json_decode($r['out'], true);
@@ -403,6 +475,29 @@ ok('trend report contains no negative deltas', !$stillNeg);
 section('integration: RisPort response cap and the partitioning fallback');
 file_get_contents("http://127.0.0.1:$port/_big/300");   // 300 phones, cap 120
 
+// The harder variant, and the one seen in the field: the cluster caps the
+// response AND reports TotalDevicesFound as the capped number, so the answer
+// is internally consistent and comparing the two proves nothing. Detection
+// has to fall back on the result sitting at the cap.
+file_get_contents("http://127.0.0.1:$port/_bigcap/1");
+$confCap = "$root/tests/.cucm-test-cap.conf";
+// ris_max_devices matching the server's cap mirrors production, where we ask
+// for 1000 and the cluster returns exactly 1000.
+file_put_contents($confCap, file_get_contents($conf) . "\nris_max_devices = 120\n");
+
+$r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confCap) . " --json");
+eq('a self-consistent capped answer is still detected and recovered',
+   count(json_decode($r['out'], true) ?: []), 300);
+ok('the at-cap reason is reported', str_contains($r['err'], 'at or near the'), substr($r['err'], 0, 200));
+
+// Negative control: with partitioning off, the same config must come back
+// short. If it does not, the mock has stopped modelling the fault.
+file_put_contents($confCap, file_get_contents($conf) . "\nris_max_devices = 120\nris_partitions = off\n");
+$r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confCap) . " --json");
+eq('with partitioning off the cap still truncates', count(json_decode($r['out'], true) ?: []), 120);
+@unlink($confCap);
+file_get_contents("http://127.0.0.1:$port/_bigcap/0");
+
 // Reproduce the fault first. If this ever stops returning a short count the
 // mock has stopped modelling the bug, and the next assertion proves nothing.
 $confOff = "$root/tests/.cucm-test-off.conf";
@@ -415,8 +510,12 @@ eq('unpartitioned query is truncated by the cap', count($off ?: []), 120);
 $r = run("$php $root/bin/cucm-phones.php --config $C --json");
 $auto = json_decode($r['out'], true);
 eq('auto partitioning recovers the full estate', count($auto ?: []), 300);
+// Assert on the facts in the message, not its exact wording - the phrasing
+// has been reworded once already and a brittle match just fails later for
+// no reason.
 ok('truncation is reported, not silent',
-   str_contains($r['err'], 'of 300 devices it says exist'), substr($r['err'], 0, 200));
+   str_contains($r['err'], 're-running split by name prefix')
+   && str_contains($r['err'], '300'), substr($r['err'], 0, 200));
 
 // Unique device names: a merge bug would inflate or collapse the count.
 $names = array_column($auto ?: [], 'name');
@@ -430,6 +529,39 @@ eq('sample still honoured on a large estate', $bs['polled'] ?? null, 25);
 
 @unlink($confOff);
 file_get_contents("http://127.0.0.1:$port/_big/0");     // back to the small estate
+
+// ------------------------------------------------- badly behaved phones ---
+section('integration: a bad handset cannot abort the sweep');
+file_get_contents("http://127.0.0.1:$port/_edge/1");   // 200+empty, 200+whitespace, 200+no table
+
+$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --json");
+$eg = json_decode($r['out'], true);
+ok('the sweep completes instead of dying', is_array($eg) && isset($eg['polled']),
+   substr($r['out'] . ' ' . $r['err'], 0, 300));
+eq('every phone is still accounted for', $eg['polled'] ?? null, 10);
+eq('the good phones still succeed', $eg['ok'] ?? null, 5);
+ok('no ValueError escaped', !str_contains($r['err'], 'ValueError'), substr($r['err'], 0, 200));
+
+// The distinct causes must stay distinct: an empty body is the phone's
+// fault, unparseable markup is arguably ours, and they lead different places.
+$errs = [];
+foreach ($eg['phones'] ?? [] as $ph) {
+    foreach ($ph['errors'] ?? [] as $msg) { $errs[$ph['name']] = $msg; }
+}
+ok('empty body reported as such',
+   str_contains($errs['SEP00112233EE01'] ?? '', 'empty body'), $errs['SEP00112233EE01'] ?? '(none)');
+ok('whitespace-only body reported as empty too',
+   str_contains($errs['SEP00112233EE02'] ?? '', 'empty body'), $errs['SEP00112233EE02'] ?? '(none)');
+ok('markup with no table reported as a parse failure, not as empty',
+   str_contains($errs['SEP00112233EE03'] ?? '', 'no label/value rows'), $errs['SEP00112233EE03'] ?? '(none)');
+
+// And the classification must survive into the database.
+$r = run("$php $root/bin/cucm-sweep.php --config $C --json");
+$kinds = array_column($db->query(
+    "SELECT DISTINCT error_kind FROM page_fetches WHERE ok = 0 AND error_kind IS NOT NULL"), 'error_kind');
+ok("'empty' is a recorded error_kind", in_array('empty', $kinds, true), implode(',', $kinds));
+
+file_get_contents("http://127.0.0.1:$port/_edge/0");
 
 // -------------------------------------------------------- concurrency -----
 section('integration: phones are polled concurrently, not in batches');

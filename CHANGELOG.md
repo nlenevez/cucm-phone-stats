@@ -2,103 +2,129 @@
 
 ## Unreleased
 
+First working version. Never yet run against the production cluster in
+anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
+
 ### Added
+
+**Core**
 - AXL client (`lib/axl.php`): schema-version negotiation, `executeSQLQuery`,
-  paged `listPhone`, `RegistrationDynamic` fallback query.
+  paged `listPhone` with a row cap, `RegistrationDynamic` fallback query.
 - RisPort70 client (`lib/risport.php`): `selectCmDevice` with StateInfo
-  paging, multi-server merge, IPv4-preferred address selection.
-- Phone collection (`lib/phone.php`): parallel fetch of the network and
-  access port pages plus ethernet/device/config context; tolerant HTML table
-  parser; label normalisation into typed speed, duplex and error columns.
+  paging, partitioned enumeration, multi-server merge, per-server and
+  per-node attribution.
+- Phone collection (`lib/phone.php`): rolling-window concurrent fetch of the
+  network and access port pages plus ethernet/device/config context;
+  tolerant HTML table parser; label normalisation into typed speed, duplex
+  and error columns, with the raw label/value pairs always retained.
 - MySQL store and reporting views (`schema.sql`): sweeps, phones,
   registrations, port_stats, page_fetches; `v_port_speed_mismatch`,
   `v_port_errors`, `v_port_error_deltas`, `v_port_errors_increasing`.
 - CLIs: `cucm-probe.php`, `cucm-phones.php`, `cucm-sweep.php`,
   `cucm-phone-netstats.php`, `cucm-report.php`, `cucm-initdb.php`.
-- Mock CUCM and mock phones (`tests/mock-server.php`) plus 84 checks
-  (`tests/run-tests.php`), including negative controls.
+- Mock CUCM and mock phones (`tests/mock-server.php`) and 189 checks
+  (`tests/run-tests.php`), including negative controls throughout.
 - Docs: README, `docs/design.md`, `docs/cucm-permissions.md`,
   `docs/airgap-runbook.md`.
 
-### Changed
-- Verified end to end on the target platform, **RHEL 8.10** with PHP 8.2.33
-  from AppStream, against **MySQL 8.0.46 and MySQL 8.4.11**: 84 checks,
-  exit 0 on each. (MariaDB 10.3 also passes; MySQL is the target.) The
-  earlier "MySQL 8.0" claim was taken from the `mysql:8` image tag, which
-  now resolves to 8.4 - so 8.0 had not in fact been exercised until now.
-- Documented the **database grants**, tested rather than asserted: the
-  runtime account needs only SELECT/INSERT/UPDATE, with DDL split into a
-  separate setup account used once by `cucm-initdb.php`. Nothing in the tool
-  deletes a row, so no DELETE is granted. Documented the RPM
-  set — `php-cli php-xml php-mysqlnd` — because RHEL splits the extensions
-  up and **`php-cli` alone does not provide DOM**, which every script here
-  depends on. Also noted that RHEL 8's AppStream default stream is php 7.2
-  and that it has no 8.3 stream at all.
-- Documented floor is **PHP 8.2**, verified on 8.2, 8.3, 8.4 and 8.5. The
-  previous "8.1+" was read off the code, not tested. `pdo_mysql` is required
-  only for the database half; the probe, discovery, single-phone and
-  `--no-db` sweep paths run without it.
-- `cucm-probe.php` now probes the configured `phone_url_base` as well as
-  `https://{ip}` and `http://{ip}`.
-
-### Added
+**Scoping and scale**
 - **`poll_device_prefixes` (default `SEP`) — only hard handsets are polled.**
   CSF/TCT/BOT/TAB Jabber clients, CIPC and ATA adapters have no switch or PC
-  port, so there is nothing to collect from them; more importantly a Jabber
-  client registers from the *user's workstation*, so an unfiltered sweep
-  fired an HTTPS request at every desk in the estate. `--all-devices` or an
-  explicit `--device-prefixes` list overrides. The skip is reported with a
-  per-prefix breakdown.
-- `--match` accepts `field:value` to scope the search to one field.
-  `--match` remains a substring search across name/description/model/ip, so
-  `--match SEP` legitimately matches `CSFJOSEPH` (JO-SEP-H); the docs and
-  `--help` now say so, a test pins the behaviour, and `--device-prefixes` is
-  pointed to as the anchored alternative.
+  port. More importantly a Jabber client registers from the *user's
+  workstation*, so an unfiltered sweep fired an HTTPS request at every desk
+  in the estate. `--all-devices` or an explicit `--device-prefixes` list
+  overrides; the skip is reported with a per-prefix breakdown.
 - **Partitioned RisPort enumeration** (`ris_partitions`, default `auto`).
-  RisPort caps a single `selectCmDevice` conversation without saying so -
+  RisPort caps a single `selectCmDevice` conversation without saying so —
   `StateInfo` stops arriving and the truncated answer looks complete. The
-  returned count is now compared against the cluster's own
-  `TotalDevicesFound`, and a short answer triggers a re-run split by
-  device-name prefix, merged by name. Truncation is warned about, never
-  swallowed.
+  returned count is compared against the cluster's own `TotalDevicesFound`,
+  and a short answer triggers a re-run split by device-name prefix, merged
+  by name. Truncation is warned about, never swallowed.
 - Discovery reports **per server**: devices returned, new-unique, and the
-  per-node `CmNodes` breakdown - a single total cannot show which of several
+  per-node `CmNodes` breakdown — a single total cannot show which of several
   clusters came up short.
 - `exclude_subnets` / `--exclude-subnet CIDR[,CIDR]` on `cucm-sweep.php` and
   `cucm-phones.php`, sharing one implementation so the listing and the sweep
-  cannot disagree about scope. Matching is byte-wise over `inet_pton`, so
-  non-byte-boundary prefixes and both address families are handled. An
-  invalid prefix is fatal, and a prefix that matched nothing is named in the
-  output.
-- `--sample N` on `cucm-sweep.php` for a random spread across the estate,
-  plus `--match TEXT` (name/description/model/IP) applied before sampling.
-  `--limit N` still takes the first N, which on a real cluster means one
-  node's worth of phones.
+  cannot disagree about scope. Byte-wise matching over `inet_pton`, so
+  non-byte-boundary prefixes and both address families work. An invalid
+  prefix is fatal; a prefix that matched nothing is named in the output.
+- `--sample N` for a random spread across the estate, and `--match TEXT`
+  (name/description/model/IP) applied before sampling. `--limit N` still
+  takes the first N, which on a real cluster means one node's worth.
+- `--match` accepts `field:value` to scope the search. It remains a
+  substring search, so `--match SEP` legitimately matches `CSFJOSEPH`
+  (JO-SEP-H); the docs and `--help` say so, a test pins it, and
+  `--device-prefixes` is the anchored alternative.
+- `--parallel N`, and progress logging at `--verbose` so a long sweep does
+  not look hung.
+
+**Probe**
 - `phone_probe_schemes` / `--schemes` controls which schemes the probe tries
-  against a handset. Set to `https` on an all-HTTPS estate; the HTTP attempts
-  time out rather than failing fast.
-- RisPort probe now records TotalDevicesFound vs the number returned, the
-  per-node breakdown from `CmNodes`, the status histogram, the paging rounds
-  and one `CmDevice` element verbatim, and repeats the query with
-  `Status=Any`. A short-but-clean answer is otherwise indistinguishable from
-  a complete one.
+  against a handset. Set to `https` on an all-HTTPS estate; the HTTP
+  attempts time out rather than failing fast.
+- The RisPort probe records `TotalDevicesFound` against the number returned,
+  the per-node breakdown, the status histogram, the paging rounds and one
+  `CmDevice` element verbatim, and repeats the query with `Status=Any`.
+
+### Changed
+- Verified end to end on the target platform, **RHEL 8.10** with PHP 8.2.33
+  from AppStream, against **MySQL 8.0.46 and 8.4.11**. (MariaDB 10.3 also
+  passes; MySQL is the target.) The earlier "MySQL 8.0" claim came from the
+  `mysql:8` image tag, which now resolves to 8.4 — so 8.0 had not in fact
+  been exercised until then.
+- Documented floor is **PHP 8.2**, verified on 8.2, 8.3, 8.4 and 8.5. The
+  previous "8.1+" was read off the code, not tested. `pdo_mysql` is needed
+  only for the database half; the probe, discovery, single-phone and
+  `--no-db` sweep paths run without it.
+- Documented the RPM set — `php-cli php-xml php-mysqlnd` — because RHEL
+  splits the extensions up and **`php-cli` alone does not provide DOM**,
+  which every script here depends on. RHEL 8's AppStream default stream is
+  php 7.2, and it has no 8.3 stream at all.
+- Documented the **database grants**, tested rather than asserted: the
+  runtime account needs only SELECT/INSERT/UPDATE, with DDL split into a
+  separate setup account used once by `cucm-initdb.php`. Nothing here
+  deletes a row, so no DELETE is granted.
+- `cucm-probe.php` probes the configured `phone_url_base` as well as
+  `https://{ip}` and `http://{ip}`.
 
 ### Fixed
+- **Truncation went undetected when the cluster capped `TotalDevicesFound`
+  too.** A CUCM with 2,300 registered phones returned exactly 1,000 and also
+  reported 1,000 as the total, so comparing the two concluded the answer was
+  complete and the partitioning fallback never fired. Detection now also
+  treats a result sitting at or near the cap as truncated, a bucket that
+  itself hits the cap is subdivided a character deeper (up to three levels),
+  and `ris_partitions = always` forces the split outright.
+- **A phone answering HTTP 200 with an empty body crashed the whole sweep.**
+  `curl` reported no error and the status was 200, so every guard passed the
+  body through to `DOMDocument::loadHTML('')`, which throws a `ValueError`
+  under PHP 8 — killing a run of thousands part-way through and losing every
+  phone after the bad one. Empty and whitespace-only bodies are now reported
+  as `error_kind = 'empty'` (distinct from `parse`, which means the markup
+  arrived but was not understood), the parser is wrapped so no future
+  surprise can escape, and each phone's processing in `cucm-sweep.php` is
+  contained so one handset can never abort the run. A sweep that dies anyway
+  now records the reason on its `sweeps` row instead of sitting open with no
+  explanation.
 - **Phone polling batched instead of streaming, and one slow handset stalled
   nine fast ones.** `fetchMany()` split phones into chunks of
-  `phone_parallel` and ran each chunk to completion before starting the
-  next, so every chunk cost as much as its slowest member. Replaced with a
-  rolling window that refills as each request finishes. Measured on 100
-  phones with one in eight slow: **12.2s to 3.1s** at the default
-  `phone_parallel = 10`, and 1.6s at 20. Added `--parallel N`, plus progress
-  logging at `--verbose` so a long sweep does not look hung.
-- **Config values that look boolean were being destroyed by the INI parser.**
-  `parse_ini_file`'s TYPED and NORMAL scanners both turn `off`, `no`, `false`
-  and `none` into `false` or `""`, so `ris_partitions = off` became an empty
-  pattern list and discovery returned **zero** phones - from a config file
-  that reads correctly and raises no error. Now parsed with
-  `INI_SCANNER_RAW`, with the genuinely boolean settings coerced explicitly
-  (`cps_cfg_bool`, which accepts 1/0, true/false, yes/no, on/off).
+  `phone_parallel` and ran each to completion before starting the next, so
+  every chunk cost as much as its slowest member. Replaced with a rolling
+  window that refills as each request finishes. Measured on 100 phones with
+  one in eight slow: **12.2s to 3.1s** at the default `phone_parallel = 10`,
+  and 1.6s at 20.
+- **Config values that look boolean were destroyed by the INI parser.**
+  `parse_ini_file`'s TYPED and NORMAL scanners both turn `off`, `no`,
+  `false` and `none` into `false` or `""`, so `ris_partitions = off` became
+  an empty pattern list and discovery returned **zero** phones — from a
+  config file that reads correctly and raises no error. Now parsed with
+  `INI_SCANNER_RAW`, booleans coerced explicitly via `cps_cfg_bool()`.
+- **`listPhones()` walked the entire estate when only a sample was wanted.**
+  Its second argument is the page size, not a row cap, so the probe's
+  `listPhones([...], 3)` fetched all 6,757 configured phones three at a time
+  — over two thousand SOAP round trips for what should be one. Added a
+  `$maxRows` cap; the probe pulls two pages of two, which still proves
+  skip/first paging advances.
 - **`&nbsp;` spacer cells corrupted parsed values.** These pages pad tables
   with `&nbsp;`, which decodes to U+00A0; PCRE's `\s` does not match U+00A0
   outside UTF-8 mode, so a cell that should test as empty did not, the
@@ -106,21 +132,20 @@
   `"\u{00A0} 10"` instead of `"10"`. The same bug was present in
   `patching-tools/cisco-phone-netstats.php`, which shares this parser, and
   was fixed there in `ad37cb0`.
-- Test harness referenced the `SIGTERM` constant, which only exists with
+- **A report with no rows produced an empty CSV, with no header** — a
+  zero-byte file is indistinguishable from the command having failed. The
+  header now comes from the statement's column metadata rather than from the
+  first row, so an empty result is a header and no data rows. CSV also
+  carries every selected column rather than the first row's keys.
+- An `https://` base could be redirected to `http://`, re-sending basic-auth
+  credentials in cleartext. Redirect protocols are pinned to the base's
+  scheme (never downgrade; an http base may still upgrade).
+- `cucm-probe.php` ignored `phone_url_base`, so an estate serving the phone
+  pages on a non-standard base saw every phone probe fail while the sweep
+  worked — the probe contradicting the tool it exists to validate.
+- `cps_phone_url()` bracketed any address containing a colon as IPv6, so
+  `10.0.0.5:8443` became `[10.0.0.5:8443]` and curl rejected it.
+- The test harness referenced the `SIGTERM` constant, which only exists with
   ext-pcntl. Without it the suite passed and then fatally errored in its
   shutdown handler, turning a green run into a non-zero exit code.
   `proc_terminate()` already defaults to SIGTERM.
-- `cucm-probe.php` ignored `phone_url_base`, so an estate serving the phone
-  pages on a non-standard base saw every phone probe fail while the sweep
-  worked - the probe contradicting the tool it exists to validate.
-- **`listPhones()` walked the entire estate when only a sample was wanted.**
-  Its second argument is the page size, not a row cap, so the probe's
-  `listPhones([...], 3)` fetched all 6,757 configured phones three at a time
-  - over two thousand SOAP round trips for what should be one. Added a
-  `$maxRows` cap; the probe now pulls two pages of two, which still proves
-  skip/first paging advances.
-- An `https://` base could be redirected to `http://`, re-sending basic-auth
-  credentials in cleartext. Redirect protocols are now pinned to the base's
-  scheme (never downgrade; an http base may still upgrade).
-- `cps_phone_url()` bracketed any address containing a colon as IPv6, so
-  `10.0.0.5:8443` became `[10.0.0.5:8443]` and curl rejected it.

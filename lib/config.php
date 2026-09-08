@@ -33,6 +33,7 @@ const CPS_DEFAULTS = [
     // How to enumerate an estate larger than one RisPort response:
     //   auto (default) - one plain query, and if it returns fewer devices
     //                    than TotalDevicesFound claims, re-run split by name
+    //   always         - always split, whatever the first query returned
     //   off            - never split; accept whatever one query returns
     //   <list>         - explicit patterns, e.g. "SEP0*,SEP1*,..."
     'ris_partitions'  => 'auto',

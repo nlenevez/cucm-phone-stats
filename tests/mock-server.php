@@ -38,8 +38,43 @@ const BIG_FILE = __DIR__ . '/.mock-big';
  * reproduce is just a hopeful guess.
  */
 const BIG_CAP = 120;
+const BIGCAP_FILE = __DIR__ . '/.mock-bigcap';
+
+/**
+ * GET /_bigcap/1 makes TotalDevicesFound report the CAPPED count.
+ *
+ * This is the harder, real-world variant: the cluster returns 1000 devices
+ * and also says 1000 exist, so comparing the two proves nothing and the
+ * truncated answer is internally consistent. Detection has to fall back on
+ * the result sitting exactly on the cap.
+ */
+function capHidesTotal(): bool {
+    return is_readable(BIGCAP_FILE) && trim((string)file_get_contents(BIGCAP_FILE)) === '1';
+}
 const SOFT_FILE = __DIR__ . '/.mock-soft';
 const CONC_FILE = __DIR__ . '/.mock-conc';
+const EDGE_FILE = __DIR__ . '/.mock-edge';
+
+/**
+ * GET /_edge/1 adds handsets that answer badly but not obviously so.
+ *
+ * The first of these is a real failure from the field: HTTP 200, zero-byte
+ * body, curl reporting no error whatsoever. Every guard passed it through to
+ * DOMDocument::loadHTML(''), which throws a ValueError under PHP 8 and took
+ * an entire sweep of thousands down with it. The others are its neighbours:
+ * a body of pure whitespace, and markup with no table at all.
+ */
+function edgeClients(): array {
+    if (!is_readable(EDGE_FILE) || trim((string)file_get_contents(EDGE_FILE)) !== '1') { return []; }
+    return [
+        'SEP00112233EE01' => ['ip' => '10.10.10.61', 'status' => 'Registered', 'model' => 'Cisco 8841',
+                              'descr' => 'Answers 200 with nothing', 'http' => 'Yes', 'behaviour' => 'empty'],
+        'SEP00112233EE02' => ['ip' => '10.10.10.62', 'status' => 'Registered', 'model' => 'Cisco 8841',
+                              'descr' => 'Answers 200 with whitespace', 'http' => 'Yes', 'behaviour' => 'blank'],
+        'SEP00112233EE03' => ['ip' => '10.10.10.63', 'status' => 'Registered', 'model' => 'Cisco 8841',
+                              'descr' => 'Answers 200 with no table', 'http' => 'Yes', 'behaviour' => 'notable'],
+    ];
+}
 const SLOW_FILE = __DIR__ . '/.mock-slow';
 
 /**
@@ -159,6 +194,16 @@ if (preg_match('#^/_slow/(\d+)$#', $uri, $m)) {
     echo "slow {$m[1]}ms\n";
     return;
 }
+if (preg_match('#^/_bigcap/([01])$#', $uri, $m)) {
+    file_put_contents(BIGCAP_FILE, $m[1]);
+    echo "bigcap {$m[1]}\n";
+    return;
+}
+if (preg_match('#^/_edge/([01])$#', $uri, $m)) {
+    file_put_contents(EDGE_FILE, $m[1]);
+    echo "edge cases {$m[1]}\n";
+    return;
+}
 if (preg_match('#^/_soft/([01])$#', $uri, $m)) {
     file_put_contents(SOFT_FILE, $m[1]);
     header('Content-Type: text/plain');
@@ -194,7 +239,7 @@ echo "no mock route for $uri\n";
 // Each phone is here to produce a specific, checkable outcome.
 // ---------------------------------------------------------------------------
 function estate(): array {
-    return softClients() + [
+    return edgeClients() + softClients() + [
         // clean baseline: both ports 100/full, no errors
         'SEP001122334401' => ['ip' => '10.10.10.1', 'status' => 'Registered', 'model' => 'Cisco 8841',
                               'descr' => 'Reception', 'http' => 'Yes', 'behaviour' => 'clean'],
@@ -390,6 +435,9 @@ function ris(string $body): void {
     // by name prefix a workaround rather than a coincidence.
     $trueTotal = count($all);
     $capped    = (bigCount() > 0 && !$narrowed) ? BIG_CAP : PHP_INT_MAX;
+    // With capHidesTotal the response is self-consistent and gives detection
+    // nothing to compare against.
+    if (capHidesTotal() && $trueTotal > $capped) { $trueTotal = $capped; }
 
     // Page deliberately at 3 devices regardless of MaxReturnedDevices, so
     // StateInfo paging is exercised even on a small fixture estate.
@@ -449,6 +497,15 @@ function phoneInner(string $ip, string $adapter): void {
         return;
     }
     if ($e['behaviour'] === 'noweb') { http_response_code(404); echo 'not found'; return; }
+
+    // 200 with nothing in it - the field failure this guards against.
+    if ($e['behaviour'] === 'empty') { header('Content-Type: text/html'); echo ''; return; }
+    if ($e['behaviour'] === 'blank') { header('Content-Type: text/html'); echo "   \n\t  \n"; return; }
+    if ($e['behaviour'] === 'notable') {
+        header('Content-Type: text/html');
+        echo '<html><body><h1>Service temporarily unavailable</h1></body></html>';
+        return;
+    }
 
     header('Content-Type: text/html');
     echo phone_page($e['behaviour'], $adapter, $name, gen());

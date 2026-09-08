@@ -65,6 +65,32 @@ is enough to finish it.
   two sweeps in the same second tie, and both "the latest sweep" and the
   `LAG()` window would then pick arbitrarily among them.
 
+## One phone must never stop the sweep
+
+A run covers thousands of handsets and takes minutes. Anything that lets a
+single device abort it turns a small fault into a total loss, and the
+failure arrives at whatever point in the estate the bad phone happens to
+sit, so the data you keep is an arbitrary prefix of the run.
+
+This is not hypothetical: a phone answering HTTP 200 with a zero-byte body
+reached `DOMDocument::loadHTML('')`, which throws a `ValueError` under PHP 8.
+curl reported no error, the status was 200, and every guard passed it
+through. The sweep died several minutes in.
+
+Three layers now, because each catches a different class of surprise:
+
+1. The parser refuses an empty document rather than throwing, and the
+   fetcher classifies that as `empty` — a phone-side fault, distinct from
+   `parse`, which means markup arrived and this code did not understand it.
+2. The parse call is wrapped, so an unanticipated libxml or DOM error
+   becomes one recorded page failure.
+3. Each phone's processing in `cucm-sweep.php` is wrapped, so anything at
+   all going wrong for one device costs that device and nothing else.
+
+A sweep that dies regardless records the reason on its `sweeps` row.
+`finished_at` stays NULL so the reporting views keep excluding a partial
+run, but the row says why rather than sitting open with no explanation.
+
 ## Failure modes are kept apart
 
 A phone that times out, one that refuses the connection, one that returns

@@ -251,6 +251,18 @@ class CpsRisportClient
     }
 
     /**
+     * RisPort will not return more than this from one selectCmDevice
+     * conversation, whatever MaxReturnedDevices asks for.
+     */
+    public const HARD_CAP = 1000;
+
+    /** The most this client can expect back from a single query. */
+    private function effectiveCap(): int
+    {
+        return min(max(1, $this->maxReturnedDevices), self::HARD_CAP);
+    }
+
+    /**
      * Enumerate every matching device, working around the response cap.
      *
      * One plain query first, because on a small cluster that is the whole
@@ -280,17 +292,42 @@ class CpsRisportClient
             $totals = array_map('intval', array_filter(array_column($diag['rounds'] ?? [], 'total_devices_found'), 'strlen'));
             $claimed = $totals ? max($totals) : null;
 
-            if ($mode === 'off' || $claimed === null || count($rows) >= $claimed) {
+            $cap     = $this->effectiveCap();
+            // 90% rather than 100%: the documented cap is 1000 and asking for
+            // 1000 gets exactly 1000, but an administrator can lower the
+            // RisPort throttle below what we asked for, in which case the
+            // result stops just short of our number. Splitting one extra time
+            // is cheap; missing a truncation is not.
+            $atCap   = count($rows) >= (int)ceil($cap * 0.9);
+            $short   = $claimed !== null && count($rows) < $claimed;
+            $reason  = null;
+            if ($short) {
+                $reason = sprintf('returned %d of the %d it says exist', count($rows), $claimed);
+            } elseif ($atCap) {
+                // TotalDevicesFound is not a reliable truncation signal: on a
+                // capped response some releases report the CAPPED number, so
+                // returned == claimed == 1000 and a comparison alone concludes
+                // the answer is complete. Landing exactly on the cap is the
+                // tell. An estate having precisely $cap registered phones is
+                // vanishingly unlikely, and splitting when it has costs one
+                // extra pass; NOT splitting when it has not loses devices
+                // silently, which is far worse.
+                $reason = sprintf('returned %d, at or near the %d-device cap (TotalDevicesFound=%s)',
+                    count($rows), $cap, $claimed ?? '?');
+            }
+
+            if ($mode === 'always' && $reason === null) {
+                $reason = 'ris_partitions = always';
+            }
+            if ($mode === 'off' || $reason === null) {
                 $this->lastDiag['enumeration'] = [
                     'mode' => 'single', 'returned' => count($rows),
                     'total_devices_found' => $claimed, 'truncated' => false,
                 ];
                 return $rows;
             }
-            cps_warn(sprintf(
-                '%s: RisPort returned %d of %d devices it says exist - re-running split by name prefix',
-                $this->soap->baseUrl(), count($rows), $claimed
-            ));
+            cps_warn(sprintf('%s: RisPort %s - re-running split by name prefix',
+                $this->soap->baseUrl(), $reason));
             $patterns = self::DEFAULT_PARTITIONS;
             $firstPass = $rows;
             $firstClaimed = $claimed;
@@ -303,7 +340,20 @@ class CpsRisportClient
         $byName = [];
         foreach ($firstPass as $r) { $byName[$r['name']] = $r; }
         $perPattern = [];
-        foreach ($patterns as $pat) {
+        $cap        = $this->effectiveCap();
+
+        // Work through a queue rather than a fixed list: a bucket that comes
+        // back at the cap is itself truncated and gets subdivided a level
+        // deeper. Results are merged by name throughout, so subdividing can
+        // only ever add devices - if a child pattern misses something the
+        // parent already found, the parent's row is still there.
+        $queue = array_values($patterns);
+        $depth = [];
+        foreach ($queue as $q) { $depth[$q] = 0; }
+        $maxDepth = 3;
+
+        while ($queue) {
+            $pat = array_shift($queue);
             try {
                 $part = $this->selectCmDevice($status, $deviceClass, [$pat]);
             } catch (Throwable $e) {
@@ -314,6 +364,20 @@ class CpsRisportClient
             $perPattern[$pat] = count($part);
             foreach ($part as $r) {
                 if ($r['name'] !== '') { $byName[$r['name']] = $r; }
+            }
+
+            if (count($part) >= $cap) {
+                $d = ($depth[$pat] ?? 0) + 1;
+                if ($d > $maxDepth) {
+                    cps_warn(sprintf(
+                        'RisPort partition %s still returns the %d-device cap at maximum subdivision depth - '
+                        . 'devices under this prefix may be missing', $pat, $cap));
+                } else {
+                    $children = self::subdivide($pat);
+                    cps_warn(sprintf('RisPort partition %s hit the %d-device cap - subdividing into %d',
+                        $pat, $cap, count($children)));
+                    foreach ($children as $c) { $depth[$c] = $d; $queue[] = $c; }
+                }
             }
             if ($this->requestGapMs > 0) { usleep($this->requestGapMs * 1000); }
         }
@@ -330,6 +394,27 @@ class CpsRisportClient
         cps_log(sprintf('%s: partitioned enumeration produced %d unique devices (first pass %d)',
             $this->soap->baseUrl(), count($merged), count($firstPass)));
         return $merged;
+    }
+
+    /**
+     * Split a wildcard pattern one character deeper.
+     *
+     * "SEP0*" becomes "SEP00*".."SEP0Z*". The alphabet is 0-9A-Z rather than
+     * just hex because these patterns are not only MAC-based: a soft-client
+     * prefix is followed by a username. Over-generating is harmless - a
+     * pattern matching nothing costs one cheap query - whereas leaving a
+     * character out would drop devices.
+     *
+     * @return string[]
+     */
+    private static function subdivide(string $pattern): array
+    {
+        $stem = rtrim($pattern, '*');
+        $out  = [];
+        foreach (str_split('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ') as $ch) {
+            $out[] = $stem . $ch . '*';
+        }
+        return $out;
     }
 
     /**

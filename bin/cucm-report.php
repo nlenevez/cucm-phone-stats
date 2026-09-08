@@ -59,10 +59,14 @@ if (!empty($opts['all'])) {
 }
 
 [$sql, $params, $cols] = cps_build_report($report, $sweepId, $opts);
-$rows = $db->query($sql, $params);
+$res     = $db->queryWithColumns($sql, $params);
+$rows    = $res['rows'];
+$sqlCols = $res['columns'];
 
 if (!empty($opts['json']))      { echo cps_json($rows); }
-elseif (!empty($opts['csv']))   { echo cps_render_csv($rows); }
+// CSV carries every selected column, and always emits the header - a report
+// with no findings is a header with no data rows, never an empty file.
+elseif (!empty($opts['csv']))   { echo cps_render_csv($rows, $sqlCols); }
 else {
     echo cps_render_table($rows, $cols);
     fwrite(STDERR, sprintf("\n%d row(s)%s\n", count($rows),

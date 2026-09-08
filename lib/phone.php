@@ -265,6 +265,12 @@ function cps_squash_ws(string $s): string {
  * non-separator cell in a row; first is the label, the rest is the value.
  */
 function cps_parse_stats_html(string $html): array {
+    // DOMDocument::loadHTML() throws a ValueError on an empty string under
+    // PHP 8, and a phone answering 200 with a zero-byte body reaches here
+    // with curl reporting no error at all. Returning no pairs lets the
+    // caller classify it; throwing killed an entire sweep.
+    if (trim($html) === '') { return []; }
+
     $prev = libxml_use_internal_errors(true);
     $dom  = new DOMDocument();
     $dom->loadHTML($html, LIBXML_NOWARNING | LIBXML_NOERROR);
@@ -497,7 +503,22 @@ class CpsPhoneFetcher
             return ['ok' => false, 'http_code' => $code, 'error_kind' => 'http',
                     'error' => "phone returned HTTP $code"];
         }
-        $pairs = cps_parse_stats_html($body);
+        // A 200 with no bytes is the phone's fault; a 200 we could not parse
+        // is arguably ours. Different remedies, so different error_kind.
+        if (trim($body) === '') {
+            return ['ok' => false, 'http_code' => 200, 'error_kind' => 'empty',
+                    'error' => 'phone returned HTTP 200 with an empty body'];
+        }
+
+        // Nothing a single handset does may abort a sweep of thousands, so
+        // any parser surprise becomes a recorded failure for that one page.
+        try {
+            $pairs = cps_parse_stats_html($body);
+        } catch (Throwable $e) {
+            return ['ok' => false, 'http_code' => 200, 'error_kind' => 'parse',
+                    'error' => 'parser failed: ' . $e->getMessage(),
+                    'raw' => substr($body, 0, 4000)];
+        }
         if (!$pairs) {
             return ['ok' => false, 'http_code' => 200, 'error_kind' => 'parse',
                     'error' => 'page fetched but no label/value rows parsed', 'raw' => $body];

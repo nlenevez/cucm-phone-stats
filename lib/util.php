@@ -145,7 +145,10 @@ function cps_render_table(array $rows, array $cols = []): string {
 
 /** Render a list of assoc arrays as CSV text (union of all keys as header). */
 function cps_render_csv(array $rows, array $cols = []): string {
-    if (!$rows) { return ''; }
+    // With columns supplied, an empty result is still a valid CSV: one
+    // header line. Returning nothing at all makes "no findings" look
+    // identical to "the command failed".
+    if (!$rows && !$cols) { return ''; }
     if (!$cols) {
         $cols = [];
         foreach ($rows as $r) { foreach (array_keys($r) as $k) { $cols[$k] = true; } }

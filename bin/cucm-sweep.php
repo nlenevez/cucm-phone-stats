@@ -142,6 +142,24 @@ if ($useDb) {
     $db      = new CpsDb($cfg);
     $sweepId = $db->startSweep($source, cps_server_urls($cfg), CPS_VERSION);
     cps_log("sweep #$sweepId opened");
+
+    // If the run dies anyway, say so on the sweep row. finished_at stays
+    // NULL so the reporting views keep excluding a partial run, but the
+    // reason is recorded rather than the sweep just sitting there open with
+    // no explanation months later.
+    register_shutdown_function(function () use ($db, $sweepId) {
+        if (!isset($GLOBALS['CPS_SWEEP_FINISHED'])) {
+            $e = error_get_last();
+            $why = $e && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)
+                ? sprintf('aborted: %s in %s:%d', $e['message'], basename((string)$e['file']), $e['line'])
+                : 'aborted before completion';
+            try {
+                $st = $db->pdo()->prepare('UPDATE sweeps SET notes = ? WHERE id = ? AND finished_at IS NULL');
+                $st->execute([substr($why, 0, 2000), $sweepId]);
+            } catch (Throwable) { /* nothing useful left to do at shutdown */ }
+            fwrite(STDERR, "sweep #$sweepId did not complete: $why\n");
+        }
+    });
 }
 
 if (isset($opts['parallel']) && is_string($opts['parallel'])) {
@@ -157,8 +175,13 @@ foreach ($pollable as $r) { $byName[$r['name']] = $r; }
 
 $ok = $failed = 0;
 $dbErrors = 0;
+$phoneErrors = 0;
 $summary = [];
 foreach ($results as $name => $res) {
+  // Everything for one phone is contained. A sweep of thousands must never
+  // be brought down by one handset: an unhandled throw here previously took
+  // the whole run with it, losing every phone after the bad one.
+  try {
     $disc  = $byName[$name] ?? ['name' => $name];
     $pages = $res['pages'] ?? [];
 
@@ -237,13 +260,19 @@ foreach ($results as $name => $res) {
         $dbErrors++;
         cps_warn("$name: database write failed: " . $e->getMessage());
     }
+  } catch (Throwable $e) {
+    $failed++;
+    $phoneErrors++;
+    cps_warn("$name: skipped after an unexpected error: " . get_class($e) . ': ' . $e->getMessage());
+  }
 }
 
+$GLOBALS['CPS_SWEEP_FINISHED'] = true;
 if ($db) {
     $db->finishSweep($sweepId, [
         'discovered' => $discovered, 'polled' => count($results),
         'ok' => $ok, 'failed' => $failed,
-    ], $dbErrors > 0 ? "$dbErrors phone(s) failed to store" : null);
+    ], cps_sweep_notes($dbErrors, $phoneErrors));
     cps_log("sweep #$sweepId closed");
     // A sweep that reached every phone but stored none of it must not look
     // like a success: the polling worked and the run is still worthless.
@@ -262,6 +291,7 @@ if (!empty($opts['json'])) {
         'failed'     => $failed,
         'elapsed_s'  => round(microtime(true) - $t0, 1),
         'db_errors'  => $dbErrors,
+        'phone_errors' => $phoneErrors,
         'phones'     => $summary,
     ]);
 } else {
@@ -285,6 +315,14 @@ if (!empty($opts['json'])) {
 // Exit 2 when nothing usable came out of the run: no phone answered, or the
 // database rejected every write.
 exit((($failed > 0 && $ok === 0) || ($db && $dbErrors > 0 && $dbErrors === count($results))) ? 2 : 0);
+
+function cps_sweep_notes(int $dbErrors, int $phoneErrors): ?string
+{
+    $n = [];
+    if ($dbErrors > 0)    { $n[] = "$dbErrors phone(s) failed to store"; }
+    if ($phoneErrors > 0) { $n[] = "$phoneErrors phone(s) skipped after an unexpected error"; }
+    return $n ? implode('; ', $n) : null;
+}
 
 function cps_fmt_link(?array $p): string
 {
