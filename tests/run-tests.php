@@ -205,6 +205,36 @@ $sum = cps_neighbour_summary([]);
 eq('no neighbour info yields nulls', $sum['switch_name'], null);
 eq('and no source', $sum['source'], null);
 
+section('unit: exact partitions computed from device names');
+// Blind prefix splitting has to DISCOVER where an estate divides, one
+// expensive level at a time. Given the real names it can be computed.
+$oui = [];
+for ($i = 0; $i < 2300; $i++) { $oui[] = 'SEP44B6BE' . strtoupper(str_pad(dechex($i), 3, '0', STR_PAD_LEFT)); }
+$p = CpsRisportClient::partitionsFromNames($oui, ['SEP'], 1000);
+ok('an all-one-OUI estate splits straight at the serial digits',
+   count($p) >= 3 && count($p) <= 20, count($p) . ' buckets: ' . implode(',', array_slice($p, 0, 4)));
+ok('every bucket descends past the shared OUI',
+   count(array_filter($p, fn($x) => str_starts_with($x, 'SEP44B6BE'))) === count($p), implode(',', $p));
+
+// No bucket may exceed the cap, or the split has not done its job.
+foreach ($p as $pat) {
+    $stem = rtrim($pat, '*');
+    $n = count(array_filter($oui, fn($x) => str_starts_with($x, $stem)));
+    ok("bucket $pat holds $n names, under the cap", $n <= 1000, "$n");
+}
+
+// Names outside the dominant group must not be dragged deep with it.
+$mixed = array_merge($oui, array_map(fn($i) => 'SEP0011223344' . dechex($i % 16), range(0, 39)));
+$p2 = CpsRisportClient::partitionsFromNames($mixed, ['SEP'], 1000);
+ok('a small second OUI gets one shallow bucket, not sixteen deep ones',
+   in_array('SEP0*', $p2, true), implode(',', $p2));
+
+// An estate that fits in one query must not be split at all.
+eq('a small estate needs no splitting',
+   CpsRisportClient::partitionsFromNames(['SEPAAAA00000001', 'SEPBBBB00000002'], ['SEP'], 1000), ['SEP*']);
+eq('no names yields no buckets',
+   CpsRisportClient::partitionsFromNames([], ['SEP'], 1000), []);
+
 section('unit: throttle-fault recognition');
 // A throttle fault is transient. Misclassifying one as a hard failure meant
 // a partition was skipped and its devices vanished from the result, which
@@ -833,8 +863,26 @@ $r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confOui) .
 eq('prefix fallback still recovers the whole estate', count(json_decode($r['out'], true) ?: []), 300);
 ok('and it is the prefix path, not the suffix one',
    !str_contains($r['err'], 'last character'), substr($r['err'], 0, 200));
+// Without AXL there is nothing to compute from, so it must still get there
+// the slow way rather than giving up.
+// Disabling the name provider must NOT mean blanking axl_user: RisPort
+// authenticates with the same credentials, so that would test a 401 rather
+// than the blind-prefix path.
+$confBlind = "$root/tests/.cucm-test-blind.conf";
+file_put_contents($confBlind, file_get_contents($conf) . "\nris_max_devices = 120\nris_use_axl_names = 0\n");
+$rb = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confBlind) . " --json");
+eq('blind prefix splitting still recovers everything', count(json_decode($rb['out'], true) ?: []), 300);
+ok('and it says it is doing so blindly', str_contains($rb['err'], 'BLIND'), substr($rb['err'], 0, 200));
 ok('which needs several subdivisions to cross the OUI',
-   substr_count($r['err'], 'hit the') >= 4, substr_count($r['err'], 'hit the') . ' subdivisions');
+   substr_count($rb['err'], 'hit the') >= 4, substr_count($rb['err'], 'hit the') . ' subdivisions');
+@unlink($confBlind);
+
+// With AXL reachable, the buckets are computed rather than discovered, so
+// even the worst-shaped estate resolves without walking the OUI.
+$r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confOui) . " --json");
+eq('AXL-derived buckets recover the whole estate', count(json_decode($r['out'], true) ?: []), 300);
+ok('the buckets came from AXL', str_contains($r['err'], 'computed'), substr($r['err'], 0, 300));
+eq('and nothing needed subdividing', substr_count($r['err'], 'hit the'), 0);
 
 file_get_contents("http://127.0.0.1:$port/_nosuffix/0");
 file_get_contents("http://127.0.0.1:$port/_oui/0");

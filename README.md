@@ -185,6 +185,18 @@ actually end in the requested digit — because a cluster that ignored the
 pattern would return the whole capped set and look like success. If it is
 not supported, prefix splitting is the fallback.
 
+**Then computing exact buckets from AXL.** If the cluster will not match on
+the end of a name — ours does not; `SEP*0` returns nothing — the device names
+are fetched from AXL, which is *not* subject to the RisPort throttle, and the
+buckets are computed from where the estate actually divides: descend only
+where a bucket is genuinely too big, and only into characters that really
+occur, so no query is ever spent on an empty branch. On a 2,300-phone fleet
+all sharing one OUI that is nine buckets, computed, versus roughly a hundred
+and twelve queries discovered the hard way.
+
+Set `ris_use_axl_names = 0` only if `listPhone` is denied to the account.
+Blind prefix splitting remains the last resort and says so loudly.
+
 A bucket that itself comes back at the cap is subdivided a character deeper
 (`SEP0*` → `SEP00*`…`SEP0Z*`), up to three levels. Results merge by device
 name throughout, so subdividing can only add devices, never lose them.

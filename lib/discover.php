@@ -38,7 +38,26 @@ function cps_discover_phones(array $cfg, string $source, string $status, array $
             // wonder whether devices went missing.
             cps_log('querying only ' . implode('*, ', $prefixes) . '* device names');
         }
-        $res = CpsRisportClient::discover(cps_risport_clients($cfg), $status, 'Phone', $mode, $prefixes);
+        // AXL knows every configured device name and is not subject to
+        // RisPort's per-minute throttle, so it is the cheap way to learn
+        // where the estate actually divides. Lazily invoked: only the
+        // strategies that need it will call this.
+        $nameProvider = null;
+        if (((string)($cfg['axl_user'] ?? '')) !== '' && cps_cfg_bool($cfg, 'ris_use_axl_names', true)) {
+            $nameProvider = function () use ($cfg, $prefixes) {
+                $axl  = cps_axl_client($cfg);
+                $out  = [];
+                foreach ($prefixes ?: [''] as $p) {
+                    $like = $p === '' ? '%' : strtoupper($p) . '%';
+                    foreach ($axl->listPhones(['name'], 1000, $like) as $row) {
+                        if (!empty($row['name'])) { $out[] = $row['name']; }
+                    }
+                }
+                cps_log('AXL knows ' . count($out) . ' configured device names');
+                return $out;
+            };
+        }
+        $res = CpsRisportClient::discover(cps_risport_clients($cfg), $status, 'Phone', $mode, $prefixes, $nameProvider);
         foreach ($res['per_server'] ?? [] as $srv => $st) {
             $enum = $st['enumeration'] ?? null;
             if ($enum && !empty($enum['truncated'])) {

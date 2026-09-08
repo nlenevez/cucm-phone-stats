@@ -401,11 +401,21 @@ function axl(string $body): void {
         preg_match('#<first>(\d+)</first>#', $body, $f);
         $skip  = (int)($s[1] ?? 0);
         $first = (int)($f[1] ?? 500);
-        $all   = array_keys(estate());
+        // AXL must see the same estate RisPort does, including the
+        // synthetic one - it is the source the client uses to compute exact
+        // partitions, so a mismatch here would test nothing real.
+        $src   = bigCount() > 0 ? bigEstate() : estate();
+        preg_match('#<name>([^<]*)</name>#', $body, $nm);
+        $like  = trim($nm[1] ?? '%');
+        $all   = array_keys($src);
+        if ($like !== '' && $like !== '%') {
+            $re  = '/^' . str_replace('%', '.*', preg_quote(strtoupper($like), '/')) . '$/i';
+            $all = array_values(array_filter($all, fn($n) => preg_match($re, $n)));
+        }
         $page  = array_slice($all, $skip, $first);
         $xml   = '';
         foreach ($page as $name) {
-            $e = estate()[$name];
+            $e = $src[$name];
             $xml .= '<phone uuid="{' . strtolower(md5($name)) . '}">'
                   . "<name>$name</name><description>{$e['descr']}</description>"
                   . "<model>{$e['model']}</model></phone>";

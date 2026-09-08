@@ -34,6 +34,15 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
   workstation*, so an unfiltered sweep fired an HTTPS request at every desk
   in the estate. `--all-devices` or an explicit `--device-prefixes` list
   overrides; the skip is reported with a per-prefix breakdown.
+- **Exact partitions computed from AXL's device names.** When a cluster will
+  not match on the end of a name (a live one does not — `SEP*0` returns
+  nothing), the names are fetched from AXL, which is not subject to the
+  RisPort throttle, and the buckets are computed from where the estate
+  actually divides: descending only where a bucket is too big and only into
+  characters that occur, so no query is spent on an empty branch. On a fleet
+  sharing one OUI that is ~9 buckets computed rather than ~112 queries
+  discovered. `ris_use_axl_names = 0` disables it; blind prefix splitting
+  remains the last resort and says so loudly.
 - **Splitting on the last character of the device name**, tried after
   per-node and before prefixes. Prefix buckets are near-useless when a fleet
   shares an OUI — a live estate had `SEP4*` through `SEP44B6BE*` all over the

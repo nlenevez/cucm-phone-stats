@@ -44,6 +44,11 @@ const CPS_DEFAULTS = [
     //   off            - never split; accept whatever one query returns
     //   <list>         - explicit patterns, e.g. "SEP0*,SEP1*,..."
     'ris_partitions'  => 'auto',
+    // Use AXL's list of device names to compute exact RisPort partitions
+    // when the cheaper strategies are unavailable. Needs no extra rights
+    // beyond those AXL already requires, and AXL is not subject to the
+    // RisPort throttle. Set to 0 only if listPhone is denied to the account.
+    'ris_use_axl_names' => 1,
 
     'phone_url_base'  => 'https://{ip}',
     'phone_user'      => '',

@@ -373,6 +373,7 @@ class CpsRisportClient
         string $deviceClass = 'Phone',
         string|array $partitions = 'auto',
         array $devicePrefixes = [],
+        ?callable $nameProvider = null,
     ): array {
         $mode = is_array($partitions) ? 'explicit' : strtolower(trim($partitions));
 
@@ -497,6 +498,7 @@ class CpsRisportClient
             // actually end in the requested digit. A cluster that ignores the
             // pattern would otherwise hand back the whole capped set and look
             // like success.
+            cps_log('probing whether this cluster can match on the end of a device name');
             $suffix = $this->trySuffixPartitioning($status, $deviceClass, $selectItems, $cap);
             if ($suffix !== null) {
                 cps_warn(sprintf('%s: re-running split on the last character of the name (%d buckets)',
@@ -507,7 +509,30 @@ class CpsRisportClient
                 return $this->runPartitions($status, $deviceClass, $patterns, $firstPass, $firstClaimed, $cap, 'suffix');
             }
 
-            cps_warn(sprintf('%s: re-running split by name prefix', $this->soap->baseUrl()));
+            // Ask AXL for the real names and compute exact buckets. Only
+            // reached when the cheaper strategies are unavailable, and only
+            // costs a few unthrottled AXL calls.
+            if ($nameProvider !== null) {
+                try {
+                    $names = $nameProvider();
+                } catch (Throwable $e) {
+                    cps_warn('could not list device names from AXL: ' . $e->getMessage());
+                    $names = [];
+                }
+                if ($names) {
+                    $computed = self::partitionsFromNames($names, $devicePrefixes, $cap);
+                    cps_warn(sprintf('%s: computed %d exact buckets from %d device names known to AXL',
+                        $this->soap->baseUrl(), count($computed), count($names)));
+                    return $this->runPartitions($status, $deviceClass, $computed,
+                        $rows, $claimed, $cap, 'axl-derived');
+                }
+            }
+
+            cps_warn(sprintf(
+                '%s: falling back to BLIND name prefix splitting. On a fleet sharing an OUI this is slow - '
+                . 'every level is 16 queries and the OUI is 6 hex digits deep. Configure axl_user/axl_pass '
+                . 'so the buckets can be computed from the real device names instead.',
+                $this->soap->baseUrl()));
             $patterns = self::partitionsFor($devicePrefixes);
             $firstPass = $rows;
             $firstClaimed = $claimed;
@@ -673,6 +698,72 @@ class CpsRisportClient
     }
 
     /**
+     * Build the smallest set of prefix patterns that keeps every bucket
+     * under the cap, from the actual device names.
+     *
+     * Blind prefix splitting has to DISCOVER where the estate divides, one
+     * expensive level at a time, and on a fleet sharing an OUI that means
+     * traversing six hex digits before anything separates. Given the real
+     * names the answer can simply be computed: descend only where a bucket
+     * is genuinely too big, and only into characters that actually occur, so
+     * no query is ever spent on an empty branch.
+     *
+     * Names come from AXL, which is not subject to RisPort's per-minute
+     * throttle, so learning them is cheap compared with the queries saved.
+     *
+     * @param string[] $names    every configured device name
+     * @param string[] $prefixes device prefixes in scope, e.g. ['SEP']
+     * @return string[]
+     */
+    public static function partitionsFromNames(array $names, array $prefixes, int $cap): array
+    {
+        $limit = max(1, (int)ceil($cap * 0.9));
+        $roots = [];
+        foreach ($prefixes ?: [''] as $p) {
+            $p = strtoupper(trim($p));
+            $roots[$p] = [];
+        }
+        foreach ($names as $n) {
+            $n = strtoupper(trim((string)$n));
+            if ($n === '') { continue; }
+            foreach (array_keys($roots) as $p) {
+                if ($p === '' || str_starts_with($n, $p)) { $roots[$p][] = $n; break; }
+            }
+        }
+
+        $out = [];
+        foreach ($roots as $stem => $members) {
+            if (!$members) { continue; }
+            self::splitBucket($stem, $members, $limit, $out);
+        }
+        sort($out);
+        return $out;
+    }
+
+    /** Recursive helper for partitionsFromNames(). */
+    private static function splitBucket(string $stem, array $members, int $limit, array &$out): void
+    {
+        if (count($members) <= $limit) {
+            $out[] = $stem . '*';
+            return;
+        }
+        $next = [];
+        $exhausted = 0;
+        foreach ($members as $n) {
+            if (strlen($n) <= strlen($stem)) { $exhausted++; continue; }
+            $next[$n[strlen($stem)]][] = $n;
+        }
+        // Every remaining name is exactly this stem, or there is no further
+        // character to split on: emit it and let the cap do what it will,
+        // rather than recursing forever.
+        if (!$next) { $out[] = $stem . '*'; return; }
+        if ($exhausted) { $out[] = $stem; }
+        foreach ($next as $ch => $sub) {
+            self::splitBucket($stem . $ch, $sub, $limit, $out);
+        }
+    }
+
+    /**
      * Can this cluster match on the end of a device name?
      *
      * One probe query, and its answer is verified rather than assumed. A
@@ -692,21 +783,21 @@ class CpsRisportClient
         try {
             $rows = $this->selectCmDevice($status, $deviceClass, [$probe]);
         } catch (Throwable $e) {
-            cps_log('suffix probe failed: ' . $e->getMessage(), 2);
+            cps_warn('suffix probe failed, falling back to prefixes: ' . $e->getMessage());
             return null;
         }
         if (!$rows) {
-            cps_log("suffix probe '$probe' returned nothing - cluster does not support it", 2);
+            cps_warn("suffix probe '$probe' returned nothing - this cluster will not match on the end of a name");
             return null;
         }
         foreach ($rows as $r) {
             if (!str_ends_with(strtoupper((string)$r['name']), '0')) {
-                cps_log("suffix probe '$probe' returned '{$r['name']}' - pattern ignored by the cluster", 2);
+                cps_warn("suffix probe '$probe' returned '{$r['name']}', which does not end in 0 - the cluster ignored the pattern");
                 return null;
             }
         }
         if (count($rows) >= $cap) {
-            cps_log("suffix probe '$probe' is itself at the cap - one character is not enough", 2);
+            cps_warn("suffix probe '$probe' is itself at the cap - one character is not enough spread");
             return null;
         }
 
@@ -775,13 +866,14 @@ class CpsRisportClient
         string $deviceClass = 'Phone',
         string|array $partitions = 'auto',
         array $devicePrefixes = [],
+        ?callable $nameProvider = null,
     ): array {
         $byName = [];
         $errors = [];
         $perServer = [];
         foreach ($clients as $c) {
             try {
-                $rows = $c->selectCmDeviceComplete($status, $deviceClass, $partitions, $devicePrefixes);
+                $rows = $c->selectCmDeviceComplete($status, $deviceClass, $partitions, $devicePrefixes, $nameProvider);
             } catch (Throwable $e) {
                 $errors[] = ['server' => $c->baseUrl(), 'error' => $e->getMessage()];
                 cps_warn($c->baseUrl() . ': ' . $e->getMessage());

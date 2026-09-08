@@ -55,6 +55,12 @@ ris_max_devices = 1000
 ;   <list>          explicit patterns, e.g. "SEP0*,SEP1*,SEP2*"
 ris_partitions = auto
 
+; When the cheap strategies are unavailable, ask AXL for the real device
+; names and compute exact partitions from them instead of discovering where
+; the estate divides one expensive query at a time. AXL is not subject to
+; the RisPort throttle. Set to 0 only if listPhone is denied to the account.
+ris_use_axl_names = 1
+
 ; --------------------------------------------------------------- phones ---
 ; "{ip}" is replaced with each phone's address. Use http://{ip} if the
 ; estate has not enabled HTTPS on the handsets.
