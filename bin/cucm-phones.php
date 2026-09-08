@@ -33,7 +33,7 @@ $source = is_string($opts['source'] ?? null) ? $opts['source'] : 'risport';
 
 if (!cps_server_urls($cfg)) { cps_die('no cucm_servers configured (see cucm.conf.example)'); }
 
-$rows = cps_discover_phones($cfg, $source, $status);
+$rows = cps_discover_phones($cfg, $source, $status, $opts);
 $rows = cps_apply_device_prefixes($rows, $cfg, $opts);
 $rows = cps_apply_subnet_exclusions($rows, $cfg, $opts);
 

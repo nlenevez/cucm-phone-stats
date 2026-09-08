@@ -53,6 +53,26 @@ function capHidesTotal(): bool {
 }
 const SOFT_FILE = __DIR__ . '/.mock-soft';
 const CONC_FILE = __DIR__ . '/.mock-conc';
+const RISSEEN_FILE = __DIR__ . '/.mock-risseen';
+
+/**
+ * Record which device-name prefixes RisPort actually handed back.
+ *
+ * "We never enumerate CSF" is a claim about what the cluster is asked for,
+ * so the server is the only place that can honestly answer it. Filtering
+ * client-side would look identical from the outside while still costing the
+ * query.
+ */
+function noteReturnedPrefixes(array $devices): void {
+    $seen = is_readable(RISSEEN_FILE)
+        ? (json_decode((string)file_get_contents(RISSEEN_FILE), true) ?: []) : [];
+    foreach (array_keys($devices) as $name) {
+        if (preg_match('/^(CIPC|SEP|CSF|TCT|BOT|TAB|ATA)/i', (string)$name, $m)) {
+            $seen[strtoupper($m[1])] = ($seen[strtoupper($m[1])] ?? 0) + 1;
+        }
+    }
+    file_put_contents(RISSEEN_FILE, json_encode($seen));
+}
 const EDGE_FILE = __DIR__ . '/.mock-edge';
 
 /**
@@ -73,6 +93,12 @@ function edgeClients(): array {
                               'descr' => 'Answers 200 with whitespace', 'http' => 'Yes', 'behaviour' => 'blank'],
         'SEP00112233EE03' => ['ip' => '10.10.10.63', 'status' => 'Registered', 'model' => 'Cisco 8841',
                               'descr' => 'Answers 200 with no table', 'http' => 'Yes', 'behaviour' => 'notable'],
+        // RisPort returns DirNumber as a comma-separated list of every line
+        // appearance, and a phone with many lines runs well past a short
+        // column. This one broke a live sweep with MySQL 1406.
+        'SEP00112233EE04' => ['ip' => '10.10.10.64', 'status' => 'Registered', 'model' => 'Cisco 8861',
+                              'descr' => 'Many line appearances', 'http' => 'Yes', 'behaviour' => 'clean',
+                              'dn' => implode(',', array_map(fn($i) => '6' . str_pad((string)$i, 4, '0', STR_PAD_LEFT), range(1, 60)))],
     ];
 }
 const SLOW_FILE = __DIR__ . '/.mock-slow';
@@ -162,6 +188,10 @@ function bigEstate(): array {
             'ip' => sprintf('10.%d.%d.%d', 20 + intdiv($i, 65025), intdiv($i, 255) % 255, ($i % 254) + 1),
             'status' => 'Registered', 'model' => 'Cisco 8841',
             'descr' => "Synthetic $i", 'http' => 'Yes', 'behaviour' => 'clean',
+            // Spread across subscribers, as a real cluster is. This is what
+            // makes per-node enumeration a cheaper way past the response cap
+            // than splitting by device name.
+            'node' => 'CUCM-SUB' . (($i % 3) + 1),
         ];
     }
     return $out;
@@ -174,6 +204,16 @@ function gen(): int {
 $uri  = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $body = file_get_contents('php://input');
 
+if ($uri === '/_ris/seen') {
+    header('Content-Type: application/json');
+    echo is_readable(RISSEEN_FILE) ? (string)file_get_contents(RISSEEN_FILE) : '{}';
+    return;
+}
+if ($uri === '/_ris/reset') {
+    @unlink(RISSEEN_FILE);
+    echo "reset\n";
+    return;
+}
 if ($uri === '/_conc') {
     header('Content-Type: application/json');
     echo is_readable(CONC_FILE) ? (string)file_get_contents(CONC_FILE) : '{"cur":0,"max":0}';
@@ -414,6 +454,8 @@ function ris(string $body): void {
     $state = $s[1] ?? '';
     preg_match('#<[^>]*MaxReturnedDevices>(\d+)<#', $body, $mx);
     $max = max(1, (int)($mx[1] ?? 1000));
+    preg_match('#<[^>]*NodeName>([^<]*)<#', $body, $nn);
+    $wantNode = trim($nn[1] ?? '');
 
     // Which name patterns did the caller ask for?
     preg_match_all('#<[^>]*Item>([^<]*)<#', $body, $im);
@@ -425,6 +467,7 @@ function ris(string $body): void {
     $all = [];
     foreach ($source as $name => $e) {
         if ($want !== 'Any' && strcasecmp($e['status'], $want) !== 0) { continue; }
+        if ($wantNode !== '' && ($e['node'] ?? 'CUCM-SUB1') !== $wantNode) { continue; }
         foreach ($patterns as $pat) {
             $re = '/^' . str_replace('\*', '.*', preg_quote($pat, '/')) . '$/i';
             if (preg_match($re, $name)) { $all[$name] = $e; break; }
@@ -434,7 +477,11 @@ function ris(string $body): void {
     // The cap only bites an unnarrowed query, which is what makes splitting
     // by name prefix a workaround rather than a coincidence.
     $trueTotal = count($all);
-    $capped    = (bigCount() > 0 && !$narrowed) ? BIG_CAP : PHP_INT_MAX;
+    // The cap applies to EVERY query, as it does on a real cluster. Splitting
+    // helps only because each narrower query matches fewer devices - not
+    // because narrowing exempts you from the limit. Modelling it the other
+    // way made a scoped first query look complete when it would not be.
+    $capped    = bigCount() > 0 ? BIG_CAP : PHP_INT_MAX;
     // With capHidesTotal the response is self-consistent and gives detection
     // nothing to compare against.
     if (capHidesTotal() && $trueTotal > $capped) { $trueTotal = $capped; }
@@ -448,10 +495,22 @@ function ris(string $body): void {
     // StateInfo simply stops once the cap is reached: no error, no warning.
     $next     = ($offset + $pageSize) < $reachable ? (string)($offset + $pageSize) : '';
 
+    noteReturnedPrefixes($slice);
+
+    $byNode = [];
+    foreach ($slice as $name => $e) { $byNode[$e['node'] ?? 'CUCM-SUB1'][$name] = $e; }
+    // Even a truncated response lists every node the cluster has, which is
+    // what lets the client discover node names to query individually.
+    if (bigCount() > 0) {
+        foreach (['CUCM-SUB1', 'CUCM-SUB2', 'CUCM-SUB3'] as $n) { $byNode[$n] ??= []; }
+    }
+
+    $nodesXml = '';
+    foreach ($byNode as $nodeName => $devices) {
     $xml = '';
-    foreach ($slice as $name => $e) {
+    foreach ($devices as $name => $e) {
         $xml .= '<item><Name>' . $name . '</Name>'
-              . '<DirNumber>' . (2000 + (int)substr($name, -2)) . '</DirNumber>'
+              . '<DirNumber>' . htmlspecialchars((string)($e['dn'] ?? (2000 + (int)substr($name, -2)))) . '</DirNumber>'
               . '<Class>Phone</Class><Model>' . htmlspecialchars($e['model']) . '</Model>'
               . '<Product>' . htmlspecialchars($e['model']) . '</Product>'
               . '<Status>' . $e['status'] . '</Status><StatusReason>0</StatusReason>'
@@ -463,11 +522,13 @@ function ris(string $body): void {
               . '<IPAddress><item><IP>' . $e['ip'] . '</IP><IPAddrType>ipv4</IPAddrType></item></IPAddress>'
               . '</item>';
     }
+        $nodesXml .= '<item><Name>' . htmlspecialchars((string)$nodeName) . '</Name>'
+                   . '<NoChange>false</NoChange><CmDevices>' . $xml . '</CmDevices></item>';
+    }
     soap_out('<ns:selectCmDeviceResponse xmlns:ns="http://schemas.cisco.com/ast/soap">'
            . '<selectCmDeviceReturn><SelectCmDeviceResult>'
            . '<TotalDevicesFound>' . $trueTotal . '</TotalDevicesFound>'
-           . '<CmNodes><item><Name>CUCM-SUB1</Name><NoChange>false</NoChange>'
-           . '<CmDevices>' . $xml . '</CmDevices></item></CmNodes>'
+           . '<CmNodes>' . ($nodesXml ?: '<item><Name>CUCM-SUB1</Name><CmDevices></CmDevices></item>') . '</CmNodes>'
            . '</SelectCmDeviceResult><StateInfo>' . $next . '</StateInfo>'
            . '</selectCmDeviceReturn></ns:selectCmDeviceResponse>');
 }

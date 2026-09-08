@@ -68,7 +68,7 @@ if (isset($opts['phones-from']) && is_string($opts['phones-from'])) {
     cps_log(count($phones) . ' phones loaded from ' . $opts['phones-from']);
 } else {
     if (!cps_server_urls($cfg)) { cps_die('no cucm_servers configured (see cucm.conf.example)'); }
-    $phones = cps_discover_phones($cfg, $source, $status);
+    $phones = cps_discover_phones($cfg, $source, $status, $opts);
     cps_log(count($phones) . " phones discovered from CUCM (status=$status, source=$source)");
 }
 $phones     = cps_apply_device_prefixes($phones, $cfg, $opts);

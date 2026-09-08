@@ -41,7 +41,10 @@ CREATE TABLE IF NOT EXISTS phones (
   model             VARCHAR(64)     NULL,
   product           VARCHAR(64)     NULL,
   device_class      VARCHAR(32)     NULL,
-  dir_number        VARCHAR(64)     NULL,
+  -- RisPort returns DirNumber as a comma-separated list of EVERY line
+  -- appearance, so a phone with a handful of lines runs past 64 characters
+  -- easily. Widened, and clipped defensively on write.
+  dir_number        VARCHAR(512)    NULL,
   serial_number     VARCHAR(64)     NULL,
   model_number      VARCHAR(64)     NULL,
   hardware_revision VARCHAR(64)     NULL,

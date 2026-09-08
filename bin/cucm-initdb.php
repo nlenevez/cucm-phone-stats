@@ -33,6 +33,13 @@ $db = new CpsDb($cfg);
 $n  = $db->applySchema(dirname(__DIR__) . '/schema.sql');
 echo "Applied {$n} statements to {$cfg['db_name']} on {$cfg['db_host']}.\n";
 
+// CREATE TABLE IF NOT EXISTS cannot widen a column that already exists, so
+// an existing database needs explicit ALTERs. Idempotent: a column already
+// wide enough is left alone.
+$migrated = $db->migrate((string)$cfg['db_name']);
+foreach ($migrated as $m) { echo "Migrated: $m\n"; }
+if (!$migrated) { echo "No column migrations needed.\n"; }
+
 $tables = $db->query('SELECT TABLE_NAME AS n, TABLE_TYPE AS t FROM information_schema.TABLES
                       WHERE TABLE_SCHEMA = ? ORDER BY TABLE_TYPE, TABLE_NAME', [$cfg['db_name']]);
 echo cps_render_table($tables, ['n', 't']);

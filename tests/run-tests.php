@@ -205,16 +205,51 @@ $sum = cps_neighbour_summary([]);
 eq('no neighbour info yields nulls', $sum['switch_name'], null);
 eq('and no source', $sum['source'], null);
 
+section('unit: throttle-fault recognition');
+// A throttle fault is transient. Misclassifying one as a hard failure meant
+// a partition was skipped and its devices vanished from the result, which
+// is the same silent undercount the partitioning exists to prevent.
+foreach ([
+    'Exceeded allowed rate for Realtime information',
+    'exceeded allowed rate',
+    'Rate Control: too many requests',
+    'Request throttled',
+] as $msg) {
+    ok("recognised: $msg", CpsRisportClient::isRateLimitFault(new RuntimeException($msg)), $msg);
+}
+foreach ([
+    'Unknown schema version 15.0',
+    'Column (foo) not found in any table in the query',
+    'connection refused',
+] as $msg) {
+    ok("not a throttle: $msg", !CpsRisportClient::isRateLimitFault(new RuntimeException($msg)), $msg);
+}
+
 section('unit: partition subdivision');
 $sub = new ReflectionMethod(CpsRisportClient::class, 'subdivide');
 $sub->setAccessible(true);
+// A MAC-shaped stem can only continue with a hex digit, so 36 children
+// would be 20 queries guaranteed to return nothing - expensive against a
+// rate-limited API every time a bucket is subdivided.
 $kids = $sub->invoke(null, 'SEP0*');
-eq('one child per 0-9A-Z', count($kids), 36);
+eq('MAC-shaped stem subdivides into 16 hex children', count($kids), 16);
 eq('first child extends the stem', $kids[0], 'SEP00*');
-eq('last child is Z, not F - names are not always hex', $kids[35], 'SEP0Z*');
-eq('a soft-client prefix subdivides too', $sub->invoke(null, 'CSF*')[0], 'CSF0*');
+eq('last hex child is F', $kids[15], 'SEP0F*');
 ok('every child keeps the parent stem',
-   count(array_filter($kids, fn($k) => str_starts_with($k, 'SEP0'))) === 36, implode(',', array_slice($kids, 0, 3)));
+   count(array_filter($kids, fn($k) => str_starts_with($k, 'SEP0'))) === 16, implode(',', array_slice($kids, 0, 3)));
+
+// A soft-client prefix is followed by a username, so it needs the letters.
+$csf = $sub->invoke(null, 'CSF*');
+eq('username-shaped stem keeps the full alphabet', count($csf), 36);
+eq('and reaches Z', $csf[35], 'CSFZ*');
+
+// Only the prefixes actually being polled get enumerated.
+$parts = CpsRisportClient::partitionsFor(['SEP']);
+eq('SEP alone yields 16 buckets and nothing else', count($parts), 16);
+ok('no CSF bucket when only SEP is polled',
+   !in_array('CSF*', $parts, true), implode(',', $parts));
+ok('polling everything falls back to the full default set',
+   count(CpsRisportClient::partitionsFor([])) > 16);
 
 section('unit: config values that look boolean');
 // parse_ini_file's TYPED and NORMAL scanners turn "off"/"no"/"false"/"none"
@@ -345,6 +380,7 @@ axl_user       = axluser
 axl_pass       = axlpass
 verify_tls     = 0
 ris_gap_ms     = 0
+ris_rate_per_min = 0
 phone_url_base = http://127.0.0.1:$port/phone/{ip}
 phone_parallel = 8
 phone_timeout  = 5
@@ -601,8 +637,12 @@ eq('auto partitioning recovers the full estate', count($auto ?: []), 300);
 // has been reworded once already and a brittle match just fails later for
 // no reason.
 ok('truncation is reported, not silent',
-   str_contains($r['err'], 're-running split by name prefix')
-   && str_contains($r['err'], '300'), substr($r['err'], 0, 200));
+   str_contains($r['err'], '300') && str_contains($r['err'], 'RisPort returned'),
+   substr($r['err'], 0, 200));
+// Per-node is the cheap route past the cap and must be preferred: three
+// node queries instead of sixteen name buckets against a rate-limited API.
+ok('per-node enumeration is used in preference to name prefixes',
+   str_contains($r['err'], 'per-node enumeration'), substr($r['err'], 0, 300));
 
 // Unique device names: a merge bug would inflate or collapse the count.
 $names = array_column($auto ?: [], 'name');
@@ -625,9 +665,20 @@ $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --json");
 $eg = json_decode($r['out'], true);
 ok('the sweep completes instead of dying', is_array($eg) && isset($eg['polled']),
    substr($r['out'] . ' ' . $r['err'], 0, 300));
-eq('every phone is still accounted for', $eg['polled'] ?? null, 10);
-eq('the good phones still succeed', $eg['ok'] ?? null, 5);
+eq('every phone is still accounted for', $eg['polled'] ?? null, 11);
+eq('the good phones still succeed', $eg['ok'] ?? null, 6);
 ok('no ValueError escaped', !str_contains($r['err'], 'ValueError'), substr($r['err'], 0, 200));
+
+// A phone with 60 line appearances has a DirNumber far longer than the
+// original column, which failed the INSERT and - because writes are one
+// transaction per phone - cost that entire handset over one field.
+$r2 = run("$php $root/bin/cucm-sweep.php --config $C --json");
+ok('the long-DirNumber phone is stored, not lost',
+   !str_contains($r2['err'], 'Data too long'), substr($r2['err'], 0, 300));
+$long = $db->query("SELECT dir_number FROM phones WHERE device_name = 'SEP00112233EE04'");
+ok('its dir_number is present', !empty($long[0]['dir_number']), json_encode($long));
+ok('and holds the whole list, not a truncated stub',
+   strlen((string)($long[0]['dir_number'] ?? '')) > 64, strlen((string)($long[0]['dir_number'] ?? '')) . ' chars');
 
 // The distinct causes must stay distinct: an empty body is the phone's
 // fault, unparseable markup is arguably ours, and they lead different places.
@@ -694,6 +745,24 @@ file_get_contents("http://127.0.0.1:$port/_big/0");
 section('integration: soft clients are not polled by default');
 file_get_contents("http://127.0.0.1:$port/_soft/1");   // + CSF, TCT, BOT, ATA
 
+// Stronger than "they are filtered out": the cluster must never be ASKED
+// for them. Filtering client-side would look the same from here while still
+// costing a query and, on a rate-limited API, real time.
+file_get_contents("http://127.0.0.1:$port/_ris/reset");
+$r = run("$php $root/bin/cucm-phones.php --config $C --json");
+$seen = json_decode((string)file_get_contents("http://127.0.0.1:$port/_ris/seen"), true) ?: [];
+ok('RisPort never returned a CSF device', !isset($seen['CSF']), json_encode($seen));
+ok('nor TCT / BOT / TAB / ATA',
+   !isset($seen['TCT']) && !isset($seen['BOT']) && !isset($seen['TAB']) && !isset($seen['ATA']),
+   json_encode($seen));
+ok('SEP handsets were returned', ($seen['SEP'] ?? 0) > 0, json_encode($seen));
+
+// ...and --all-devices must widen the query again, or the flag is a lie.
+file_get_contents("http://127.0.0.1:$port/_ris/reset");
+$r = run("$php $root/bin/cucm-phones.php --config $C --all-devices --json");
+$seen = json_decode((string)file_get_contents("http://127.0.0.1:$port/_ris/seen"), true) ?: [];
+ok('--all-devices does ask for CSF', isset($seen['CSF']), json_encode($seen));
+
 $r = run("$php $root/bin/cucm-phones.php --config $C --json");
 $def = array_column(json_decode($r['out'], true) ?: [], 'name');
 eq('default lists only SEP handsets', count($def), 7);
@@ -708,9 +777,11 @@ ok('soft clients are visible when asked for', in_array('CSFJOSEPH', $all, true),
 // The skip must be reported, not silent - this is the answer to "CUCM says
 // 3000 and I only see 2000".
 $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --json");
-ok('the skip is reported with a per-prefix breakdown',
-   str_contains($r['err'], 'skipped as not SEP') && str_contains($r['err'], 'CSF=1'),
-   substr($r['err'], 0, 300));
+// Scoping the query leaves nothing to skip, so what must be reported is the
+// scope itself - a quietly smaller number is exactly what makes an operator
+// wonder whether devices went missing.
+ok('the scope of the query is reported',
+   str_contains($r['err'], 'querying only SEP*'), substr($r['err'], 0, 300));
 eq('sweep polls only the handsets', (json_decode($r['out'], true)['polled'] ?? null), 7);
 
 $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --all-devices --json");

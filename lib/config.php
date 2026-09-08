@@ -28,7 +28,14 @@ const CPS_DEFAULTS = [
     'verify_tls'      => 0,
     'ca_bundle'       => '',
     'soap_timeout'    => 60,
-    'ris_gap_ms'      => 4000,
+    // RisPort is rate limited per user per node. ris_rate_per_min is the real
+    // control - a sliding window, so the allowance is spent as fast as is
+    // safe and then waits. Keep it under the cluster's limit (commonly 15):
+    // the budget is shared with anything else querying realtime data as the
+    // same account. ris_gap_ms is an optional extra minimum spacing.
+    'ris_rate_per_min' => 12,
+    'ris_rate_retries' => 4,
+    'ris_gap_ms'      => 0,
     'ris_max_devices' => 1000,
     // How to enumerate an estate larger than one RisPort response:
     //   auto (default) - one plain query, and if it returns fewer devices
@@ -199,6 +206,8 @@ function cps_risport_clients(array $cfg): array
             cps_soap_for($cfg, $u),
             (int)$cfg['ris_max_devices'],
             (int)$cfg['ris_gap_ms'],
+            (int)$cfg['ris_rate_per_min'],
+            (int)$cfg['ris_rate_retries'],
         );
     }
     return $out;

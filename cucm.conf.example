@@ -34,7 +34,16 @@ ca_bundle      =
 
 soap_timeout   = 60
 ; RisPort is rate limited per user; this is the pause between paged calls.
-ris_gap_ms     = 4000
+; RisPort is rate limited per user, per node, and the budget is shared with
+; anything else querying realtime data as this account. ris_rate_per_min is
+; a sliding window: the allowance is spent as fast as is safe, then it waits.
+; Keep it under the cluster's limit (commonly 15). If you see
+; "Exceeded allowed rate for Realtime information", LOWER this - the tool
+; also backs off and retries such faults automatically.
+ris_rate_per_min = 12
+ris_rate_retries = 4
+; Optional extra minimum spacing between calls; 0 leaves it to the window.
+ris_gap_ms     = 0
 ris_max_devices = 1000
 
 ; How to enumerate an estate larger than one RisPort response will carry.

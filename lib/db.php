@@ -83,6 +83,88 @@ class CpsDb
         return $n;
     }
 
+    /**
+     * Column widths that must be at least this wide, applied on every
+     * initdb run.
+     *
+     * CREATE TABLE IF NOT EXISTS cannot widen a column that already exists,
+     * so a schema change to a live database needs an explicit, idempotent
+     * ALTER. Only widening is ever attempted - narrowing would truncate real
+     * data - and a column already wide enough is left alone.
+     */
+    private const MIN_WIDTHS = [
+        ['phones', 'dir_number', 'VARCHAR(512) NULL', 512],
+    ];
+
+    /** Widen any column that is narrower than the schema now requires. */
+    public function migrate(string $dbName): array
+    {
+        $applied = [];
+        foreach (self::MIN_WIDTHS as [$table, $col, $definition, $want]) {
+            $cur = $this->query(
+                'SELECT CHARACTER_MAXIMUM_LENGTH AS len FROM information_schema.COLUMNS
+                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?',
+                [$dbName, $table, $col]
+            );
+            if (!$cur) { continue; }              // table/column not there yet
+            if ((int)$cur[0]['len'] >= $want) { continue; }
+            $this->pdo->exec("ALTER TABLE `$table` MODIFY COLUMN `$col` $definition");
+            $applied[] = "$table.$col -> $definition (was " . $cur[0]['len'] . ')';
+        }
+        return $applied;
+    }
+
+    /** Cached CHARACTER_MAXIMUM_LENGTH per table.column. */
+    private array $widths = [];
+
+    private function widths(string $table): array
+    {
+        if (!isset($this->widths[$table])) {
+            $this->widths[$table] = [];
+            foreach ($this->query(
+                'SELECT COLUMN_NAME AS c, CHARACTER_MAXIMUM_LENGTH AS len
+                 FROM information_schema.COLUMNS
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+                   AND CHARACTER_MAXIMUM_LENGTH IS NOT NULL', [$table]
+            ) as $r) {
+                $this->widths[$table][$r['c']] = (int)$r['len'];
+            }
+        }
+        return $this->widths[$table];
+    }
+
+    /**
+     * Clip over-long strings to what the column can hold.
+     *
+     * A single over-long value used to fail the whole INSERT, and because
+     * writes are one transaction per phone that cost the entire handset -
+     * its registration, its port statistics, everything - over one field.
+     * Losing the tail of a field is a far better outcome, and it is
+     * announced rather than silent.
+     *
+     * Driven by the live column widths, so it also covers the fields nobody
+     * predicted would overflow. That is the point: dir_number was widened
+     * because it was the one that broke, but it will not be the last.
+     */
+    private function clipRow(string $table, array $row): array
+    {
+        $w = $this->widths($table);
+        foreach ($row as $col => $v) {
+            if (!is_string($v) || !isset($w[$col])) { continue; }
+            if (mb_strlen($v) <= $w[$col]) { continue; }
+            $key = "$table.$col";
+            if (!isset($this->clipWarned[$key])) {
+                $this->clipWarned[$key] = true;
+                cps_warn(sprintf('%s: value of %d chars clipped to %d (e.g. "%s") - widen the column if this matters',
+                    $key, mb_strlen($v), $w[$col], mb_substr($v, 0, 40)));
+            }
+            $row[$col] = mb_substr($v, 0, $w[$col]);
+        }
+        return $row;
+    }
+
+    private array $clipWarned = [];
+
     public function startSweep(string $source, array $servers, string $toolVersion): int
     {
         $st = $this->pdo->prepare(
@@ -134,19 +216,20 @@ class CpsDb
                last_ip           = COALESCE(NULLIF(VALUES(last_ip), ""), last_ip),
                id                = LAST_INSERT_ID(id)'
         );
-        $st->execute([
-            $p['device_name'],
-            $p['mac_address']       ?? cps_mac_from_device_name($p['device_name']),
-            $p['description']       ?? null,
-            $p['model']             ?? null,
-            $p['product']           ?? null,
-            $p['device_class']      ?? null,
-            $p['dir_number']        ?? null,
-            $p['serial_number']     ?? null,
-            $p['model_number']      ?? null,
-            $p['hardware_revision'] ?? null,
-            $p['ip']                ?? null,
+        $row = $this->clipRow('phones', [
+            'device_name'       => $p['device_name'],
+            'mac_address'       => $p['mac_address'] ?? cps_mac_from_device_name($p['device_name']),
+            'description'       => $p['description'] ?? null,
+            'model'             => $p['model'] ?? null,
+            'product'           => $p['product'] ?? null,
+            'device_class'      => $p['device_class'] ?? null,
+            'dir_number'        => $p['dir_number'] ?? null,
+            'serial_number'     => $p['serial_number'] ?? null,
+            'model_number'      => $p['model_number'] ?? null,
+            'hardware_revision' => $p['hardware_revision'] ?? null,
+            'last_ip'           => $p['ip'] ?? null,
         ]);
+        $st->execute(array_values($row));
         return (int)$this->pdo->lastInsertId();
     }
 
@@ -162,20 +245,25 @@ class CpsDb
                ip_address = VALUES(ip_address), status = VALUES(status)'
         );
         $http = cps_tri_bool($r['http_supported'] ?? '');
+        $row = $this->clipRow('registrations', [
+            'ip_address'    => $r['ip'] ?: null,
+            'status'        => $r['status'] ?? null,
+            'status_reason' => $r['status_reason'] ?? null,
+            'node_name'     => $r['node_name'] ?? null,
+            'ris_server'    => $r['ris_server'] ?? null,
+            'protocol'      => $r['protocol'] ?? null,
+            'active_load'   => $r['active_load'] ?? null,
+            'inactive_load' => $r['inactive_load'] ?? null,
+            'ris_timestamp' => $r['ris_timestamp'] ?? null,
+            'source'        => $r['source'] ?? 'risport',
+        ]);
         $st->execute([
             $sweepId, $phoneId,
-            $r['ip'] ?: null,
+            $row['ip_address'],
             isset($r['ip_addresses']) ? json_encode($r['ip_addresses']) : null,
-            $r['status'] ?? null,
-            $r['status_reason'] ?? null,
-            $r['node_name'] ?? null,
-            $r['ris_server'] ?? null,
-            $r['protocol'] ?? null,
-            $r['active_load'] ?? null,
-            $r['inactive_load'] ?? null,
-            $http,
-            $r['ris_timestamp'] ?? null,
-            $r['source'] ?? 'risport',
+            $row['status'], $row['status_reason'], $row['node_name'], $row['ris_server'],
+            $row['protocol'], $row['active_load'], $row['inactive_load'],
+            $http, $row['ris_timestamp'], $row['source'],
         ]);
     }
 
@@ -241,14 +329,25 @@ class CpsDb
                neighbour_source = VALUES(neighbour_source),
                collected_at = NOW()'
         );
+        $row = $this->clipRow('uplinks', [
+            'cdp_neighbour'          => $n['cdp_neighbour'] ?? null,
+            'cdp_neighbour_port'     => $n['cdp_neighbour_port'] ?? null,
+            'cdp_neighbour_ip'       => $n['cdp_neighbour_ip'] ?? null,
+            'cdp_neighbour_platform' => $n['cdp_neighbour_platform'] ?? null,
+            'lldp_neighbour'         => $n['lldp_neighbour'] ?? null,
+            'lldp_neighbour_port'    => $n['lldp_neighbour_port'] ?? null,
+            'lldp_neighbour_ip'      => $n['lldp_neighbour_ip'] ?? null,
+            'switch_name'            => $summary['switch_name'] ?? null,
+            'switch_port'            => $summary['switch_port'] ?? null,
+            'switch_ip'              => $summary['switch_ip'] ?? null,
+        ]);
         $st->execute([
             $sweepId, $phoneId,
-            $n['cdp_neighbour'] ?? null,  $n['cdp_neighbour_port'] ?? null,
-            $n['cdp_neighbour_ip'] ?? null, $n['cdp_neighbour_platform'] ?? null,
-            $n['lldp_neighbour'] ?? null, $n['lldp_neighbour_port'] ?? null,
-            $n['lldp_neighbour_ip'] ?? null,
-            $summary['switch_name'] ?? null, $summary['switch_port'] ?? null,
-            $summary['switch_ip'] ?? null,   $summary['source'] ?? null,
+            $row['cdp_neighbour'], $row['cdp_neighbour_port'], $row['cdp_neighbour_ip'],
+            $row['cdp_neighbour_platform'],
+            $row['lldp_neighbour'], $row['lldp_neighbour_port'], $row['lldp_neighbour_ip'],
+            $row['switch_name'], $row['switch_port'], $row['switch_ip'],
+            $summary['source'] ?? null,
         ]);
     }
 

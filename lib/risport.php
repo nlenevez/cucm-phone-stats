@@ -67,11 +67,101 @@ class CpsRisportClient
      */
     private array $lastDiag = [];
 
+    /**
+     * Request timestamps per server, for the sliding-window rate limit.
+     *
+     * Static and keyed by base URL because the throttle is enforced per node
+     * per user, not per PHP object: the probe builds fresh clients for the
+     * same server, and each one starting with an empty history would let the
+     * limit be exceeded immediately.
+     */
+    private static array $requestLog = [];
+
     public function __construct(
         private CpsSoapClient $soap,
         private int $maxReturnedDevices = 1000,
         private int $requestGapMs = 4000,
+        private int $ratePerMin = 12,
+        private int $rateRetries = 4,
     ) {}
+
+    /**
+     * Block until another request is allowed.
+     *
+     * A fixed gap between calls is the wrong shape for this limit. RisPort
+     * allows a number of requests per minute, so a 4s gap sits exactly on 15
+     * a minute with no headroom - and the budget is shared with anything
+     * else querying realtime data as the same user. A sliding window spends
+     * the allowance as fast as it is safe to and then waits, which is both
+     * faster when there is room and safer when there is not.
+     */
+    private function rateLimit(): void
+    {
+        $key = $this->soap->baseUrl();
+        $now = microtime(true);
+        self::$requestLog[$key] = array_values(array_filter(
+            self::$requestLog[$key] ?? [], fn($t) => $now - $t < 60.0
+        ));
+
+        if ($this->ratePerMin > 0 && count(self::$requestLog[$key]) >= $this->ratePerMin) {
+            $oldest = self::$requestLog[$key][0];
+            $wait   = 60.0 - ($now - $oldest) + 0.25;
+            if ($wait > 0) {
+                cps_log(sprintf('%s: rate limit reached (%d/min), waiting %.1fs',
+                    $key, $this->ratePerMin, $wait), 2);
+                usleep((int)($wait * 1_000_000));
+            }
+        }
+        if ($this->requestGapMs > 0) {
+            $last = end(self::$requestLog[$key]);
+            if ($last !== false) {
+                $since = (microtime(true) - $last) * 1000;
+                if ($since < $this->requestGapMs) {
+                    usleep((int)(($this->requestGapMs - $since) * 1000));
+                }
+            }
+        }
+        self::$requestLog[$key][] = microtime(true);
+    }
+
+    /** Does this fault mean "you are asking too often"? */
+    public static function isRateLimitFault(Throwable $e): bool
+    {
+        $m = strtolower($e->getMessage());
+        return str_contains($m, 'exceeded allowed rate')
+            || str_contains($m, 'rate control')
+            || str_contains($m, 'throttl')
+            || str_contains($m, 'too many requests');
+    }
+
+    /**
+     * Issue one selectCmDevice, retrying when the cluster says we are asking
+     * too often.
+     *
+     * A throttle fault is transient by definition, so treating it as a
+     * failure is simply wrong: previously a throttled partition was warned
+     * about and skipped, which dropped exactly the devices the partitioning
+     * existed to recover, and left a short answer looking deliberate.
+     */
+    private function postWithRetry(string $envelope): DOMDocument
+    {
+        $attempt = 0;
+        while (true) {
+            $this->rateLimit();
+            try {
+                return $this->soap->post(CPS_RIS_PATH, $envelope, '""');
+            } catch (Throwable $e) {
+                if (!self::isRateLimitFault($e) || $attempt >= $this->rateRetries) { throw $e; }
+                $attempt++;
+                // The window is a minute, so waiting out a good part of one
+                // is the only thing that actually clears the condition.
+                $backoff = min(60, 15 * $attempt);
+                cps_warn(sprintf('%s: %s - backing off %ds (attempt %d of %d)',
+                    $this->soap->baseUrl(), trim($e->getMessage()), $backoff, $attempt, $this->rateRetries));
+                sleep($backoff);
+            }
+        }
+    }
 
     public function baseUrl(): string { return $this->soap->baseUrl(); }
 
@@ -127,7 +217,7 @@ class CpsRisportClient
                   . '</soap:selectCmDevice>';
 
             $env = CpsSoapClient::envelope($body, ['soap' => CPS_RIS_NS]);
-            $doc = $this->soap->post(CPS_RIS_PATH, $env, '""');
+            $doc = $this->postWithRetry($env);
 
             $found = cps_xml_text($doc, 'TotalDevicesFound');
             $batch = $this->parseDevices($doc);
@@ -178,8 +268,7 @@ class CpsRisportClient
             }
             $seenState[$next] = true;
             $stateInfo = $next;
-
-            if ($this->requestGapMs > 0) { usleep($this->requestGapMs * 1000); }
+            // Pacing is handled by rateLimit() inside postWithRetry().
         }
         $this->lastDiag['returned_total'] = count($devices);
         $statuses = [];
@@ -283,11 +372,25 @@ class CpsRisportClient
         string $status = 'Registered',
         string $deviceClass = 'Phone',
         string|array $partitions = 'auto',
+        array $devicePrefixes = [],
     ): array {
         $mode = is_array($partitions) ? 'explicit' : strtolower(trim($partitions));
 
+        $selectItems = self::selectItemsFor($devicePrefixes);
+
         if ($mode !== 'explicit') {
-            $rows  = $this->selectCmDevice($status, $deviceClass);
+            $rows  = $this->selectCmDevice($status, $deviceClass, $selectItems);
+
+            // Safety net: if scoping the query returns nothing at all, the
+            // cluster may not accept a wildcard in SelectItems. Falling back
+            // to an unscoped query once is far better than reporting an
+            // empty estate, and it says so rather than hiding the fallback.
+            if (!$rows && $selectItems !== ['*']) {
+                cps_warn(sprintf('%s: scoped query (%s) returned nothing - retrying unscoped',
+                    $this->soap->baseUrl(), implode(',', $selectItems)));
+                $rows = $this->selectCmDevice($status, $deviceClass, ['*']);
+                $selectItems = ['*'];
+            }
             $diag  = $this->lastDiagnostics();
             $totals = array_map('intval', array_filter(array_column($diag['rounds'] ?? [], 'total_devices_found'), 'strlen'));
             $claimed = $totals ? max($totals) : null;
@@ -326,9 +429,60 @@ class CpsRisportClient
                 ];
                 return $rows;
             }
-            cps_warn(sprintf('%s: RisPort %s - re-running split by name prefix',
-                $this->soap->baseUrl(), $reason));
-            $patterns = self::DEFAULT_PARTITIONS;
+            cps_warn(sprintf('%s: RisPort %s', $this->soap->baseUrl(), $reason));
+
+            // Strategy 1: split by NODE. Far cheaper than splitting by name,
+            // and better targeted. The cap applies per query, and phones are
+            // already distributed across subscribers, so a four-node cluster
+            // of 2,300 phones usually resolves in four queries.
+            //
+            // Splitting by name is the fallback because device names are
+            // MACs: the leading characters are the OUI, and a fleet bought
+            // together shares one. Over a thousand phones under SEP44* is
+            // normal, so leading-character buckets walk down a single
+            // dominant branch, costing sixteen queries a level against a
+            // rate-limited API to make almost no progress.
+            $nodes = array_keys($this->lastDiag['nodes'] ?? []);
+            $nodes = array_values(array_filter($nodes, fn($n) => $n !== '' && $n !== '(unnamed)'));
+            if (count($nodes) > 1) {
+                $byNode   = [];
+                foreach ($firstPassSeed = $rows as $r) { $byNode[$r['name']] = $r; }
+                $stillCapped = [];
+                foreach ($nodes as $node) {
+                    try {
+                        $nodeRows = $this->selectCmDevice($status, $deviceClass, $selectItems, 'Name', $node);
+                    } catch (Throwable $e) {
+                        cps_warn("RisPort node $node failed: " . $e->getMessage());
+                        $stillCapped[] = $node;
+                        continue;
+                    }
+                    foreach ($nodeRows as $r) {
+                        if ($r['name'] !== '') { $byNode[$r['name']] = $r; }
+                    }
+                    cps_log(sprintf('  node %-30s %d devices', $node, count($nodeRows)));
+                    if (count($nodeRows) >= $cap) { $stillCapped[] = $node; }
+                }
+                if (!$stillCapped) {
+                    $this->lastDiag['enumeration'] = [
+                        'mode' => 'partitioned (by node)',
+                        'first_pass_returned' => count($rows),
+                        'total_devices_found' => $claimed,
+                        'nodes_queried' => $nodes,
+                        'returned' => count($byNode),
+                        'truncated' => false,
+                        'incomplete' => false,
+                    ];
+                    cps_log(sprintf('%s: per-node enumeration produced %d unique devices in %d queries',
+                        $this->soap->baseUrl(), count($byNode), count($nodes)));
+                    return array_values($byNode);
+                }
+                cps_warn(sprintf('%s: node(s) %s still at the cap - falling back to name prefixes',
+                    $this->soap->baseUrl(), implode(', ', $stillCapped)));
+                $rows = array_values($byNode);
+            }
+
+            cps_warn(sprintf('%s: re-running split by name prefix', $this->soap->baseUrl()));
+            $patterns = self::partitionsFor($devicePrefixes);
             $firstPass = $rows;
             $firstClaimed = $claimed;
         } else {
@@ -348,9 +502,13 @@ class CpsRisportClient
         // only ever add devices - if a child pattern misses something the
         // parent already found, the parent's row is still there.
         $queue = array_values($patterns);
+        $failedPatterns = [];
         $depth = [];
         foreach ($queue as $q) { $depth[$q] = 0; }
-        $maxDepth = 3;
+        // Six hex digits of OUI have to be traversed before the serial part
+        // provides any spread, so a shallow limit stops right where a
+        // MAC-clustered estate needs to keep going.
+        $maxDepth = 8;
 
         while ($queue) {
             $pat = array_shift($queue);
@@ -359,6 +517,7 @@ class CpsRisportClient
             } catch (Throwable $e) {
                 cps_warn("RisPort partition $pat failed: " . $e->getMessage());
                 $perPattern[$pat] = 'ERROR: ' . $e->getMessage();
+                $failedPatterns[] = $pat;
                 continue;
             }
             $perPattern[$pat] = count($part);
@@ -383,17 +542,84 @@ class CpsRisportClient
         }
 
         $merged = array_values($byName);
+        if ($failedPatterns) {
+            // Say it plainly. A partition that never completed means devices
+            // under that prefix are missing, and the total looks like an
+            // answer rather than a partial one.
+            cps_warn(sprintf(
+                '%s: %d partition(s) never completed (%s) - the device list is INCOMPLETE',
+                $this->soap->baseUrl(), count($failedPatterns),
+                implode(', ', array_slice($failedPatterns, 0, 6))
+                    . (count($failedPatterns) > 6 ? ', ...' : '')
+            ));
+        }
         $this->lastDiag['enumeration'] = [
             'mode'                 => $mode === 'explicit' ? 'partitioned (explicit)' : 'partitioned (auto)',
             'first_pass_returned'  => count($firstPass),
             'total_devices_found'  => $firstClaimed,
             'per_pattern'          => $perPattern,
+            'failed_patterns'      => $failedPatterns,
             'returned'             => count($merged),
-            'truncated'            => $firstClaimed !== null && count($merged) < $firstClaimed,
+            'incomplete'           => (bool)$failedPatterns,
+            'truncated'            => ($firstClaimed !== null && count($merged) < $firstClaimed) || (bool)$failedPatterns,
         ];
         cps_log(sprintf('%s: partitioned enumeration produced %d unique devices (first pass %d)',
             $this->soap->baseUrl(), count($merged), count($firstPass)));
         return $merged;
+    }
+
+    /**
+     * SelectItems patterns for the prefixes being polled.
+     *
+     * Scoping the query itself, rather than filtering afterwards, means the
+     * cluster never gathers or returns device types we do not want. That is
+     * cheaper for CUCM, returns less data, and - on an estate with a large
+     * Jabber population - can keep a node under the response cap that would
+     * otherwise exceed it purely because of soft clients.
+     *
+     * @param string[] $prefixes
+     * @return string[] ['*'] when nothing is specified
+     */
+    public static function selectItemsFor(array $prefixes): array
+    {
+        $out = [];
+        foreach ($prefixes as $p) {
+            $p = strtoupper(trim($p));
+            if ($p !== '') { $out[] = $p . '*'; }
+        }
+        return $out ?: ['*'];
+    }
+
+    /**
+     * Build the partition set for the device prefixes actually being polled.
+     *
+     * Enumerating device types that are about to be discarded is pure waste,
+     * and on a rate-limited API it is expensive waste: with
+     * poll_device_prefixes = SEP the CSF/TCT/BOT/TAB buckets cost queries for
+     * rows that never reach a report, and a large Jabber estate would push
+     * CSF* over the cap and spend another subdivision enumerating it.
+     *
+     * A MAC-based prefix is split into 16 hex buckets; anything else is left
+     * whole and only subdivided if it turns out to need it.
+     *
+     * @param string[] $prefixes device-name prefixes, empty for everything
+     * @return string[]
+     */
+    public static function partitionsFor(array $prefixes): array
+    {
+        if (!$prefixes) { return self::DEFAULT_PARTITIONS; }
+        $out = [];
+        foreach ($prefixes as $p) {
+            $p = strtoupper(trim($p));
+            if ($p === '') { continue; }
+            if (in_array($p, ['SEP', 'ATA', 'CIPC'], true)) {
+                // Followed by a MAC, so the next character is a hex digit.
+                foreach (str_split('0123456789ABCDEF') as $h) { $out[] = $p . $h . '*'; }
+            } else {
+                $out[] = $p . '*';
+            }
+        }
+        return $out ?: self::DEFAULT_PARTITIONS;
     }
 
     /**
@@ -410,10 +636,24 @@ class CpsRisportClient
     private static function subdivide(string $pattern): array
     {
         $stem = rtrim($pattern, '*');
-        $out  = [];
-        foreach (str_split('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ') as $ch) {
-            $out[] = $stem . $ch . '*';
-        }
+        // A MAC-shaped stem can only continue with a hex digit, so 36
+        // children would be 20 queries returning nothing - and on a
+        // rate-limited API those cost well over a minute each time a bucket
+        // is subdivided. Everything else keeps the wider alphabet, because a
+        // soft-client prefix is followed by a username.
+        // Decide by the PREFIX, not by whether the tail happens to look hex:
+        // a bare "CSF*" has no tail at all, and treating that as MAC-shaped
+        // would generate only 0-F and miss every username starting G-Z.
+        preg_match('/^(CIPC|SEP|CSF|TCT|BOT|TAB|ATA|SIP|IMS)/i', $stem, $m);
+        $prefix    = strtoupper($m[1] ?? '');
+        $tail      = substr($stem, strlen($prefix));
+        $macShaped = in_array($prefix, ['SEP', 'ATA', 'CIPC'], true)
+                     && ($tail === '' || ctype_xdigit($tail));
+        $alphabet  = $macShaped
+            ? '0123456789ABCDEF'
+            : '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+        $out = [];
+        foreach (str_split($alphabet) as $ch) { $out[] = $stem . $ch . '*'; }
         return $out;
     }
 
@@ -433,13 +673,14 @@ class CpsRisportClient
         string $status = 'Registered',
         string $deviceClass = 'Phone',
         string|array $partitions = 'auto',
+        array $devicePrefixes = [],
     ): array {
         $byName = [];
         $errors = [];
         $perServer = [];
         foreach ($clients as $c) {
             try {
-                $rows = $c->selectCmDeviceComplete($status, $deviceClass, $partitions);
+                $rows = $c->selectCmDeviceComplete($status, $deviceClass, $partitions, $devicePrefixes);
             } catch (Throwable $e) {
                 $errors[] = ['server' => $c->baseUrl(), 'error' => $e->getMessage()];
                 cps_warn($c->baseUrl() . ': ' . $e->getMessage());

@@ -34,6 +34,29 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
   workstation*, so an unfiltered sweep fired an HTTPS request at every desk
   in the estate. `--all-devices` or an explicit `--device-prefixes` list
   overrides; the skip is reported with a per-prefix breakdown.
+- **Per-node RisPort enumeration, tried before name prefixes.** Phones are
+  already spread across subscribers, so a four-node cluster of 2,300 phones
+  resolves in four queries instead of sixteen-plus name buckets. Device names
+  are MACs and a fleet shares an OUI — over a thousand phones under `SEP44*`
+  is normal — so leading-character buckets walk down one dominant branch and
+  make almost no progress per query.
+- **`poll_device_prefixes` now scopes the RisPort query itself.** It was
+  only ever a post-discovery filter: the partition list was a hardcoded
+  constant that always included `CSF*`, `TCT*`, `BOT*` and friends, so
+  setting `poll_device_prefixes = SEP` still enumerated — and on a truncated
+  estate subdivided — every soft-client bucket before discarding the rows.
+  `SelectItems` now carries the polled prefixes on the first query, the
+  per-node queries and the partitions alike, so those devices are never
+  gathered at all. A scoped query returning nothing retries once unscoped
+  and says so, rather than reporting an empty estate.
+- **Sliding-window rate limiting** (`ris_rate_per_min`, default 12) replaces
+  the fixed inter-request gap, which sat exactly on 15/min with no headroom.
+  Throttle faults are recognised and **retried with backoff** — they are
+  transient, and treating one as a hard failure previously skipped a
+  partition and dropped exactly the devices the split existed to recover. A
+  partition that never completes now marks the result incomplete and says so.
+- Subdivision uses a hex alphabet for MAC-shaped stems (16 children, not 36),
+  and the depth limit is raised so it can get past a six-digit OUI.
 - **Partitioned RisPort enumeration** (`ris_partitions`, default `auto`).
   RisPort caps a single `selectCmDevice` conversation without saying so —
   `StateInfo` stops arriving and the truncated answer looks complete. The
@@ -106,6 +129,20 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
   `https://{ip}` and `http://{ip}`.
 
 ### Fixed
+- **`dir_number` overflowed its column and cost the whole phone.** RisPort
+  returns `DirNumber` as a comma-separated list of *every* line appearance,
+  so a phone with many lines runs past `VARCHAR(64)` and MySQL rejects the
+  row with error 1406 — and since writes are one transaction per phone, that
+  lost the handset's registration, port statistics and uplink over one
+  field. The column is now `VARCHAR(512)`, and **`cucm-initdb.php` migrates
+  an existing database** (`CREATE TABLE IF NOT EXISTS` cannot widen a column
+  that already exists; the ALTER only ever widens and is a no-op when the
+  column is already big enough).
+- **Over-long values are now clipped rather than failing the write.** Driven
+  by the live column widths from `information_schema`, so it covers the
+  fields nobody predicted would overflow, and it warns once per column
+  rather than doing it silently. `dir_number` was the one that broke; it will
+  not be the last.
 - **Truncation went undetected when the cluster capped `TotalDevicesFound`
   too.** A CUCM with 2,300 registered phones returned exactly 1,000 and also
   reported 1,000 as the total, so comparing the two concluded the answer was

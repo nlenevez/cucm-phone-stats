@@ -101,7 +101,7 @@ RisPort is throttled or deactivated.
 cp cucm.conf.example cucm.conf && $EDITOR cucm.conf
 
 php bin/cucm-probe.php --phone 10.0.0.50   # confirm the assumptions first
-php bin/cucm-initdb.php --create-database  # tables and reporting views
+php bin/cucm-initdb.php --create-database  # tables, views, and column migrations
 php bin/cucm-sweep.php                     # discover, poll, store
 
 php bin/cucm-report.php speed-mismatch
@@ -224,6 +224,17 @@ not to poll it — only the device name does.
 ```ini
 poll_device_prefixes = SEP          # cucm.conf; blank polls everything
 ```
+
+This scopes the **RisPort query itself**, not just the results: `SelectItems`
+asks the cluster for `SEP*` only, so CSF/TCT/BOT/TAB devices are never
+gathered, never returned and never partitioned. Cheaper for CUCM, less data
+back, and on an estate with a large Jabber population it can keep a node
+under the response cap it would otherwise exceed purely because of soft
+clients.
+
+If a scoped query returns nothing at all — which would mean the cluster does
+not accept a wildcard in `SelectItems` — it retries once unscoped and says
+so, rather than reporting an empty estate.
 ```bash
 php bin/cucm-sweep.php --all-devices             # poll everything, once
 php bin/cucm-sweep.php --device-prefixes SEP,ATA # explicit list
@@ -306,6 +317,10 @@ is what you want when a phone keeps clearing its counters and you are working
 out why. `--since YYYY-MM-DD` bounds the window.
 
 ## Schema
+
+**After upgrading, run `php bin/cucm-initdb.php` before the next sweep.** It
+creates anything new and applies column migrations to an existing database.
+It is idempotent, so running it when nothing has changed costs nothing.
 
 `sweeps` one run · `phones` inventory keyed on device name · `registrations`
 where each phone was in each sweep · `port_stats` normalised link state and

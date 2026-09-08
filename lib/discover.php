@@ -14,14 +14,31 @@ require_once __DIR__ . '/config.php';
  *
  * @return array<int,array<string,mixed>>
  */
-function cps_discover_phones(array $cfg, string $source, string $status): array
+function cps_discover_phones(array $cfg, string $source, string $status, array $opts = []): array
 {
     if ($source === 'risport') {
         $parts = (string)($cfg['ris_partitions'] ?? 'auto');
         $mode  = in_array(strtolower(trim($parts)), ['auto', 'off', 'always'], true)
             ? strtolower(trim($parts))
             : preg_split('/[\s,]+/', $parts, -1, PREG_SPLIT_NO_EMPTY);
-        $res = CpsRisportClient::discover(cps_risport_clients($cfg), $status, 'Phone', $mode);
+        // Enumerate only the device types that will actually be polled.
+        // Splitting the estate to recover CSF/TCT/BOT rows that the prefix
+        // filter then discards spends the rate-limit budget on nothing.
+        $prefixes = [];
+        if (empty($opts['all-devices'])) {
+            $raw = is_string($opts['device-prefixes'] ?? null)
+                ? $opts['device-prefixes']
+                : (string)($cfg['poll_device_prefixes'] ?? '');
+            $prefixes = preg_split('/[\s,]+/', trim($raw), -1, PREG_SPLIT_NO_EMPTY);
+        }
+        if ($prefixes) {
+            // Say what is being asked for. The "N skipped as not SEP" line
+            // no longer appears once the query itself is scoped, and a
+            // quietly smaller number is exactly what makes an operator
+            // wonder whether devices went missing.
+            cps_log('querying only ' . implode('*, ', $prefixes) . '* device names');
+        }
+        $res = CpsRisportClient::discover(cps_risport_clients($cfg), $status, 'Phone', $mode, $prefixes);
         foreach ($res['per_server'] ?? [] as $srv => $st) {
             $enum = $st['enumeration'] ?? null;
             if ($enum && !empty($enum['truncated'])) {

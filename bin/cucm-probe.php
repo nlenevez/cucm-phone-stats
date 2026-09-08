@@ -186,7 +186,8 @@ $risCounts = [];
 foreach ($servers as $srv) {
     $rec = probe($probes, "ris:selectCmDevice:$srv", 'RisPort70 returns registered phones with IP addresses',
         function () use ($cfg, $srv, &$risCounts) {
-            $ris  = new CpsRisportClient(cps_soap_for($cfg, $srv), 1000, 0);
+            $ris  = new CpsRisportClient(cps_soap_for($cfg, $srv), 1000, 0,
+                (int)$cfg['ris_rate_per_min'], (int)$cfg['ris_rate_retries']);
             $rows = $ris->selectCmDevice('Registered', 'Phone');
             $diag = $ris->lastDiagnostics();
             $withIp   = count(array_filter($rows, fn($r) => !empty($r['ip'])));
@@ -224,7 +225,8 @@ foreach ($servers as $srv) {
     // what is excluding them.
     probe($probes, "ris:selectCmDevice:$srv:Any", 'Status=Any reveals whether the node knows more devices than it reports as Registered',
         function () use ($cfg, $srv, &$risCounts) {
-            $ris  = new CpsRisportClient(cps_soap_for($cfg, $srv), 1000, 0);
+            $ris  = new CpsRisportClient(cps_soap_for($cfg, $srv), 1000, 0,
+                (int)$cfg['ris_rate_per_min'], (int)$cfg['ris_rate_retries']);
             $rows = $ris->selectCmDevice('Any', 'Phone');
             $diag = $ris->lastDiagnostics();
             $reg  = $risCounts[$srv]['registered'] ?? null;
