@@ -377,6 +377,7 @@ class CpsRisportClient
         $mode = is_array($partitions) ? 'explicit' : strtolower(trim($partitions));
 
         $selectItems = self::selectItemsFor($devicePrefixes);
+        $cap         = $this->effectiveCap();
 
         if ($mode !== 'explicit') {
             $rows  = $this->selectCmDevice($status, $deviceClass, $selectItems);
@@ -395,7 +396,6 @@ class CpsRisportClient
             $totals = array_map('intval', array_filter(array_column($diag['rounds'] ?? [], 'total_devices_found'), 'strlen'));
             $claimed = $totals ? max($totals) : null;
 
-            $cap     = $this->effectiveCap();
             // 90% rather than 100%: the documented cap is 1000 and asking for
             // 1000 gets exactly 1000, but an administrator can lower the
             // RisPort throttle below what we asked for, in which case the
@@ -481,6 +481,32 @@ class CpsRisportClient
                 $rows = array_values($byNode);
             }
 
+            // Strategy 2: split on the END of the name.
+            //
+            // A device name is SEP plus a MAC, and the leading digits are the
+            // OUI: a fleet bought together shares one, so prefix buckets keep
+            // resolving to a single over-cap branch - SEP4*, SEP44*, SEP44B*,
+            // SEP44B6*, SEP44B6B* all capped on a real estate, sixteen
+            // queries a level to get nowhere. The last digits are the serial
+            // and are close to uniform, so splitting there gives sixteen even
+            // buckets in ONE level.
+            //
+            // Whether the cluster accepts a leading wildcard is not something
+            // to assume, so it is tested with a single query and the answer
+            // is checked: the rows must come back, be fewer than the cap, and
+            // actually end in the requested digit. A cluster that ignores the
+            // pattern would otherwise hand back the whole capped set and look
+            // like success.
+            $suffix = $this->trySuffixPartitioning($status, $deviceClass, $selectItems, $cap);
+            if ($suffix !== null) {
+                cps_warn(sprintf('%s: re-running split on the last character of the name (%d buckets)',
+                    $this->soap->baseUrl(), count($suffix)));
+                $patterns  = $suffix;
+                $firstPass = $rows;
+                $firstClaimed = $claimed;
+                return $this->runPartitions($status, $deviceClass, $patterns, $firstPass, $firstClaimed, $cap, 'suffix');
+            }
+
             cps_warn(sprintf('%s: re-running split by name prefix', $this->soap->baseUrl()));
             $patterns = self::partitionsFor($devicePrefixes);
             $firstPass = $rows;
@@ -491,10 +517,34 @@ class CpsRisportClient
             $firstClaimed = null;
         }
 
+        return $this->runPartitions($status, $deviceClass, $patterns,
+            $firstPass, $firstClaimed, $cap, $mode === 'explicit' ? 'explicit' : 'prefix');
+    }
+
+    /**
+     * Run a set of name patterns to exhaustion and merge the results.
+     *
+     * Shared by every splitting strategy so they cannot drift: the queue,
+     * the subdivision of a bucket that is itself over the cap, the merge by
+     * device name, and the honest reporting of any pattern that never
+     * completed all behave identically whichever axis was chosen.
+     *
+     * @param string[] $patterns
+     * @param array<int,array> $firstPass rows already in hand, merged in
+     * @return array<int,array<string,mixed>>
+     */
+    private function runPartitions(
+        string $status,
+        string $deviceClass,
+        array $patterns,
+        array $firstPass,
+        ?int $firstClaimed,
+        int $cap,
+        string $axis,
+    ): array {
         $byName = [];
         foreach ($firstPass as $r) { $byName[$r['name']] = $r; }
         $perPattern = [];
-        $cap        = $this->effectiveCap();
 
         // Work through a queue rather than a fixed list: a bucket that comes
         // back at the cap is itself truncated and gets subdivided a level
@@ -554,7 +604,7 @@ class CpsRisportClient
             ));
         }
         $this->lastDiag['enumeration'] = [
-            'mode'                 => $mode === 'explicit' ? 'partitioned (explicit)' : 'partitioned (auto)',
+            'mode'                 => "partitioned ($axis)",
             'first_pass_returned'  => count($firstPass),
             'total_devices_found'  => $firstClaimed,
             'per_pattern'          => $perPattern,
@@ -623,6 +673,49 @@ class CpsRisportClient
     }
 
     /**
+     * Can this cluster match on the end of a device name?
+     *
+     * One probe query, and its answer is verified rather than assumed. A
+     * cluster that does not understand a leading wildcard may return
+     * nothing, or may ignore the pattern and return everything; both are
+     * rejected, and the caller falls back to prefix splitting.
+     *
+     * @return string[]|null the suffix patterns to use, or null if unsupported
+     */
+    private function trySuffixPartitioning(string $status, string $deviceClass, array $selectItems, int $cap): ?array
+    {
+        // Probe with the first scoped prefix, e.g. "SEP*" -> "SEP*0".
+        $base = $selectItems[0] ?? '*';
+        if (!str_ends_with($base, '*')) { return null; }
+        $probe = $base . '0';
+
+        try {
+            $rows = $this->selectCmDevice($status, $deviceClass, [$probe]);
+        } catch (Throwable $e) {
+            cps_log('suffix probe failed: ' . $e->getMessage(), 2);
+            return null;
+        }
+        if (!$rows) {
+            cps_log("suffix probe '$probe' returned nothing - cluster does not support it", 2);
+            return null;
+        }
+        foreach ($rows as $r) {
+            if (!str_ends_with(strtoupper((string)$r['name']), '0')) {
+                cps_log("suffix probe '$probe' returned '{$r['name']}' - pattern ignored by the cluster", 2);
+                return null;
+            }
+        }
+        if (count($rows) >= $cap) {
+            cps_log("suffix probe '$probe' is itself at the cap - one character is not enough", 2);
+            return null;
+        }
+
+        $out = [];
+        foreach (str_split('0123456789ABCDEF') as $ch) { $out[] = $base . $ch; }
+        return $out;
+    }
+
+    /**
      * Split a wildcard pattern one character deeper.
      *
      * "SEP0*" becomes "SEP00*".."SEP0Z*". The alphabet is 0-9A-Z rather than
@@ -635,6 +728,14 @@ class CpsRisportClient
      */
     private static function subdivide(string $pattern): array
     {
+        // A trailing-wildcard pattern ("SEP*0") splits by inserting another
+        // character before the fixed tail, not by appending to the stem.
+        if (preg_match('/^(.*)\*(.+)$/', $pattern, $sm)) {
+            $out = [];
+            foreach (str_split('0123456789ABCDEF') as $ch) { $out[] = $sm[1] . '*' . $ch . $sm[2]; }
+            return $out;
+        }
+
         $stem = rtrim($pattern, '*');
         // A MAC-shaped stem can only continue with a hex digit, so 36
         // children would be 20 queries returning nothing - and on a

@@ -172,6 +172,19 @@ Discovery also reports **per server**: how many devices each one returned,
 how many were new, and the per-node breakdown from `CmNodes`. With more than
 one cluster in play, a single total cannot show which one came up short.
 
+**Then splitting on the LAST character of the name**, because device names
+are MACs and prefix buckets are hopeless when a fleet shares an OUI: on a
+real estate `SEP4*`, `SEP44*`, `SEP44B*`, `SEP44B6*`, `SEP44B6B*` and
+`SEP44B6BE*` were all over the cap in turn — six levels, sixteen queries
+each, to separate nothing. The trailing digits are the device serial and are
+close to uniform, so they give sixteen even buckets in one level.
+
+Whether a cluster accepts a leading wildcard is probed with a single query
+and the answer is *verified* — the rows must arrive, be under the cap, and
+actually end in the requested digit — because a cluster that ignored the
+pattern would return the whole capped set and look like success. If it is
+not supported, prefix splitting is the fallback.
+
 A bucket that itself comes back at the cap is subdivided a character deeper
 (`SEP0*` → `SEP00*`…`SEP0Z*`), up to three levels. Results merge by device
 name throughout, so subdividing can only add devices, never lose them.

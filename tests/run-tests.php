@@ -812,6 +812,35 @@ ok('the device-prefix default also excludes it', !in_array('CSFJOSEPH', $m3, tru
 
 file_get_contents("http://127.0.0.1:$port/_soft/0");
 
+// --------------------------------------- OUI-clustered estate (the hard one)
+section('integration: every phone on one OUI, one node');
+file_get_contents("http://127.0.0.1:$port/_big/300");
+file_get_contents("http://127.0.0.1:$port/_oui/1");
+$confOui = "$root/tests/.cucm-test-oui.conf";
+file_put_contents($confOui, file_get_contents($conf) . "\nris_max_devices = 120\n");
+
+// Prefix splitting is useless here: SEP4*, SEP44*, SEP44B*, SEP44B6*,
+// SEP44B6B* and SEP44B6BE* are all over the cap in turn, because the OUI is
+// shared. The trailing digits are the serial and split evenly at once.
+$r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confOui) . " --json");
+eq('the whole estate is recovered', count(json_decode($r['out'], true) ?: []), 300);
+ok('splitting on the last character is used', str_contains($r['err'], 'last character'), substr($r['err'], 0, 300));
+eq('and no bucket needed subdividing', substr_count($r['err'], 'hit the'), 0);
+
+// A cluster that will not match on the end of a name must still get there.
+file_get_contents("http://127.0.0.1:$port/_nosuffix/1");
+$r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confOui) . " --json");
+eq('prefix fallback still recovers the whole estate', count(json_decode($r['out'], true) ?: []), 300);
+ok('and it is the prefix path, not the suffix one',
+   !str_contains($r['err'], 'last character'), substr($r['err'], 0, 200));
+ok('which needs several subdivisions to cross the OUI',
+   substr_count($r['err'], 'hit the') >= 4, substr_count($r['err'], 'hit the') . ' subdivisions');
+
+file_get_contents("http://127.0.0.1:$port/_nosuffix/0");
+file_get_contents("http://127.0.0.1:$port/_oui/0");
+file_get_contents("http://127.0.0.1:$port/_big/0");
+@unlink($confOui);
+
 // -------------------------------------------------------- subnet excludes --
 section('integration: --exclude-subnet');
 $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --exclude-subnet 10.10.10.8/32 --json");

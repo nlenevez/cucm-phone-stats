@@ -54,6 +54,18 @@ function capHidesTotal(): bool {
 const SOFT_FILE = __DIR__ . '/.mock-soft';
 const CONC_FILE = __DIR__ . '/.mock-conc';
 const RISSEEN_FILE = __DIR__ . '/.mock-risseen';
+const NOSUFFIX_FILE = __DIR__ . '/.mock-nosuffix';
+
+/**
+ * GET /_nosuffix/1 makes the cluster refuse a leading wildcard.
+ *
+ * Not every CUCM will match on the end of a device name, and the client is
+ * supposed to probe for it rather than assume. Modelling a cluster that
+ * returns nothing for such a pattern is what proves the fallback works.
+ */
+function suffixUnsupported(): bool {
+    return is_readable(NOSUFFIX_FILE) && trim((string)file_get_contents(NOSUFFIX_FILE)) === '1';
+}
 
 /**
  * Record which device-name prefixes RisPort actually handed back.
@@ -179,11 +191,28 @@ function bigCount(): int {
     return is_readable(BIG_FILE) ? max(0, (int)file_get_contents(BIG_FILE)) : 0;
 }
 
-/** Deterministic synthetic estate, spread across all 16 SEP buckets. */
+const OUI_FILE = __DIR__ . '/.mock-oui';
+
+/**
+ * GET /_oui/1 puts every phone on ONE OUI and ONE node.
+ *
+ * The realistic hard case, and the one seen in the field: a fleet bought
+ * together shares 44:B6:BE, so SEP4*, SEP44*, SEP44B*, SEP44B6*, SEP44B6B*
+ * and SEP44B6BE* are all over the cap in turn. Prefix splitting has to walk
+ * the entire OUI before it separates anything, while the trailing digits are
+ * the serial and split evenly at the first attempt.
+ */
+function ouiClustered(): bool {
+    return is_readable(OUI_FILE) && trim((string)file_get_contents(OUI_FILE)) === '1';
+}
+
+/** Deterministic synthetic estate. */
 function bigEstate(): array {
     $out = [];
     for ($i = 0; $i < bigCount(); $i++) {
-        $name = 'SEP' . strtoupper(substr(md5('dev' . $i), 0, 12));
+        $name = ouiClustered()
+            ? 'SEP44B6BE' . strtoupper(str_pad(dechex($i), 3, '0', STR_PAD_LEFT))
+            : 'SEP' . strtoupper(substr(md5('dev' . $i), 0, 12));
         $out[$name] = [
             'ip' => sprintf('10.%d.%d.%d', 20 + intdiv($i, 65025), intdiv($i, 255) % 255, ($i % 254) + 1),
             'status' => 'Registered', 'model' => 'Cisco 8841',
@@ -191,7 +220,7 @@ function bigEstate(): array {
             // Spread across subscribers, as a real cluster is. This is what
             // makes per-node enumeration a cheaper way past the response cap
             // than splitting by device name.
-            'node' => 'CUCM-SUB' . (($i % 3) + 1),
+            'node' => ouiClustered() ? 'CUCM-SUB1' : 'CUCM-SUB' . (($i % 3) + 1),
         ];
     }
     return $out;
@@ -204,6 +233,16 @@ function gen(): int {
 $uri  = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $body = file_get_contents('php://input');
 
+if (preg_match('#^/_oui/([01])$#', $uri, $m)) {
+    file_put_contents(OUI_FILE, $m[1]);
+    echo "oui {$m[1]}\n";
+    return;
+}
+if (preg_match('#^/_nosuffix/([01])$#', $uri, $m)) {
+    file_put_contents(NOSUFFIX_FILE, $m[1]);
+    echo "nosuffix {$m[1]}\n";
+    return;
+}
 if ($uri === '/_ris/seen') {
     header('Content-Type: application/json');
     echo is_readable(RISSEEN_FILE) ? (string)file_get_contents(RISSEEN_FILE) : '{}';
@@ -463,6 +502,20 @@ function ris(string $body): void {
     if (!$patterns) { $patterns = ['*']; }
     $narrowed = !(count($patterns) === 1 && $patterns[0] === '*');
 
+    // A pattern with a wildcard anywhere but the end is a "suffix" pattern.
+    if (suffixUnsupported()) {
+        foreach ($patterns as $pat) {
+            if (str_contains($pat, '*') && !str_ends_with($pat, '*')) {
+                soap_out('<ns:selectCmDeviceResponse xmlns:ns="http://schemas.cisco.com/ast/soap">'
+                       . '<selectCmDeviceReturn><SelectCmDeviceResult>'
+                       . '<TotalDevicesFound>0</TotalDevicesFound><CmNodes></CmNodes>'
+                       . '</SelectCmDeviceResult><StateInfo></StateInfo>'
+                       . '</selectCmDeviceReturn></ns:selectCmDeviceResponse>');
+                return;
+            }
+        }
+    }
+
     $source = bigCount() > 0 ? bigEstate() : estate();
     $all = [];
     foreach ($source as $name => $e) {
@@ -501,7 +554,7 @@ function ris(string $body): void {
     foreach ($slice as $name => $e) { $byNode[$e['node'] ?? 'CUCM-SUB1'][$name] = $e; }
     // Even a truncated response lists every node the cluster has, which is
     // what lets the client discover node names to query individually.
-    if (bigCount() > 0) {
+    if (bigCount() > 0 && !ouiClustered()) {
         foreach (['CUCM-SUB1', 'CUCM-SUB2', 'CUCM-SUB3'] as $n) { $byNode[$n] ??= []; }
     }
 

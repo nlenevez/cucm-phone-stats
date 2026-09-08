@@ -34,6 +34,15 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
   workstation*, so an unfiltered sweep fired an HTTPS request at every desk
   in the estate. `--all-devices` or an explicit `--device-prefixes` list
   overrides; the skip is reported with a per-prefix breakdown.
+- **Splitting on the last character of the device name**, tried after
+  per-node and before prefixes. Prefix buckets are near-useless when a fleet
+  shares an OUI — a live estate had `SEP4*` through `SEP44B6BE*` all over the
+  cap in turn, six levels of sixteen queries to separate nothing — whereas
+  the trailing serial digits split evenly in one level. Support is probed
+  with a single query and the result verified (rows present, under the cap,
+  and actually ending in the requested digit), since a cluster that ignored
+  the pattern would return the capped set and look successful. Measured on an
+  OUI-clustered estate: **0 subdivisions instead of 7**.
 - **Per-node RisPort enumeration, tried before name prefixes.** Phones are
   already spread across subscribers, so a four-node cluster of 2,300 phones
   resolves in four queries instead of sixteen-plus name buckets. Device names
