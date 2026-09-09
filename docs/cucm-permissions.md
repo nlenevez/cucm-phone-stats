@@ -20,6 +20,7 @@ Read the HTTP status before theorising about anything else:
 | **403** | credentials accepted, **account** refused | wrong password |
 | 404 | wrong path, or the service is not activated on this node | wrong host |
 | 500 + SOAP Fault | request reached the API and was understood enough to be rejected — read `axlmessage` | transport problem |
+| **599** | **AXL refused the request** — most often a schema version this cluster does not accept ("Wrong AXL Version" in the CUCM log). The body is a bare `<axlError>`, not a SOAP Fault | a transport failure |
 
 A **403 with credentials that work in the web UI** is the signature of an
 account whose access comes through a group rather than directly. Use a

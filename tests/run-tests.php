@@ -456,6 +456,48 @@ ok('axl-sql source works', is_array($axlPhones) && count($axlPhones) > 0, substr
 eq('axl-sql rows are labelled LastKnown, not Registered',
    $axlPhones[0]['status'] ?? null, 'LastKnown');
 
+section('integration: an older cluster (AXL 11.5)');
+// An estate can run more than one CUCM release. The client must negotiate
+// DOWN to a schema the cluster admits rather than assume the newest, and
+// this is a regression test for exactly that - a 11.5 cluster is live.
+// The cluster refuses an unknown schema with HTTP 599 and a bare
+// <axlError>, not a SOAP Fault. Treated as a transport failure that ends the
+// request, negotiation stopped on its first candidate and an older cluster
+// was never reached - so this asserts the walk survives a 599.
+foreach (['11.5', '10.5'] as $ver) {
+    file_get_contents("http://127.0.0.1:$port/_axlver/$ver");
+    $r = run("$php $root/bin/cucm-phones.php --config $C --source axl-sql --verbose --json");
+    ok("AXL $ver is negotiated",
+       str_contains($r['err'], "negotiated: $ver"),
+       implode(' | ', array_slice(array_filter(explode("\n", $r['err']), fn($l) => str_contains($l, 'schema')), 0, 2)));
+    ok("and it returns rows on AXL $ver", count(json_decode($r['out'], true) ?: []) > 0, substr($r['out'], 0, 120));
+}
+
+// The probe must name what was rejected, which is how a version problem on
+// one cluster of several gets identified at all.
+file_get_contents("http://127.0.0.1:$port/_axlver/11.5");
+$r = run("$php $root/bin/cucm-probe.php --config $C --server 127.0.0.1:$port --out /tmp/cps-probe-115");
+ok('the probe reports the accepted schema', str_contains($r['out'], 'schema 11.5 accepted'), substr($r['out'], 0, 400));
+ok('and lists the ones the cluster refused', str_contains($r['out'], 'rejected:'), substr($r['out'], 0, 400));
+ok('--server narrows the probe to one cluster', str_contains($r['err'] . $r['out'], "probing: http://127.0.0.1:$port"),
+   substr($r['err'], 0, 200));
+
+// A 599 must be an application-level refusal, not a fatal transport error.
+file_get_contents("http://127.0.0.1:$port/_axlver/11.5");
+$r = run("$php $root/bin/cucm-phones.php --config $C --source axl-sql --json");
+ok('a 599 on the first candidates does not abort the run', $r['rc'] === 0, substr($r['err'], 0, 200));
+ok('and no uncaught error escapes', !str_contains($r['err'], 'Uncaught'), substr($r['err'], 0, 200));
+
+// A cluster that accepts nothing we know must fail cleanly, not with a trace.
+file_get_contents("http://127.0.0.1:$port/_axlver/9.1");
+$r = run("$php $root/bin/cucm-phones.php --config $C --source axl-sql --json");
+ok('an unusable cluster fails cleanly', $r['rc'] !== 0 && !str_contains($r['err'], 'Uncaught'),
+   substr($r['err'], 0, 200));
+ok('and says which versions it tried', str_contains($r['err'], 'no AXL schema version accepted'),
+   substr($r['err'], 0, 200));
+
+file_get_contents("http://127.0.0.1:$port/_axlver/14.0,12.5");
+
 // ------------------------------------------------------------------ database
 section('integration: schema');
 try {

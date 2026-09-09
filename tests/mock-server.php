@@ -192,6 +192,22 @@ function bigCount(): int {
 }
 
 const OUI_FILE = __DIR__ . '/.mock-oui';
+const AXLVER_FILE = __DIR__ . '/.mock-axlver';
+
+/**
+ * Which AXL schema versions this cluster admits.
+ *
+ * An estate can easily run more than one CUCM release, and an older cluster
+ * rejects the newer schemas outright - so the client has to negotiate down
+ * to something it accepts rather than assume the latest.
+ */
+function axlVersions(): array {
+    if (is_readable(AXLVER_FILE)) {
+        $v = trim((string)file_get_contents(AXLVER_FILE));
+        if ($v !== '') { return preg_split('/[\s,]+/', $v, -1, PREG_SPLIT_NO_EMPTY); }
+    }
+    return ['14.0', '12.5'];
+}
 
 /**
  * GET /_oui/1 puts every phone on ONE OUI and ONE node.
@@ -233,6 +249,11 @@ function gen(): int {
 $uri  = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $body = file_get_contents('php://input');
 
+if (preg_match('#^/_axlver/(.*)$#', $uri, $m)) {
+    file_put_contents(AXLVER_FILE, urldecode($m[1]));
+    echo "axl versions {$m[1]}\n";
+    return;
+}
 if (preg_match('#^/_oui/([01])$#', $uri, $m)) {
     file_put_contents(OUI_FILE, $m[1]);
     echo "oui {$m[1]}\n";
@@ -377,8 +398,16 @@ function axl(string $body): void {
     }
     // Only 14.0 and 12.5 are "supported", so version negotiation has
     // something to walk down through - starting at 15.0, it must fall back.
-    if (preg_match('#AXL/API/([0-9.]+)#', $body, $m) && !in_array($m[1], ['14.0', '12.5'], true)) {
-        soap_fault("Unsupported AXL schema version {$m[1]}", '5007');
+    if (preg_match('#AXL/API/([0-9.]+)#', $body, $m) && !in_array($m[1], axlVersions(), true)) {
+        // How a real CUCM refuses a schema it does not know: HTTP 599 with a
+        // bare <axlError>, NOT a SOAP Fault. Treated as a transport failure
+        // that ends the request, this stopped version negotiation on its
+        // first candidate and the cluster was never reached at all.
+        http_response_code(599);
+        header('Content-Type: text/xml; charset=utf-8');
+        echo '<axlError><axlcode>-1</axlcode>'
+           . '<axlmessage>Wrong AXL Version</axlmessage>'
+           . '<request>getCCMVersion</request></axlError>';
         return;
     }
 

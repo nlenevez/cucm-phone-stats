@@ -147,6 +147,18 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
   `https://{ip}` and `http://{ip}`.
 
 ### Fixed
+- **A cluster on an older release was unreachable: AXL version negotiation
+  aborted on the first refusal.** CUCM refuses a schema it does not know with
+  **HTTP 599** and a bare `<axlError>` ("Wrong AXL Version") rather than a
+  SOAP Fault, and any non-200 was being treated as a fatal transport error —
+  so the walk stopped on its first candidate and never got down to 11.5.
+  599 is AXL refusing the request, not the transport failing: it now moves to
+  the next version, a bare `<axlError>` is recognised without a Fault
+  wrapper, and the error text says what 599 means. A cluster that accepts
+  nothing known now fails with a clear message naming the versions tried,
+  rather than an uncaught `CpsHttpError`.
+- `cucm-probe.php` gained `--server HOST` to probe one cluster of several,
+  and now reports which schema versions were accepted and refused.
 - **`error-trend` repeated the same phone and port once per sweep
   transition**, each with a different error count, which reads as duplicate
   rows rather than as the time series it is. It now returns **one row per

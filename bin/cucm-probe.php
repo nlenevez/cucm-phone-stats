@@ -29,6 +29,7 @@ $p    = cps_parse_args($argv, ['verbose', 'quiet', 'debug', 'help']);
 $opts = $p['opts'];
 if (!empty($opts['help'])) {
     fwrite(STDERR, "Usage: php bin/cucm-probe.php [--config FILE] [--phone IP] [--out DIR]\n"
+                 . "       [--server HOST]            probe only this cluster\n"
                  . "       [--schemes https[,http]]   schemes to try against the handset\n");
     exit(0);
 }
@@ -41,7 +42,21 @@ if (!is_dir($outDir) && !@mkdir($outDir, 0700, true)) {
 }
 
 $servers = cps_server_urls($cfg);
+// --server narrows the probe to one cluster. With more than one CUCM in
+// cucm_servers - and especially when they are different releases - probing
+// the failing one on its own is the difference between a clear answer and a
+// wall of output about the cluster that already works.
+if (is_string($opts['server'] ?? null)) {
+    $want = $opts['server'];
+    $only = array_values(array_filter($servers, fn($u) => str_contains($u, $want)));
+    if (!$only) {
+        $only = [str_contains($want, '://') ? rtrim($want, '/')
+                                            : 'https://' . $want . ':' . (int)$cfg['cucm_port']];
+    }
+    $servers = $only;
+}
 if (!$servers) { cps_die('no cucm_servers configured (see cucm.conf.example)'); }
+cps_log('probing: ' . implode(', ', $servers));
 
 $probes = [];
 
@@ -113,11 +128,14 @@ probe($probes, 'axl:auth+schema', 'getCCMVersion accepted on one candidate schem
                 return ['status' => 'PASS', 'schema_version' => $v,
                         'ccm_version' => cps_xml_text($doc, 'version'),
                         'tried' => $tried,
-                        'note' => "schema $v, cluster " . (cps_xml_text($doc, 'version') ?? '?')];
+                        'note' => "schema $v accepted, cluster reports " . (cps_xml_text($doc, 'version') ?? '?')
+                                  . ($tried ? ' (rejected: ' . implode(', ', array_keys($tried)) . ')' : '')];
             } catch (CpsSoapFault $e) {
                 $tried[$v] = $e->getMessage();
             } catch (CpsHttpError $e) {
-                // 401/403 will not improve with another schema version.
+                // 599 is AXL refusing the schema, so keep walking; 401/403
+                // and connection failures will not improve with another one.
+                if ($e->httpCode === 599) { $tried[$v] = $e->getMessage(); continue; }
                 return ['status' => 'FAIL', 'error' => $e->getMessage(),
                         'http_code' => $e->httpCode, 'tried' => $tried];
             }

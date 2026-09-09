@@ -77,7 +77,15 @@ function cps_discover_phones(array $cfg, string $source, string $status, array $
     }
 
     if ($source === 'axl-sql') {
-        $axl  = cps_axl_client($cfg);
+        // A discovery failure should read as a diagnosis, not a stack trace:
+        // this is the first thing that runs, and whatever it says is what
+        // someone acts on.
+        try {
+            $axl = cps_axl_client($cfg);
+            $axl->discoverVersion();
+        } catch (Throwable $e) {
+            cps_die('AXL is not usable on ' . implode(', ', cps_server_urls($cfg)) . ': ' . $e->getMessage());
+        }
         $rows = [];
         foreach ($axl->registrationDynamic() as $r) {
             $rows[] = [

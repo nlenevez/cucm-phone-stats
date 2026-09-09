@@ -86,6 +86,7 @@ class CpsAxlClient
     {
         if ($this->version !== null) { return $this->version; }
         $lastFault = null;
+        $tried     = [];
         foreach (self::KNOWN_VERSIONS as $v) {
             $env = CpsSoapClient::envelope(
                 '<ns:getCCMVersion></ns:getCCMVersion>',
@@ -98,13 +99,24 @@ class CpsAxlClient
                 return $v;
             } catch (CpsSoapFault $e) {
                 cps_log("AXL schema $v rejected: " . $e->getMessage(), 3);
+                $tried[$v] = $e->getMessage();
                 $lastFault = $e;
             } catch (CpsHttpError $e) {
-                throw $e; // auth or transport: retrying other versions is pointless
+                // 401/403 and connection failures will not improve with a
+                // different schema version, so stop. Anything AXL itself
+                // refused is a reason to try the next one - an older cluster
+                // rejects the newer schemas, which is the entire point of
+                // walking the list.
+                if ($e->httpCode === 599) {
+                    cps_log("AXL schema $v rejected (HTTP 599): " . $e->getMessage(), 3);
+                    $tried[$v] = $e->getMessage();
+                    continue;
+                }
+                throw $e;
             }
         }
         throw new CpsHttpError(
-            'no AXL schema version accepted (tried ' . implode(', ', self::KNOWN_VERSIONS) . ')'
+            'no AXL schema version accepted (tried ' . implode(', ', array_keys($tried) ?: self::KNOWN_VERSIONS) . ')'
             . ($lastFault ? '; last fault: ' . $lastFault->getMessage() : '')
         );
     }

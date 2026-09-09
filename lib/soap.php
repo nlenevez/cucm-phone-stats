@@ -106,6 +106,24 @@ class CpsSoapClient
             if ($fault !== null) {
                 throw $this->faultFrom($fault, $code);
             }
+            // AXL does not always wrap its errors in a SOAP Fault: a rejected
+            // schema version comes back as HTTP 599 carrying a bare
+            // <axlError>. Treated as a transport failure that ends the
+            // request, it stops version negotiation dead; treated as the
+            // application-level error it is, the next version gets tried.
+            if (cps_xml_first($doc, 'axlError') !== null || cps_xml_first($doc, 'axlcode') !== null) {
+                throw $this->faultFrom($doc->documentElement ?? $doc, $code);
+            }
+        }
+
+        // 599 is AXL's own "this request was understood and refused" code.
+        // Whatever the body looks like, it is not a transport problem.
+        if ($code === 599) {
+            $snippet = trim(preg_replace('/\s+/', ' ', strip_tags($body)));
+            throw new CpsSoapFault(
+                'AXL returned HTTP 599: ' . ($snippet !== '' ? substr($snippet, 0, 300) : '(empty body)'),
+                null, '599', null, 599
+            );
         }
 
         if ($code !== 200) {
@@ -113,7 +131,7 @@ class CpsSoapClient
                 $code === 401 => ' (401: bad username/password)',
                 $code === 403 => ' (403: credentials accepted but the account lacks the role - see docs/cucm-permissions.md)',
                 $code === 404 => ' (404: wrong path or the service is not activated on this node)',
-                $code === 599 => '',
+                $code === 599 => ' (599: AXL refused the request - commonly a schema version this cluster does not accept)',
                 default       => '',
             };
             throw new CpsHttpError("$url returned HTTP $code$hint", $code, substr($body, 0, 2000));
