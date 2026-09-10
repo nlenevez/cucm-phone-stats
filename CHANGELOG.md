@@ -118,6 +118,21 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
   re-sweeping the estate.
 
 **Web**
+- The page is light regardless of the browser's colour scheme; the dark-mode
+  rules are gone and `color-scheme` is pinned.
+- Columns empty for every row are hidden, named underneath with a link to
+  show them again (`?cols=all`), and omitted from the CSV to match. Decided
+  from the data rather than hard-coded, since which counters a firmware
+  reports varies by estate.
+- A web server that does not pass the query string made every tab render the
+  first report — the page reloaded and nothing changed. Two distinct nginx
+  causes, reproduced against a real nginx: a `try_files` fallback without
+  `?$query_string` (recoverable — the page now reads the parameters from
+  `REQUEST_URI` and notes it), and a `location ~ \.php$` block missing
+  `include fastcgi_params`, where PHP receives **no CGI environment at all**
+  and nothing can be recovered — the page now detects that and names the
+  directive instead of silently showing the wrong report.
+  `docs/web-deployment.md` carries a known-good server block.
 - **`web/cucm-reports.php`** — a single drop-in PHP file presenting the three
   reports as a browsable page: tabs, full-text search across all columns
   (multiple words narrow), click-to-sort on every column in both directions
@@ -157,6 +172,14 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
   `https://{ip}` and `http://{ip}`.
 
 ### Fixed
+- **Model showed as a numeric enum rather than a name.** RisPort reports the
+  model as an integer (627, 684, …); the name lives in CUCM's `typemodel`
+  table. It is now resolved at collection from the cluster itself — not a
+  hard-coded list, which would be wrong for some release and silently so —
+  and mirrored into a `device_models` table so rows collected earlier are
+  backfilled by `cucm-initdb.php` without needing those handsets to register
+  again. If AXL is unreachable the enum is kept rather than lost, and a
+  cluster already returning names is untouched.
 - **A cluster on an older release was unreachable: AXL version negotiation
   aborted on the first refusal.** CUCM refuses a schema it does not know with
   **HTTP 599** and a bare `<axlError>` ("Wrong AXL Version") rather than a

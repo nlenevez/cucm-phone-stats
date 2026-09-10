@@ -200,6 +200,32 @@ class CpsAxlClient
         return $maxRows > 0 ? array_slice($out, 0, $maxRows) : $out;
     }
 
+    /** Cached enum => model name, so one sweep costs one query. */
+    private ?array $modelNames = null;
+
+    /**
+     * Model enum to human-readable name, from CUCM's own typemodel table.
+     *
+     * RisPort reports a device's model as a numeric enum - 627, 683 and so
+     * on - which is meaningless in a report. The mapping is version-specific
+     * and runs to hundreds of entries, so it is read from the cluster rather
+     * than hard-coded: a built-in list would be wrong for some release, and
+     * silently wrong at that.
+     *
+     * @return array<int,string>
+     */
+    public function modelNames(): array
+    {
+        if ($this->modelNames !== null) { return $this->modelNames; }
+        $out = [];
+        foreach ($this->executeSqlQuery('SELECT enum, name FROM typemodel') as $row) {
+            if (isset($row['enum'], $row['name']) && $row['name'] !== '') {
+                $out[(int)$row['enum']] = $row['name'];
+            }
+        }
+        return $this->modelNames = $out;
+    }
+
     /**
      * Registration state from the configuration database, as a fallback for
      * RisPort70.

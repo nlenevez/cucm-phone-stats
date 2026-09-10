@@ -335,10 +335,22 @@ only `SELECT`** — nothing on this page writes.
 - **Download CSV** exports exactly the rows on screen.
 - The tab badges show each report's row count, so an empty report is
   visible without clicking into it.
+- **Columns that are empty for every row are hidden**, since which counters a
+  firmware reports varies. They are named underneath with a link to show
+  them, so nothing disappears silently. An always-empty counter is worth
+  chasing though — it usually means a label the normaliser does not
+  recognise, and `bin/cucm-report.php labels --unmapped-only` will say which.
+- Light, regardless of the browser's theme.
 
 No CDN, no framework: the CSS and JavaScript are inline, because the host
 this is for has no route to the internet and a page that silently loses its
 sorting on deployment is worse than a plain table.
+
+> **If the tabs seem to do nothing** — the page reloads but always shows the
+> first report — the web server is not passing the query string to PHP. The
+> page detects this and says which nginx directive is missing.
+> [docs/web-deployment.md](docs/web-deployment.md) has the known-good server
+> block.
 
 ## Reports
 
@@ -385,6 +397,20 @@ out why. `--since YYYY-MM-DD` bounds the window.
 **After upgrading, run `php bin/cucm-initdb.php` before the next sweep.** It
 creates anything new and applies column migrations to an existing database.
 It is idempotent, so running it when nothing has changed costs nothing.
+
+### Model names
+
+RisPort reports a phone's model as a **numeric enum** (627, 684, …), which is
+useless in a report. The names come from CUCM's own `typemodel` table via
+AXL — read from the cluster rather than hard-coded, because the mapping is
+version-specific and a built-in list would eventually be wrong without
+saying so.
+
+Resolution happens at collection, and the mapping is mirrored into
+`device_models` so rows collected earlier can be corrected without waiting
+for those handsets to register again — `bin/cucm-initdb.php` applies that
+backfill. If AXL cannot be reached the enum is **kept**: a number is poor, a
+blank model is worse. A cluster that already returns names is left alone.
 
 `sweeps` one run · `phones` inventory keyed on device name · `registrations`
 where each phone was in each sweep · `port_stats` normalised link state and

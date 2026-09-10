@@ -307,6 +307,42 @@ class CpsDb
      * @param array $n       raw cdp_ and lldp_ fields
      * @param array $summary collapsed switch_name/switch_port/switch_ip/source
      */
+    /**
+     * Mirror the cluster's model-enum table.
+     *
+     * @param array<int,string> $names
+     */
+    public function upsertDeviceModels(array $names): int
+    {
+        if (!$names) { return 0; }
+        $st = $this->pdo->prepare(
+            'INSERT INTO device_models (enum, name, updated_at) VALUES (?,?,NOW())
+             ON DUPLICATE KEY UPDATE name = VALUES(name), updated_at = NOW()'
+        );
+        $n = 0;
+        foreach ($names as $enum => $name) {
+            $st->execute([(int)$enum, mb_substr((string)$name, 0, 128)]);
+            $n++;
+        }
+        return $n;
+    }
+
+    /**
+     * Replace numeric models already stored with their names.
+     *
+     * A sweep fixes every phone it sees, but a handset that is not currently
+     * registered would keep its enum indefinitely - so this catches the rest
+     * without needing them to come back online.
+     */
+    public function backfillModelNames(): int
+    {
+        return (int)$this->pdo->exec(
+            'UPDATE phones p JOIN device_models dm ON dm.enum = CAST(p.model AS UNSIGNED)
+             SET p.model = dm.name
+             WHERE p.model REGEXP \'^[0-9]+$\''
+        );
+    }
+
     public function insertUplink(int $sweepId, int $phoneId, array $n, array $summary): void
     {
         $st = $this->pdo->prepare(

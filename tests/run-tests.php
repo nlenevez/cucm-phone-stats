@@ -498,6 +498,39 @@ ok('and says which versions it tried', str_contains($r['err'], 'no AXL schema ve
 
 file_get_contents("http://127.0.0.1:$port/_axlver/14.0,12.5");
 
+section('integration: model enums become readable names');
+// RisPort reports a model as a numeric enum; the name lives in CUCM's
+// typemodel table. A number is useless in a report, and a hard-coded list
+// would be wrong for some release without saying so - so it is read from
+// the cluster.
+file_get_contents("http://127.0.0.1:$port/_modelenum/1");
+
+$r = run("$php $root/bin/cucm-phones.php --config $C --json");
+$byName = array_column(json_decode($r['out'], true) ?: [], null, 'name');
+eq('a numeric model enum is resolved', $byName['SEP001122334401']['model'] ?? null, 'Cisco 8841');
+eq('and a different one too', $byName['SEP001122334403']['model'] ?? null, 'Cisco 7841');
+ok('no bare enum survives',
+   !array_filter($byName, fn($x) => ctype_digit((string)($x['model'] ?? ''))), 'an enum remained');
+
+// If AXL cannot be reached the enums must SURVIVE, not be lost - a number is
+// poor, but a blank model is worse.
+file_get_contents("http://127.0.0.1:$port/_axlver/9.1");   // no schema we know
+$r = run("$php $root/bin/cucm-phones.php --config $C --json");
+$fallback = array_column(json_decode($r['out'], true) ?: [], null, 'name');
+ok('without AXL the enum is kept rather than dropped',
+   ($fallback['SEP001122334401']['model'] ?? '') !== '', json_encode($fallback['SEP001122334401'] ?? null));
+ok('and it says why the models stayed numeric',
+   str_contains($r['err'], 'model names'), substr($r['err'], 0, 200));
+file_get_contents("http://127.0.0.1:$port/_axlver/14.0,12.5");
+
+// A cluster that already returns names must not be touched.
+file_get_contents("http://127.0.0.1:$port/_modelenum/0");
+$r = run("$php $root/bin/cucm-phones.php --config $C --json");
+$plain = array_column(json_decode($r['out'], true) ?: [], null, 'name');
+eq('a name from the cluster is left alone', $plain['SEP001122334401']['model'] ?? null, 'Cisco 8841');
+
+file_get_contents("http://127.0.0.1:$port/_modelenum/0");
+
 // ------------------------------------------------------------------ database
 section('integration: schema');
 try {
@@ -548,6 +581,26 @@ eq('unmapped_labels counted',
                     WHERE p.device_name = 'SEP001122334404' AND ps.port = 'network'")[0]['u'], 1);
 
 // ------------------------------------------------------------------ reports
+section('integration: model names are mirrored and backfilled');
+// Sweeping mirrors the table, so rows collected earlier can be fixed
+// without waiting for those handsets to register again.
+file_get_contents("http://127.0.0.1:$port/_modelenum/1");
+run("$php $root/bin/cucm-sweep.php --config $C --json");
+ok('the model table is mirrored locally',
+   (int)$db->query('SELECT COUNT(*) c FROM device_models')[0]['c'] > 1, 'device_models empty');
+
+$db->pdo()->exec("INSERT INTO phones (device_name, model, first_seen, last_seen)
+                  VALUES ('SEPHISTORIC01', '684', NOW(), NOW())
+                  ON DUPLICATE KEY UPDATE model = '684'");
+eq('a historical row starts as an enum',
+   $db->query("SELECT model FROM phones WHERE device_name='SEPHISTORIC01'")[0]['model'], '684');
+$fixedRows = $db->backfillModelNames();
+ok('the backfill resolves it', $fixedRows >= 1, "$fixedRows rows");
+eq('and it is now readable',
+   $db->query("SELECT model FROM phones WHERE device_name='SEPHISTORIC01'")[0]['model'], 'Cisco 8845');
+$db->pdo()->exec("DELETE FROM phones WHERE device_name='SEPHISTORIC01'");
+file_get_contents("http://127.0.0.1:$port/_modelenum/0");
+
 section('report: speed / duplex mismatch');
 $r = run("$php $root/bin/cucm-report.php speed-mismatch --config $C --json");
 $mm = json_decode($r['out'], true);
@@ -1127,6 +1180,68 @@ if ($older !== $latest) {
 $res = $fetch('?r=errors&sweep=999999');
 eq('web: an unknown sweep id is rejected safely', $res['code'], 200);
 ok('web: no SQL error surfaced', !str_contains($res['body'], 'SQLSTATE'), substr($res['body'], 0, 200));
+
+// A web server that drops the query string is the difference between "the
+// tabs work" and "clicking a tab does nothing", so both broken shapes are
+// pinned here. Each runs in its own process because the page defines
+// functions and can only be included once.
+$sim = function (string $prelude) use ($php, $root, $dbHost, $dbPort, $dbName, $dbUser, $dbPass) {
+    $code = '$_GET=[];' . $prelude
+          . ' ob_start(); include ' . var_export("$root/web/cucm-reports.php", true) . '; echo ob_get_clean();';
+    return run(sprintf(
+        'env CPS_DB_HOST=%s CPS_DB_PORT=%d CPS_DB_NAME=%s CPS_DB_USER=%s CPS_DB_PASS=%s %s -r %s',
+        escapeshellarg($dbHost), $dbPort, escapeshellarg($dbName),
+        escapeshellarg($dbUser), escapeshellarg($dbPass), $php, escapeshellarg($code)
+    ))['out'];
+};
+
+// nginx try_files without ?$query_string: QUERY_STRING gone, REQUEST_URI
+// intact, so the parameters are recoverable and the page keeps working.
+$out = $sim('$_SERVER["REQUEST_URI"]="/cucm-reports.php?r=errors";');
+ok('web: recovers parameters from REQUEST_URI when QUERY_STRING is dropped',
+   preg_match('/<a class="on"[^>]*>\s*Errors/', $out) === 1, substr(strip_tags($out), 0, 200));
+ok('web: and says the query string was not passed',
+   str_contains($out, 'not passing the query string'), 'no footer note');
+
+// Missing "include fastcgi_params": no CGI environment at all. Nothing can
+// recover the parameters, so the page must SAY so rather than silently
+// rendering the default report on every tab.
+$out = $sim('unset($_SERVER["REQUEST_URI"],$_SERVER["QUERY_STRING"]);');
+ok('web: detects a missing CGI environment',
+   str_contains($out, 'not passing the CGI environment'), substr(strip_tags($out), 0, 200));
+ok('web: and names the nginx directive that fixes it',
+   str_contains($out, 'fastcgi_params'), 'directive not named');
+
+// A correctly configured server must show neither warning.
+$res = $fetch('?r=errors');
+ok('web: a correct server shows no configuration warning',
+   !str_contains($res['body'], 'not passing the'), 'spurious warning');
+
+// Light regardless of the browser's theme, which was the ask - so there
+// must be no dark-mode rule left to reintroduce it.
+$res = $fetch('?r=errors');
+ok('web: no dark-mode styling', !str_contains($res['body'], 'prefers-color-scheme'), 'dark rule present');
+ok('web: colour scheme is pinned to light', str_contains($res['body'], 'color-scheme:light'), 'not pinned');
+
+// A column empty for every row is dead weight, and which columns those are
+// differs by firmware - so it is decided from the data, not hard-coded.
+$db->pdo()->exec('UPDATE port_stats SET tx_total_pkt = NULL');
+$res = $fetch('?r=errors');
+ok('web: an all-empty column is hidden', !preg_match('/<th[^>]*>TX pkts/', $res['body']), 'TX pkts still shown');
+ok('web: and is named rather than vanishing', str_contains($res['body'], 'TX pkts'), 'not named in the notice');
+ok('web: with a link to show it again', str_contains($res['body'], 'Show all columns'), 'no show-all link');
+
+$res = $fetch('?r=errors&cols=all');
+ok('web: cols=all brings it back', preg_match('/<th[^>]*>TX pkts/', $res['body']) === 1, 'not restored');
+
+// A column with data must never be hidden.
+ok('web: a populated column is kept', preg_match('/<th[^>]*>RX CRC/', $fetch('?r=errors')['body']) === 1, 'RX CRC hidden');
+
+// The CSV must match what is on screen.
+$res = $fetch('?r=errors&csv=1');
+ok('web: CSV omits the hidden column too', !str_contains(explode("\n", $res['body'])[0], 'TX pkts'),
+   explode("\n", $res['body'])[0]);
+$db->pdo()->exec('UPDATE port_stats SET tx_total_pkt = 1000 WHERE port = \'network\'');
 
 $res = $fetch('?r=errors&csv=1');
 eq('web: CSV export returns 200', $res['code'], 200);

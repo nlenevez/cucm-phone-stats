@@ -73,7 +73,8 @@ function cps_discover_phones(array $cfg, string $source, string $status, array $
         }
         $rows = array_values($res['devices']);
         foreach ($rows as &$r) { $r['source'] = 'risport'; }
-        return $rows;
+        unset($r);
+        return cps_resolve_model_names($rows, $cfg);
     }
 
     if ($source === 'axl-sql') {
@@ -168,4 +169,49 @@ function cps_apply_device_prefixes(array $phones, array $cfg, array $opts): arra
             count($res['excluded']), implode('/', $prefixes), implode(', ', $parts)));
     }
     return $res['kept'];
+}
+
+/**
+ * Turn numeric model enums into names.
+ *
+ * RisPort reports the model as an enum, which is useless in a report. The
+ * names come from CUCM's typemodel table via AXL - authoritative for that
+ * release, where a hard-coded list would eventually be wrong without
+ * saying so.
+ *
+ * Only numeric values are touched, so a cluster that already returns a name
+ * is left alone, and a failure to reach AXL leaves the enums in place
+ * rather than losing the field.
+ *
+ * @param array<int,array<string,mixed>> $rows
+ * @return array<int,array<string,mixed>>
+ */
+function cps_resolve_model_names(array $rows, array $cfg): array
+{
+    $needed = false;
+    foreach ($rows as $r) {
+        if (isset($r['model']) && $r['model'] !== '' && ctype_digit((string)$r['model'])) { $needed = true; break; }
+    }
+    if (!$needed || ((string)($cfg['axl_user'] ?? '')) === '') { return $rows; }
+
+    try {
+        $names = cps_axl_client($cfg)->modelNames();
+    } catch (Throwable $e) {
+        cps_warn('could not read model names from AXL (models stay numeric): ' . $e->getMessage());
+        return $rows;
+    }
+    if (!$names) { return $rows; }
+
+    $GLOBALS['CPS_MODEL_NAMES'] = $names;
+    $hit = 0;
+    foreach ($rows as &$r) {
+        $m = (string)($r['model'] ?? '');
+        if ($m !== '' && ctype_digit($m) && isset($names[(int)$m])) {
+            $r['model'] = $names[(int)$m];
+            $hit++;
+        }
+    }
+    unset($r);
+    cps_log("resolved $hit model enum(s) to names from typemodel (" . count($names) . ' known)');
+    return $rows;
 }

@@ -193,6 +193,31 @@ function bigCount(): int {
 
 const OUI_FILE = __DIR__ . '/.mock-oui';
 const AXLVER_FILE = __DIR__ . '/.mock-axlver';
+const ENUM_FILE   = __DIR__ . '/.mock-modelenum';
+
+/**
+ * GET /_modelenum/1 makes RisPort report models as numeric enums.
+ *
+ * Which is what a real cluster does - the name lives in the typemodel
+ * table, not in the RisPort response - so reporting a readable string here
+ * was flattering the client and hiding the work it has to do.
+ */
+function modelEnums(): bool {
+    return is_readable(ENUM_FILE) && trim((string)file_get_contents(ENUM_FILE)) === '1';
+}
+/** The subset of CUCM's typemodel this mock knows. */
+function modelTable(): array {
+    return [
+        30035 => 'Cisco 7821', 36213 => 'Cisco 7841', 627 => 'Cisco 8841',
+        684   => 'Cisco 8845', 621   => 'Cisco 8851', 30032 => 'Cisco ATA 192',
+        503   => 'Cisco Unified Client', 592 => 'Cisco Jabber for iPhone',
+        593   => 'Cisco Jabber for Android',
+    ];
+}
+function modelEnumFor(string $name): string {
+    $flip = array_flip(modelTable());
+    return (string)($flip[$name] ?? 627);
+}
 
 /**
  * Which AXL schema versions this cluster admits.
@@ -249,6 +274,11 @@ function gen(): int {
 $uri  = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 $body = file_get_contents('php://input');
 
+if (preg_match('#^/_modelenum/([01])$#', $uri, $m)) {
+    file_put_contents(ENUM_FILE, $m[1]);
+    echo "model enums {$m[1]}\n";
+    return;
+}
 if (preg_match('#^/_axlver/(.*)$#', $uri, $m)) {
     file_put_contents(AXLVER_FILE, urldecode($m[1]));
     echo "axl versions {$m[1]}\n";
@@ -490,7 +520,10 @@ function axl_sql(string $sql): void {
         return;
     }
     if (str_contains($l, 'from typemodel')) {
-        soap_out(axl_rows([['enum' => '627', 'name' => 'Cisco 8841']]));
+        $rows = [];
+        foreach (modelTable() as $enum => $name) { $rows[] = ['enum' => (string)$enum, 'name' => $name]; }
+        if (preg_match('/select\s+first\s+(\d+)/', $l, $m)) { $rows = array_slice($rows, 0, (int)$m[1]); }
+        soap_out(axl_rows($rows));
         return;
     }
     if (str_contains($l, 'from device')) {
@@ -603,7 +636,8 @@ function ris(string $body): void {
     foreach ($devices as $name => $e) {
         $xml .= '<item><Name>' . $name . '</Name>'
               . '<DirNumber>' . htmlspecialchars((string)($e['dn'] ?? (2000 + (int)substr($name, -2)))) . '</DirNumber>'
-              . '<Class>Phone</Class><Model>' . htmlspecialchars($e['model']) . '</Model>'
+              . '<Class>Phone</Class><Model>'
+              . htmlspecialchars(modelEnums() ? modelEnumFor($e['model']) : $e['model']) . '</Model>'
               . '<Product>' . htmlspecialchars($e['model']) . '</Product>'
               . '<Status>' . $e['status'] . '</Status><StatusReason>0</StatusReason>'
               . '<Protocol>SIP</Protocol>'

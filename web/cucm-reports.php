@@ -1,26 +1,7 @@
 <?php
-/**
- * cucm-reports.php - the three reports as a browsable web page.
- *
- * ONE FILE. Drop it in a web root, point it at the database, done. No
- * Composer, no framework, and no CDN: the CSS and JavaScript are inline
- * because the host this is meant for has no route to the internet, and a
- * page that silently loses its styling and sorting the moment it is
- * deployed somewhere real is worse than a plain table.
- *
- * Configuration, in order of precedence:
- *   1. the CPS_DB_* environment variables
- *   2. a cucm.conf beside this file, or at $CPS_CONF
- *   3. the defaults below
- *
- * The account only ever needs SELECT. Nothing here writes, and no user
- * input reaches SQL - sorting and searching happen in the browser, and the
- * report and sweep parameters are whitelisted against fixed lists.
- */
 
 declare(strict_types=1);
 
-// ---------------------------------------------------------------- config --
 $CONFIG = [
     'db_host' => '127.0.0.1',
     'db_port' => 3306,
@@ -31,9 +12,7 @@ $CONFIG = [
 
 foreach ([getenv('CPS_CONF') ?: '', __DIR__ . '/cucm.conf', dirname(__DIR__) . '/cucm.conf'] as $candidate) {
     if ($candidate !== '' && is_readable($candidate)) {
-        // INI_SCANNER_RAW: the other scanners turn a value that merely looks
-        // boolean ("off", "none") into false or "", which would quietly
-        // mangle a database name or password.
+
         $ini = parse_ini_file($candidate, false, INI_SCANNER_RAW);
         if (is_array($ini)) {
             foreach (['db_host', 'db_port', 'db_name', 'db_user', 'db_pass'] as $k) {
@@ -48,11 +27,22 @@ foreach (['db_host', 'db_port', 'db_name', 'db_user', 'db_pass'] as $k) {
     if ($env !== false && $env !== '') { $CONFIG[$k] = $env; }
 }
 
-// ---------------------------------------------------------------- reports --
-/**
- * Each report: its SQL, the columns to show, and which of them are numeric
- * (so the browser sorts 9 before 10, and right-aligns them).
- */
+$PARAMS = $_GET;
+$QUERY_STRING_LOST = false;   
+
+$CGI_ENV_MISSING   = false;   
+
+if (!$PARAMS) {
+    $rawQuery = parse_url((string)($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_QUERY);
+    if (is_string($rawQuery) && $rawQuery !== '') {
+        parse_str($rawQuery, $PARAMS);
+        $QUERY_STRING_LOST = (bool)$PARAMS;
+    } elseif (!array_key_exists('REQUEST_URI', $_SERVER)) {
+
+        $CGI_ENV_MISSING = true;
+    }
+}
+
 const REPORTS = [
     'speed-mismatch' => [
         'title' => 'Speed mismatch',
@@ -123,14 +113,13 @@ const REPORTS = [
     ],
 ];
 
-const ROW_CAP = 20000;   // a guard, not a limit anyone should reach
+const ROW_CAP = 20000;   
 
-// ------------------------------------------------------------- gather data --
-$report = $_GET['r'] ?? 'speed-mismatch';
+$report = $PARAMS['r'] ?? 'speed-mismatch';
 if (!isset(REPORTS[$report])) { $report = 'speed-mismatch'; }
 $spec = REPORTS[$report];
 
-$minErrors = isset($_GET['min']) && ctype_digit((string)$_GET['min']) ? (int)$_GET['min'] : 1;
+$minErrors = isset($PARAMS['min']) && ctype_digit((string)$PARAMS['min']) ? (int)$PARAMS['min'] : 1;
 
 $error  = null;
 $rows   = [];
@@ -158,10 +147,9 @@ try {
         $error = 'No completed sweep in the database yet. Run bin/cucm-sweep.php first.';
     } else {
         $countsPending = true;
-        // Whitelist the requested sweep against the ones that exist, so the
-        // parameter can never reach SQL as anything but a known id.
+
         $ids = array_column($sweeps, 'id');
-        $want = isset($_GET['sweep']) ? (int)$_GET['sweep'] : (int)$ids[0];
+        $want = isset($PARAMS['sweep']) ? (int)$PARAMS['sweep'] : (int)$ids[0];
         $sweepId = in_array($want, array_map('intval', $ids), true) ? $want : (int)$ids[0];
 
         $st = $pdo->prepare($spec['sql']);
@@ -170,9 +158,6 @@ try {
         $st->execute();
         $rows = $st->fetchAll();
 
-        // A count for every tab, not just the open one: "are there any speed
-        // mismatches at all" should be answerable without clicking through,
-        // and an empty report is itself the useful answer.
         $tabCounts['speed-mismatch'] = (int)$pdo->query(
             'SELECT COUNT(*) FROM v_port_speed_mismatch WHERE sweep_id = ' . (int)$sweepId)->fetchColumn();
         $tabCounts['errors'] = (int)$pdo->query(
@@ -189,32 +174,41 @@ try {
 $capped = count($rows) > ROW_CAP;
 if ($capped) { $rows = array_slice($rows, 0, ROW_CAP); }
 
+$showAll = ($PARAMS['cols'] ?? '') === 'all';
+$hidden  = [];
+$visible = $spec['columns'];
+if ($rows && !$showAll) {
+    foreach ($spec['columns'] as $col => $label) {
+        $any = false;
+        foreach ($rows as $r) {
+            if (isset($r[$col]) && $r[$col] !== '' && $r[$col] !== null) { $any = true; break; }
+        }
+        if (!$any) { $hidden[$col] = $label; unset($visible[$col]); }
+    }
+}
+
 function h(?string $v): string { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
-/**
- * Build a link, carrying the current view forward. A null value DROPS the
- * parameter, which is how "latest sweep" is expressed: no sweep in the URL
- * at all, so the page follows the newest one as sweeps arrive rather than
- * pinning to whichever was newest when someone bookmarked it.
- */
+
 function qs(array $over = []): string {
+    global $PARAMS;
     $q = array_merge(
-        ['r' => $_GET['r'] ?? 'speed-mismatch'],
-        isset($_GET['sweep']) ? ['sweep' => (int)$_GET['sweep']] : [],
-        isset($_GET['min'])   ? ['min'   => (int)$_GET['min']]   : [],
+        ['r' => $PARAMS['r'] ?? 'speed-mismatch'],
+        isset($PARAMS['sweep']) ? ['sweep' => (int)$PARAMS['sweep']] : [],
+        isset($PARAMS['min'])   ? ['min'   => (int)$PARAMS['min']]   : [],
+        isset($PARAMS['cols'])  ? ['cols'  => (string)$PARAMS['cols']] : [],
         $over
     );
     return '?' . http_build_query(array_filter($q, fn($v) => $v !== null));
 }
 
-// CSV of exactly what is on screen, for when someone wants it in a spreadsheet.
-if (isset($_GET['csv'])) {
+if (isset($PARAMS['csv'])) {
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . $report . '-sweep' . (int)$sweepId . '.csv"');
     $out = fopen('php://output', 'w');
-    fputcsv($out, array_values($spec['columns']), ',', '"', '\\');
+    fputcsv($out, array_values($visible), ',', '"', '\\');
     foreach ($rows as $r) {
         $line = [];
-        foreach (array_keys($spec['columns']) as $c) { $line[] = (string)($r[$c] ?? ''); }
+        foreach (array_keys($visible) as $c) { $line[] = (string)($r[$c] ?? ''); }
         fputcsv($out, $line, ',', '"', '\\');
     }
     exit;
@@ -231,6 +225,7 @@ if (isset($_GET['csv'])) {
     --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#5b6672; --line:#e3e7ec;
     --accent:#0b5cad; --accent-soft:#e8f0fa; --warn:#a8410a; --bad:#b3261e;
   }
+  html{color-scheme:light}   
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
        font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
@@ -281,14 +276,7 @@ if (isset($_GET['csv'])) {
   .empty{padding:40px;text-align:center;color:var(--muted)}
   .err{background:#fde9e8;border:1px solid #f3c9c6;color:#7d1a15;padding:12px 14px;border-radius:8px}
   footer{color:var(--muted);font-size:12px;padding:0 20px 30px}
-  @media (prefers-color-scheme: dark){
-    :root{--bg:#14171a;--card:#1c2024;--ink:#e6e9ec;--muted:#9aa4af;--line:#2b3138;
-          --accent:#6aa9e9;--accent-soft:#22303f}
-    nav a:hover{background:#232830}
-    tbody tr:hover{background:#20262c}
-    .pill{background:#262c33}
-    .err{background:#3a1f1d;border-color:#5c2f2b;color:#f0c6c2}
-  }
+
 </style>
 </head>
 <body>
@@ -304,6 +292,17 @@ if (isset($_GET['csv'])) {
   </nav>
 </header>
 <main>
+<?php if ($CGI_ENV_MISSING): ?>
+  <div class="err" style="margin-bottom:16px">
+    <strong>This web server is not passing the CGI environment to PHP, so the tabs cannot work.</strong>
+    <p style="margin:8px 0 0">
+      <code>REQUEST_URI</code> and <code>QUERY_STRING</code> are both absent, which means the
+      <code>location ~ \.php$</code> block is missing <code>include fastcgi_params;</code>
+      (or <code>include fastcgi.conf;</code>). Every tab will render the default report until
+      that is added. See <code>docs/web-deployment.md</code>.
+    </p>
+  </div>
+<?php endif; ?>
 <?php if ($error !== null): ?>
   <div class="err"><strong>Cannot show reports.</strong><br><?= h($error) ?></div>
 <?php else: ?>
@@ -311,7 +310,7 @@ if (isset($_GET['csv'])) {
   <div class="bar">
     <input type="search" id="q" placeholder="Search any column - device, switch, port, description..." autofocus>
     <?php if ($spec['sweep_scoped']): ?>
-      <?php $pinned = isset($_GET['sweep']); ?>
+      <?php $pinned = isset($PARAMS['sweep']); ?>
       <select onchange="location=this.value">
         <option value="<?= h(qs(['sweep' => null])) ?>" <?= $pinned ? '' : 'selected' ?>>
           Latest sweep (#<?= (int)$sweeps[0]['id'] ?> &mdash; <?= h($sweeps[0]['started_at']) ?>)
@@ -343,7 +342,7 @@ if (isset($_GET['csv'])) {
     <div class="err" style="margin-bottom:12px">Showing the first <?= ROW_CAP ?> rows only.</div>
   <?php endif; ?>
 
-  <?php if (count($spec['columns']) > 12): ?>
+  <?php if (count($visible) > 12): ?>
     <div class="hint">This table is wider than the window &mdash; scroll it sideways to see the remaining counters.</div>
   <?php endif; ?>
   <div class="wrap">
@@ -352,7 +351,7 @@ if (isset($_GET['csv'])) {
     <?php else: ?>
     <table id="t">
       <thead><tr>
-        <?php foreach ($spec['columns'] as $col => $label):
+        <?php foreach ($visible as $col => $label):
               $num = in_array($col, $spec['numeric'], true); ?>
           <th class="<?= $num ? 'num' : '' ?>" data-type="<?= $num ? 'n' : 's' ?>"><?= h($label) ?><span class="ar">&#9650;&#9660;</span></th>
         <?php endforeach; ?>
@@ -360,7 +359,7 @@ if (isset($_GET['csv'])) {
       <tbody>
         <?php foreach ($rows as $r): ?>
           <tr>
-          <?php foreach ($spec['columns'] as $col => $label):
+          <?php foreach ($visible as $col => $label):
                 $v = $r[$col] ?? null;
                 $num = in_array($col, $spec['numeric'], true);
                 $cls = $num ? 'num' : '';
@@ -385,18 +384,36 @@ if (isset($_GET['csv'])) {
     </table>
     <?php endif; ?>
   </div>
+  <?php if ($hidden): ?>
+    <p class="hint" style="margin-top:10px">
+      <?= count($hidden) ?> empty column<?= count($hidden) === 1 ? '' : 's' ?> hidden:
+      <?= h(implode(', ', $hidden)) ?>.
+      <a href="<?= h(qs(['cols' => 'all'])) ?>">Show all columns</a>
+    </p>
+  <?php elseif ($showAll): ?>
+    <p class="hint" style="margin-top:10px">
+      Showing every column, including empty ones.
+      <a href="<?= h(qs(['cols' => null])) ?>">Hide empty columns</a>
+    </p>
+  <?php endif; ?>
 <?php endif; ?>
 </main>
 <footer>
+  <?php if ($QUERY_STRING_LOST): ?>
+    <div class="err" style="margin-bottom:12px">
+      <strong>This web server is not passing the query string to PHP.</strong>
+      The tabs are working here only because the parameters were recovered from
+      <code>REQUEST_URI</code>. In nginx this is usually a <code>try_files</code>
+      missing <code>?$query_string</code>, or a <code>location ~ \.php$</code>
+      block that does not <code>include fastcgi_params</code>. See
+      <code>docs/web-deployment.md</code>.
+    </div>
+  <?php endif; ?>
   Generated <?= h(date('Y-m-d H:i')) ?> from <?= h($CONFIG['db_name']) ?> on <?= h($CONFIG['db_host']) ?>.
   Click a column heading to sort; click again to reverse.
 </footer>
 
 <script>
-// Sorting and searching happen here rather than in SQL: the row counts are
-// small enough that a round trip per click would be slower and would lose
-// the scroll position, and it keeps user input away from the database
-// entirely.
 (function () {
   var table = document.getElementById('t');
   if (!table) return;
@@ -409,8 +426,6 @@ if (isset($_GET['csv'])) {
   function cellText(row, i) { return (row.cells[i].textContent || '').trim(); }
   function cellNum(row, i) {
     var t = cellText(row, i).replace(/[^0-9.\-]/g, '');
-    // An empty or non-numeric cell must sort as missing, not as zero -
-    // otherwise "no counter reported" outranks a genuine low value.
     return t === '' || t === '-' ? null : parseFloat(t);
   }
 
@@ -423,7 +438,7 @@ if (isset($_GET['csv'])) {
       if (numeric) {
         var x = cellNum(a, i), y = cellNum(b, i);
         if (x === null && y === null) return 0;
-        if (x === null) return 1;          // missing always sinks
+        if (x === null) return 1;
         if (y === null) return -1;
         return (x - y) * sortDir;
       }
@@ -445,7 +460,6 @@ if (isset($_GET['csv'])) {
     var n = 0;
     rows.forEach(function (r) {
       var hay = r.textContent.toLowerCase();
-      // Every term must match, so "warehouse crc" narrows rather than widens.
       var ok = terms.every(function (t) { return hay.indexOf(t) !== -1; });
       r.style.display = ok ? '' : 'none';
       if (ok) n++;

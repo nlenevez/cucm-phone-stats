@@ -165,6 +165,17 @@ if ($useDb) {
 if (isset($opts['parallel']) && is_string($opts['parallel'])) {
     $cfg['phone_parallel'] = max(1, (int)$opts['parallel']);
 }
+// Mirror the model-enum table so past sweeps can be made readable too.
+if ($db && !empty($GLOBALS['CPS_MODEL_NAMES'])) {
+    try {
+        $db->upsertDeviceModels($GLOBALS['CPS_MODEL_NAMES']);
+        $fixed = $db->backfillModelNames();
+        if ($fixed > 0) { cps_log("resolved $fixed stored model enum(s) to names"); }
+    } catch (Throwable $e) {
+        cps_warn('could not store model names: ' . $e->getMessage());
+    }
+}
+
 $fetcher = cps_phone_fetcher($cfg, $adapters);
 $results = $fetcher->fetchMany(array_map(fn($r) => ['name' => $r['name'], 'ip' => $r['ip']], $pollable));
 cps_log(sprintf('polled %d phones in %.1fs', count($results), microtime(true) - $t0));

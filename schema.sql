@@ -180,6 +180,17 @@ CREATE TABLE IF NOT EXISTS uplinks (
   CONSTRAINT fk_up_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- CUCM's model enum to its name, mirrored from the cluster's typemodel
+-- table. RisPort reports a model as a number; the mapping is version
+-- specific and hundreds of rows, so it is read from the cluster rather than
+-- hard-coded. Kept so historical rows can be backfilled without re-sweeping.
+CREATE TABLE IF NOT EXISTS device_models (
+  enum        INT UNSIGNED NOT NULL,
+  name        VARCHAR(128) NOT NULL,
+  updated_at  DATETIME     NOT NULL,
+  PRIMARY KEY (enum)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- ---------------------------------------------------------------------------
 -- Reporting views
 -- ---------------------------------------------------------------------------

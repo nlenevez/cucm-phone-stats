@@ -40,6 +40,15 @@ $migrated = $db->migrate((string)$cfg['db_name']);
 foreach ($migrated as $m) { echo "Migrated: $m\n"; }
 if (!$migrated) { echo "No column migrations needed.\n"; }
 
+// If a previous sweep mirrored the model table, make any stored enums
+// readable now rather than waiting for those handsets to register again.
+try {
+    $fixed = $db->backfillModelNames();
+    if ($fixed > 0) { echo "Resolved $fixed stored model enum(s) to names.\n"; }
+} catch (Throwable $e) {
+    // device_models may not exist yet on a brand new database.
+}
+
 $tables = $db->query('SELECT TABLE_NAME AS n, TABLE_TYPE AS t FROM information_schema.TABLES
                       WHERE TABLE_SCHEMA = ? ORDER BY TABLE_TYPE, TABLE_NAME', [$cfg['db_name']]);
 echo cps_render_table($tables, ['n', 't']);
