@@ -340,7 +340,11 @@ only `SELECT`** — nothing on this page writes.
   them, so nothing disappears silently. An always-empty counter is worth
   chasing though — it usually means a label the normaliser does not
   recognise, and `bin/cucm-report.php labels --unmapped-only` will say which.
-- Light, regardless of the browser's theme.
+- **Theme follows the browser**, with a toggle in the top right to override
+  it. The button cycles Auto → Light → Dark → Auto; an explicit choice is
+  remembered per browser and wins over the system setting in either
+  direction. It is applied before first paint, so there is no flash of the
+  wrong theme on load.
 
 No CDN, no framework: the CSS and JavaScript are inline, because the host
 this is for has no route to the internet and a page that silently loses its

@@ -118,8 +118,9 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
   re-sweeping the estate.
 
 **Web**
-- The page is light regardless of the browser's colour scheme; the dark-mode
-  rules are gone and `color-scheme` is pinned.
+- The theme follows the browser's colour scheme, with a toggle to override
+  it: Auto → Light → Dark → Auto, remembered per browser, applied before
+  first paint so there is no flash of the wrong theme.
 - Columns empty for every row are hidden, named underneath with a link to
   show them again (`?cols=all`), and omitted from the CSV to match. Decided
   from the data rather than hard-coded, since which counters a firmware

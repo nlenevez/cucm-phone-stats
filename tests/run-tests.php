@@ -1217,11 +1217,28 @@ $res = $fetch('?r=errors');
 ok('web: a correct server shows no configuration warning',
    !str_contains($res['body'], 'not passing the'), 'spurious warning');
 
-// Light regardless of the browser's theme, which was the ask - so there
-// must be no dark-mode rule left to reintroduce it.
+// Follow the browser by default, with an explicit override that wins in
+// either direction. All three pieces must be present: the media query, the
+// override selectors, and the pre-paint script that applies a stored choice
+// before the body renders so there is no flash of the wrong theme.
 $res = $fetch('?r=errors');
-ok('web: no dark-mode styling', !str_contains($res['body'], 'prefers-color-scheme'), 'dark rule present');
-ok('web: colour scheme is pinned to light', str_contains($res['body'], 'color-scheme:light'), 'not pinned');
+ok('web: follows the browser preference', str_contains($res['body'], 'prefers-color-scheme: dark'), 'no media query');
+ok('web: an explicit light choice overrides the browser',
+   str_contains($res['body'], ':root:not([data-theme="light"])'), 'no light override guard');
+ok('web: an explicit dark choice overrides the browser',
+   str_contains($res['body'], ':root[data-theme="dark"]'), 'no dark override');
+ok('web: the stored choice is applied before first paint',
+   strpos($res['body'], "localStorage.getItem('cps-theme')") < strpos($res['body'], '<body'), 'applied too late');
+ok('web: there is a theme button', str_contains($res['body'], 'id="theme"'), 'no toggle');
+ok('web: localStorage access is guarded',
+   preg_match('/try\s*\{[^}]*localStorage/', $res['body']) === 1, 'unguarded localStorage');
+
+// The file was deliberately stripped of comments; adding to it should not
+// quietly put them back.
+$pageSrc = (string)file_get_contents("$root/web/cucm-reports.php");
+$commentLines = preg_grep('#(^\s*//|^\s*/\*|\s//\s)#', explode("\n", $pageSrc));
+$commentLines = array_filter($commentLines, fn($l) => !str_contains($l, 'http://') && !str_contains($l, 'https://'));
+eq('web: the page stays comment-free', $commentLines, []);
 
 // A column empty for every row is dead weight, and which columns those are
 // differs by firmware - so it is decided from the data, not hard-coded.

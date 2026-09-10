@@ -220,25 +220,57 @@ if (isset($PARAMS['csv'])) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CUCM phone port reports</title>
+<script>
+try {
+  var t = localStorage.getItem('cps-theme');
+  if (t === 'dark' || t === 'light') { document.documentElement.setAttribute('data-theme', t); }
+} catch (e) {}
+</script>
 <style>
   :root{
     --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#5b6672; --line:#e3e7ec;
     --accent:#0b5cad; --accent-soft:#e8f0fa; --warn:#a8410a; --bad:#b3261e;
+    --hover:#eef1f5; --chip:#e6eaef; --rowhover:#f9fbfd; --faint:#aeb6c0;
+    --warnbg:#fdeee6; --badbg:#fde9e8;
+    --errbg:#fde9e8; --errline:#f3c9c6; --errink:#7d1a15;
+    color-scheme:light;
   }
-  html{color-scheme:light}   
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#14171a; --card:#1c2024; --ink:#e6e9ec; --muted:#9aa4af; --line:#2b3138;
+      --accent:#6aa9e9; --accent-soft:#22303f; --warn:#e8a06a; --bad:#ef7b74;
+      --hover:#232830; --chip:#262c33; --rowhover:#20262c; --faint:#6b7681;
+      --warnbg:#3a2a1c; --badbg:#3a1f1d;
+      --errbg:#3a1f1d; --errline:#5c2f2b; --errink:#f0c6c2;
+      color-scheme:dark;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#14171a; --card:#1c2024; --ink:#e6e9ec; --muted:#9aa4af; --line:#2b3138;
+    --accent:#6aa9e9; --accent-soft:#22303f; --warn:#e8a06a; --bad:#ef7b74;
+    --hover:#232830; --chip:#262c33; --rowhover:#20262c; --faint:#6b7681;
+    --warnbg:#3a2a1c; --badbg:#3a1f1d;
+    --errbg:#3a1f1d; --errline:#5c2f2b; --errink:#f0c6c2;
+    color-scheme:dark;
+  }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
        font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-  header{background:var(--card);border-bottom:1px solid var(--line);padding:14px 20px 0}
+  header{background:var(--card);border-bottom:1px solid var(--line);padding:14px 20px 0;position:relative}
+  .themebtn{position:absolute;top:14px;right:20px;display:inline-flex;align-items:center;gap:7px;
+            font:inherit;font-size:13px;font-weight:550;color:var(--muted);cursor:pointer;
+            background:var(--card);border:1px solid var(--line);border-radius:7px;padding:6px 11px}
+  .themebtn:hover{color:var(--accent);background:var(--accent-soft);border-color:var(--accent)}
+  .themebtn .ticon{font-size:14px;line-height:1}
   h1{margin:0 0 2px;font-size:17px;font-weight:650;letter-spacing:-.01em}
   .sub{color:var(--muted);font-size:12.5px;margin-bottom:12px}
   nav{display:flex;gap:2px}
   nav a{padding:9px 15px;text-decoration:none;color:var(--muted);font-weight:550;font-size:13.5px;
         border:1px solid transparent;border-bottom:none;border-radius:7px 7px 0 0;position:relative;top:1px}
-  nav a:hover{color:var(--ink);background:#eef1f5}
+  nav a:hover{color:var(--ink);background:var(--hover)}
   nav a.on{background:var(--bg);color:var(--accent);border-color:var(--line);}
   nav a .n{display:inline-block;margin-left:7px;padding:1px 7px;border-radius:9px;
-           background:#e6eaef;color:var(--muted);font-size:11.5px;font-weight:650}
+           background:var(--chip);color:var(--muted);font-size:11.5px;font-weight:650}
   nav a.on .n{background:var(--accent-soft);color:var(--accent)}
   nav a .n.none{opacity:.55}
   .hint{color:var(--muted);font-size:12px;margin:-4px 0 10px}
@@ -264,23 +296,26 @@ if (isset($PARAMS['csv'])) {
   th.sorted .ar{opacity:1}
   th.sorted{color:var(--accent)}
   td.num,th.num{text-align:right}
-  tbody tr:hover{background:#f9fbfd}
+  tbody tr:hover{background:var(--rowhover)}
   tbody tr:last-child td{border-bottom:none}
   .dev{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
   .pill{display:inline-block;padding:1px 8px;border-radius:9px;font-size:11.5px;font-weight:650;
-        background:#eef1f5;color:var(--muted)}
-  .pill.speed{background:#fdeee6;color:var(--warn)}
-  .pill.duplex,.pill\.speedduplex{background:#fde9e8;color:var(--bad)}
+        background:var(--chip);color:var(--muted)}
+  .pill.speed{background:var(--warnbg);color:var(--warn)}
+  .pill.duplex,.pill\.speedduplex{background:var(--badbg);color:var(--bad)}
   .bad{color:var(--bad);font-weight:650}
-  .zero{color:#aeb6c0}
+  .zero{color:var(--faint)}
   .empty{padding:40px;text-align:center;color:var(--muted)}
-  .err{background:#fde9e8;border:1px solid #f3c9c6;color:#7d1a15;padding:12px 14px;border-radius:8px}
+  .err{background:var(--errbg);border:1px solid var(--errline);color:var(--errink);padding:12px 14px;border-radius:8px}
   footer{color:var(--muted);font-size:12px;padding:0 20px 30px}
 
 </style>
 </head>
 <body>
 <header>
+  <button id="theme" class="themebtn" type="button" title="Light, dark, or follow the browser">
+    <span class="ticon">&#9788;</span><span class="tlabel">Theme</span>
+  </button>
   <h1>CUCM phone port reports</h1>
   <div class="sub">Network and access port statistics collected from registered handsets</div>
   <nav>
@@ -414,6 +449,47 @@ if (isset($PARAMS['csv'])) {
 </footer>
 
 <script>
+(function () {
+  var root = document.documentElement;
+  var btn = document.getElementById('theme');
+  var icon = btn.querySelector('.ticon');
+  var label = btn.querySelector('.tlabel');
+  var media = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+
+  function stored() {
+    try { return localStorage.getItem('cps-theme'); } catch (e) { return null; }
+  }
+  function effective() {
+    var s = stored();
+    if (s === 'dark' || s === 'light') { return s; }
+    return (media && media.matches) ? 'dark' : 'light';
+  }
+  function paint() {
+    var dark = effective() === 'dark';
+    icon.innerHTML = dark ? '&#9789;' : '&#9788;';
+    label.textContent = stored() ? (dark ? 'Dark' : 'Light') : 'Auto';
+    btn.title = stored()
+      ? 'Theme set to ' + (dark ? 'dark' : 'light') + '. Click twice more to follow the browser again.'
+      : 'Following the browser. Click to choose light or dark.';
+  }
+  btn.addEventListener('click', function () {
+    var s = stored();
+    var next = !s ? (effective() === 'dark' ? 'light' : 'dark')
+             : (s === 'dark' ? null : 'dark');
+    try {
+      if (next === null) { localStorage.removeItem('cps-theme'); }
+      else { localStorage.setItem('cps-theme', next); }
+    } catch (e) {}
+    if (next === null) { root.removeAttribute('data-theme'); }
+    else { root.setAttribute('data-theme', next); }
+    paint();
+  });
+  if (media && media.addEventListener) {
+    media.addEventListener('change', function () { if (!stored()) { paint(); } });
+  }
+  paint();
+})();
+
 (function () {
   var table = document.getElementById('t');
   if (!table) return;

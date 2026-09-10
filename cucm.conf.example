@@ -106,7 +106,11 @@ adapters       = network,access,ethernet,device
 
 ; ------------------------------------------------------------- database ---
 db_enabled     = 1
-db_host        = 127.0.0.1
+; localhost makes PDO use the UNIX SOCKET (db_port is ignored); an IP forces
+; TCP. On RHEL that distinction matters: SELinux gates the TCP path behind
+; httpd_can_network_connect_db, so for a database on THIS machine prefer
+; localhost. For one on another host, use its address and set that boolean.
+db_host        = localhost
 db_port        = 3306
 db_name        = cucm_phone_stats
 ; The RUNTIME account: SELECT, INSERT, UPDATE only. Schema changes are done
