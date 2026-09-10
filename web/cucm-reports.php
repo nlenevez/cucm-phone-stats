@@ -1,0 +1,463 @@
+<?php
+/**
+ * cucm-reports.php - the three reports as a browsable web page.
+ *
+ * ONE FILE. Drop it in a web root, point it at the database, done. No
+ * Composer, no framework, and no CDN: the CSS and JavaScript are inline
+ * because the host this is meant for has no route to the internet, and a
+ * page that silently loses its styling and sorting the moment it is
+ * deployed somewhere real is worse than a plain table.
+ *
+ * Configuration, in order of precedence:
+ *   1. the CPS_DB_* environment variables
+ *   2. a cucm.conf beside this file, or at $CPS_CONF
+ *   3. the defaults below
+ *
+ * The account only ever needs SELECT. Nothing here writes, and no user
+ * input reaches SQL - sorting and searching happen in the browser, and the
+ * report and sweep parameters are whitelisted against fixed lists.
+ */
+
+declare(strict_types=1);
+
+// ---------------------------------------------------------------- config --
+$CONFIG = [
+    'db_host' => '127.0.0.1',
+    'db_port' => 3306,
+    'db_name' => 'cucm_phone_stats',
+    'db_user' => 'cucm',
+    'db_pass' => '',
+];
+
+foreach ([getenv('CPS_CONF') ?: '', __DIR__ . '/cucm.conf', dirname(__DIR__) . '/cucm.conf'] as $candidate) {
+    if ($candidate !== '' && is_readable($candidate)) {
+        // INI_SCANNER_RAW: the other scanners turn a value that merely looks
+        // boolean ("off", "none") into false or "", which would quietly
+        // mangle a database name or password.
+        $ini = parse_ini_file($candidate, false, INI_SCANNER_RAW);
+        if (is_array($ini)) {
+            foreach (['db_host', 'db_port', 'db_name', 'db_user', 'db_pass'] as $k) {
+                if (isset($ini[$k]) && $ini[$k] !== '') { $CONFIG[$k] = trim((string)$ini[$k], " \t\"'"); }
+            }
+        }
+        break;
+    }
+}
+foreach (['db_host', 'db_port', 'db_name', 'db_user', 'db_pass'] as $k) {
+    $env = getenv('CPS_' . strtoupper($k));
+    if ($env !== false && $env !== '') { $CONFIG[$k] = $env; }
+}
+
+// ---------------------------------------------------------------- reports --
+/**
+ * Each report: its SQL, the columns to show, and which of them are numeric
+ * (so the browser sorts 9 before 10, and right-aligns them).
+ */
+const REPORTS = [
+    'speed-mismatch' => [
+        'title' => 'Speed mismatch',
+        'blurb' => 'Phones whose access (PC) port is running at a different speed or duplex from the network (switch) port. Only phones with both ports up are compared.',
+        'view'  => 'v_port_speed_mismatch',
+        'sweep_scoped' => true,
+        'columns' => [
+            'device_name' => 'Device', 'description' => 'Description', 'model' => 'Model',
+            'ip_address' => 'IP', 'switch_name' => 'Switch', 'switch_port' => 'Switch port',
+            'network_speed_mbps' => 'Net Mbps', 'network_duplex' => 'Net duplex',
+            'access_speed_mbps' => 'PC Mbps', 'access_duplex' => 'PC duplex',
+            'mismatch_kind' => 'Mismatch',
+        ],
+        'numeric' => ['network_speed_mbps', 'access_speed_mbps'],
+        'sql' => 'SELECT device_name, description, model, ip_address, switch_name, switch_port,
+                         network_speed_mbps, network_duplex, access_speed_mbps, access_duplex,
+                         mismatch_kind
+                  FROM v_port_speed_mismatch WHERE sweep_id = :sweep
+                  ORDER BY device_name',
+    ],
+    'errors' => [
+        'title' => 'Errors',
+        'blurb' => 'Ports reporting a non-zero error counter. Traffic counters (broadcast, multicast, unicast) are not errors and are excluded.',
+        'view'  => 'v_port_errors',
+        'sweep_scoped' => true,
+        'columns' => [
+            'device_name' => 'Device', 'description' => 'Description', 'ip_address' => 'IP',
+            'switch_name' => 'Switch', 'switch_port' => 'Switch port', 'port' => 'Port',
+            'speed_mbps' => 'Mbps', 'duplex' => 'Duplex', 'errors_total' => 'Errors',
+            'rx_crc_err' => 'RX CRC', 'rx_align_err' => 'RX align',
+            'tx_collisions' => 'TX coll', 'tx_late_collision' => 'TX late coll',
+            'rx_total_pkt' => 'RX pkts', 'tx_total_pkt' => 'TX pkts',
+        ],
+        'numeric' => ['speed_mbps', 'errors_total', 'rx_crc_err', 'rx_align_err',
+                      'tx_collisions', 'tx_late_collision', 'rx_total_pkt', 'tx_total_pkt'],
+        'sql' => 'SELECT device_name, description, ip_address, switch_name, switch_port, port,
+                         speed_mbps, duplex, errors_total, rx_crc_err, rx_align_err,
+                         tx_collisions, tx_late_collision, rx_total_pkt, tx_total_pkt
+                  FROM v_port_errors WHERE sweep_id = :sweep AND errors_total >= :min
+                  ORDER BY errors_total DESC, device_name',
+    ],
+    'error-trend' => [
+        'title' => 'Increasing errors',
+        'blurb' => 'Ports whose error counters grew between sweeps. One row per phone and port - the most recent growth - with how many sweeps it grew in and the total across them. A counter that drops is a handset reboot, not an improvement, and is excluded.',
+        'view'  => 'v_port_error_deltas',
+        'sweep_scoped' => false,
+        'columns' => [
+            'device_name' => 'Device', 'description' => 'Description',
+            'switch_name' => 'Switch', 'switch_port' => 'Switch port', 'port' => 'Port',
+            'prev_errors_total' => 'Was', 'errors_total' => 'Now', 'errors_delta' => 'Growth',
+            'times_grown' => 'Sweeps grown', 'total_growth' => 'Total growth',
+            'started_at' => 'Last seen',
+        ],
+        'numeric' => ['prev_errors_total', 'errors_total', 'errors_delta', 'times_grown', 'total_growth'],
+        'sql' => 'SELECT device_name, description, switch_name, switch_port, port,
+                         prev_errors_total, errors_total, errors_delta,
+                         times_grown, total_growth, started_at
+                  FROM (
+                    SELECT t.*,
+                           ROW_NUMBER() OVER (PARTITION BY t.phone_id, t.port
+                                              ORDER BY t.started_at DESC) AS rn,
+                           COUNT(*)            OVER (PARTITION BY t.phone_id, t.port) AS times_grown,
+                           SUM(t.errors_delta) OVER (PARTITION BY t.phone_id, t.port) AS total_growth
+                    FROM (SELECT * FROM v_port_error_deltas WHERE errors_delta > 0) t
+                  ) x
+                  WHERE x.rn = 1
+                  ORDER BY x.errors_delta DESC, x.device_name',
+    ],
+];
+
+const ROW_CAP = 20000;   // a guard, not a limit anyone should reach
+
+// ------------------------------------------------------------- gather data --
+$report = $_GET['r'] ?? 'speed-mismatch';
+if (!isset(REPORTS[$report])) { $report = 'speed-mismatch'; }
+$spec = REPORTS[$report];
+
+$minErrors = isset($_GET['min']) && ctype_digit((string)$_GET['min']) ? (int)$_GET['min'] : 1;
+
+$error  = null;
+$rows   = [];
+$tabCounts = [];
+$sweeps = [];
+$sweepId = null;
+
+try {
+    $pdo = new PDO(
+        sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4',
+            $CONFIG['db_host'], (int)$CONFIG['db_port'], $CONFIG['db_name']),
+        $CONFIG['db_user'], (string)$CONFIG['db_pass'],
+        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+         PDO::ATTR_EMULATE_PREPARES => false]
+    );
+
+    $sweeps = $pdo->query(
+        'SELECT id, started_at, phones_polled, phones_ok, phones_failed
+         FROM sweeps WHERE finished_at IS NOT NULL
+         ORDER BY started_at DESC, id DESC LIMIT 50'
+    )->fetchAll();
+
+    if (!$sweeps) {
+        $error = 'No completed sweep in the database yet. Run bin/cucm-sweep.php first.';
+    } else {
+        $countsPending = true;
+        // Whitelist the requested sweep against the ones that exist, so the
+        // parameter can never reach SQL as anything but a known id.
+        $ids = array_column($sweeps, 'id');
+        $want = isset($_GET['sweep']) ? (int)$_GET['sweep'] : (int)$ids[0];
+        $sweepId = in_array($want, array_map('intval', $ids), true) ? $want : (int)$ids[0];
+
+        $st = $pdo->prepare($spec['sql']);
+        if ($spec['sweep_scoped']) { $st->bindValue(':sweep', $sweepId, PDO::PARAM_INT); }
+        if ($report === 'errors')  { $st->bindValue(':min', $minErrors, PDO::PARAM_INT); }
+        $st->execute();
+        $rows = $st->fetchAll();
+
+        // A count for every tab, not just the open one: "are there any speed
+        // mismatches at all" should be answerable without clicking through,
+        // and an empty report is itself the useful answer.
+        $tabCounts['speed-mismatch'] = (int)$pdo->query(
+            'SELECT COUNT(*) FROM v_port_speed_mismatch WHERE sweep_id = ' . (int)$sweepId)->fetchColumn();
+        $tabCounts['errors'] = (int)$pdo->query(
+            'SELECT COUNT(*) FROM v_port_errors WHERE sweep_id = ' . (int)$sweepId
+            . ' AND errors_total >= ' . (int)$minErrors)->fetchColumn();
+        $tabCounts['error-trend'] = (int)$pdo->query(
+            'SELECT COUNT(*) FROM (SELECT phone_id, port FROM v_port_error_deltas
+                                   WHERE errors_delta > 0 GROUP BY phone_id, port) c')->fetchColumn();
+    }
+} catch (Throwable $e) {
+    $error = $e->getMessage();
+}
+
+$capped = count($rows) > ROW_CAP;
+if ($capped) { $rows = array_slice($rows, 0, ROW_CAP); }
+
+function h(?string $v): string { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
+/**
+ * Build a link, carrying the current view forward. A null value DROPS the
+ * parameter, which is how "latest sweep" is expressed: no sweep in the URL
+ * at all, so the page follows the newest one as sweeps arrive rather than
+ * pinning to whichever was newest when someone bookmarked it.
+ */
+function qs(array $over = []): string {
+    $q = array_merge(
+        ['r' => $_GET['r'] ?? 'speed-mismatch'],
+        isset($_GET['sweep']) ? ['sweep' => (int)$_GET['sweep']] : [],
+        isset($_GET['min'])   ? ['min'   => (int)$_GET['min']]   : [],
+        $over
+    );
+    return '?' . http_build_query(array_filter($q, fn($v) => $v !== null));
+}
+
+// CSV of exactly what is on screen, for when someone wants it in a spreadsheet.
+if (isset($_GET['csv'])) {
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $report . '-sweep' . (int)$sweepId . '.csv"');
+    $out = fopen('php://output', 'w');
+    fputcsv($out, array_values($spec['columns']), ',', '"', '\\');
+    foreach ($rows as $r) {
+        $line = [];
+        foreach (array_keys($spec['columns']) as $c) { $line[] = (string)($r[$c] ?? ''); }
+        fputcsv($out, $line, ',', '"', '\\');
+    }
+    exit;
+}
+?>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUCM phone port reports</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#5b6672; --line:#e3e7ec;
+    --accent:#0b5cad; --accent-soft:#e8f0fa; --warn:#a8410a; --bad:#b3261e;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  header{background:var(--card);border-bottom:1px solid var(--line);padding:14px 20px 0}
+  h1{margin:0 0 2px;font-size:17px;font-weight:650;letter-spacing:-.01em}
+  .sub{color:var(--muted);font-size:12.5px;margin-bottom:12px}
+  nav{display:flex;gap:2px}
+  nav a{padding:9px 15px;text-decoration:none;color:var(--muted);font-weight:550;font-size:13.5px;
+        border:1px solid transparent;border-bottom:none;border-radius:7px 7px 0 0;position:relative;top:1px}
+  nav a:hover{color:var(--ink);background:#eef1f5}
+  nav a.on{background:var(--bg);color:var(--accent);border-color:var(--line);}
+  nav a .n{display:inline-block;margin-left:7px;padding:1px 7px;border-radius:9px;
+           background:#e6eaef;color:var(--muted);font-size:11.5px;font-weight:650}
+  nav a.on .n{background:var(--accent-soft);color:var(--accent)}
+  nav a .n.none{opacity:.55}
+  .hint{color:var(--muted);font-size:12px;margin:-4px 0 10px}
+  main{padding:18px 20px 40px}
+  .blurb{color:var(--muted);max-width:76ch;margin:0 0 14px}
+  .bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px}
+  input[type=search],select,input[type=number]{
+    font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:7px;background:var(--card);color:var(--ink)}
+  input[type=search]{min-width:290px}
+  input[type=search]:focus,select:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
+  .grow{flex:1}
+  .count{color:var(--muted);font-size:12.5px;white-space:nowrap}
+  a.btn{text-decoration:none;color:var(--accent);border:1px solid var(--line);background:var(--card);
+        padding:7px 12px;border-radius:7px;font-size:13px;font-weight:550}
+  a.btn:hover{background:var(--accent-soft)}
+  .wrap{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:auto;max-height:74vh}
+  table{border-collapse:separate;border-spacing:0;width:100%;font-variant-numeric:tabular-nums}
+  th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{position:sticky;top:0;background:var(--card);z-index:1;font-size:12px;text-transform:uppercase;
+     letter-spacing:.04em;color:var(--muted);font-weight:650;cursor:pointer;user-select:none}
+  th:hover{color:var(--accent)}
+  th .ar{opacity:.35;margin-left:5px;font-size:10px}
+  th.sorted .ar{opacity:1}
+  th.sorted{color:var(--accent)}
+  td.num,th.num{text-align:right}
+  tbody tr:hover{background:#f9fbfd}
+  tbody tr:last-child td{border-bottom:none}
+  .dev{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+  .pill{display:inline-block;padding:1px 8px;border-radius:9px;font-size:11.5px;font-weight:650;
+        background:#eef1f5;color:var(--muted)}
+  .pill.speed{background:#fdeee6;color:var(--warn)}
+  .pill.duplex,.pill\.speedduplex{background:#fde9e8;color:var(--bad)}
+  .bad{color:var(--bad);font-weight:650}
+  .zero{color:#aeb6c0}
+  .empty{padding:40px;text-align:center;color:var(--muted)}
+  .err{background:#fde9e8;border:1px solid #f3c9c6;color:#7d1a15;padding:12px 14px;border-radius:8px}
+  footer{color:var(--muted);font-size:12px;padding:0 20px 30px}
+  @media (prefers-color-scheme: dark){
+    :root{--bg:#14171a;--card:#1c2024;--ink:#e6e9ec;--muted:#9aa4af;--line:#2b3138;
+          --accent:#6aa9e9;--accent-soft:#22303f}
+    nav a:hover{background:#232830}
+    tbody tr:hover{background:#20262c}
+    .pill{background:#262c33}
+    .err{background:#3a1f1d;border-color:#5c2f2b;color:#f0c6c2}
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>CUCM phone port reports</h1>
+  <div class="sub">Network and access port statistics collected from registered handsets</div>
+  <nav>
+    <?php foreach (REPORTS as $key => $r): ?>
+      <a class="<?= $key === $report ? 'on' : '' ?>" href="<?= h(qs(['r' => $key])) ?>"><?= h($r['title']) ?><?php
+        if (isset($tabCounts[$key])): ?><span class="n<?= $tabCounts[$key] === 0 ? ' none' : '' ?>"><?= (int)$tabCounts[$key] ?></span><?php
+        endif; ?></a>
+    <?php endforeach; ?>
+  </nav>
+</header>
+<main>
+<?php if ($error !== null): ?>
+  <div class="err"><strong>Cannot show reports.</strong><br><?= h($error) ?></div>
+<?php else: ?>
+  <p class="blurb"><?= h($spec['blurb']) ?></p>
+  <div class="bar">
+    <input type="search" id="q" placeholder="Search any column - device, switch, port, description..." autofocus>
+    <?php if ($spec['sweep_scoped']): ?>
+      <?php $pinned = isset($_GET['sweep']); ?>
+      <select onchange="location=this.value">
+        <option value="<?= h(qs(['sweep' => null])) ?>" <?= $pinned ? '' : 'selected' ?>>
+          Latest sweep (#<?= (int)$sweeps[0]['id'] ?> &mdash; <?= h($sweeps[0]['started_at']) ?>)
+        </option>
+        <?php foreach ($sweeps as $s): ?>
+          <option value="<?= h(qs(['sweep' => $s['id']])) ?>" <?= ($pinned && (int)$s['id'] === $sweepId) ? 'selected' : '' ?>>
+            Sweep #<?= (int)$s['id'] ?> &mdash; <?= h($s['started_at']) ?> (<?= (int)$s['phones_ok'] ?> ok, <?= (int)$s['phones_failed'] ?> failed)
+          </option>
+        <?php endforeach; ?>
+      </select>
+      <?php if ($pinned): ?>
+        <a class="btn" href="<?= h(qs(['sweep' => null])) ?>">Back to latest</a>
+      <?php endif; ?>
+    <?php else: ?>
+      <span class="count">across all <?= count($sweeps) ?> sweeps</span>
+    <?php endif; ?>
+    <?php if ($report === 'errors'): ?>
+      <label class="count">min errors
+        <input type="number" min="1" value="<?= (int)$minErrors ?>" style="width:90px"
+               onchange="location='<?= h(qs(['min' => 0])) ?>'.replace(/min=0/,'min='+Math.max(1,this.value))">
+      </label>
+    <?php endif; ?>
+    <span class="grow"></span>
+    <span class="count" id="shown"><?= count($rows) ?> rows</span>
+    <a class="btn" href="<?= h(qs(['csv' => 1])) ?>">Download CSV</a>
+  </div>
+
+  <?php if ($capped): ?>
+    <div class="err" style="margin-bottom:12px">Showing the first <?= ROW_CAP ?> rows only.</div>
+  <?php endif; ?>
+
+  <?php if (count($spec['columns']) > 12): ?>
+    <div class="hint">This table is wider than the window &mdash; scroll it sideways to see the remaining counters.</div>
+  <?php endif; ?>
+  <div class="wrap">
+    <?php if (!$rows): ?>
+      <div class="empty">Nothing to report<?= $spec['sweep_scoped'] ? ' in sweep #' . (int)$sweepId : '' ?>. That is good news.</div>
+    <?php else: ?>
+    <table id="t">
+      <thead><tr>
+        <?php foreach ($spec['columns'] as $col => $label):
+              $num = in_array($col, $spec['numeric'], true); ?>
+          <th class="<?= $num ? 'num' : '' ?>" data-type="<?= $num ? 'n' : 's' ?>"><?= h($label) ?><span class="ar">&#9650;&#9660;</span></th>
+        <?php endforeach; ?>
+      </tr></thead>
+      <tbody>
+        <?php foreach ($rows as $r): ?>
+          <tr>
+          <?php foreach ($spec['columns'] as $col => $label):
+                $v = $r[$col] ?? null;
+                $num = in_array($col, $spec['numeric'], true);
+                $cls = $num ? 'num' : '';
+                if ($col === 'device_name') { $cls .= ' dev'; }
+                echo '<td class="' . trim($cls) . '">';
+                if ($col === 'mismatch_kind' && $v !== null) {
+                    echo '<span class="pill ' . h(str_replace('+', '', (string)$v)) . '">' . h((string)$v) . '</span>';
+                } elseif (in_array($col, ['errors_total', 'errors_delta', 'total_growth'], true)) {
+                    echo $v > 0 ? '<span class="bad">' . h((string)$v) . '</span>' : '<span class="zero">0</span>';
+                } elseif ($num && ($v === null || $v === '')) {
+                    echo '<span class="zero">&mdash;</span>';
+                } elseif ($v === null || $v === '') {
+                    echo '<span class="zero">&mdash;</span>';
+                } else {
+                    echo h((string)$v);
+                }
+                echo '</td>';
+          endforeach; ?>
+          </tr>
+        <?php endforeach; ?>
+      </tbody>
+    </table>
+    <?php endif; ?>
+  </div>
+<?php endif; ?>
+</main>
+<footer>
+  Generated <?= h(date('Y-m-d H:i')) ?> from <?= h($CONFIG['db_name']) ?> on <?= h($CONFIG['db_host']) ?>.
+  Click a column heading to sort; click again to reverse.
+</footer>
+
+<script>
+// Sorting and searching happen here rather than in SQL: the row counts are
+// small enough that a round trip per click would be slower and would lose
+// the scroll position, and it keeps user input away from the database
+// entirely.
+(function () {
+  var table = document.getElementById('t');
+  if (!table) return;
+  var tbody = table.tBodies[0];
+  var rows  = Array.prototype.slice.call(tbody.rows);
+  var heads = Array.prototype.slice.call(table.tHead.rows[0].cells);
+  var shown = document.getElementById('shown');
+  var sortCol = -1, sortDir = 1;
+
+  function cellText(row, i) { return (row.cells[i].textContent || '').trim(); }
+  function cellNum(row, i) {
+    var t = cellText(row, i).replace(/[^0-9.\-]/g, '');
+    // An empty or non-numeric cell must sort as missing, not as zero -
+    // otherwise "no counter reported" outranks a genuine low value.
+    return t === '' || t === '-' ? null : parseFloat(t);
+  }
+
+  function sortBy(i) {
+    sortDir = (i === sortCol) ? -sortDir : (heads[i].dataset.type === 'n' ? -1 : 1);
+    sortCol = i;
+    heads.forEach(function (h, j) { h.classList.toggle('sorted', j === i); });
+    var numeric = heads[i].dataset.type === 'n';
+    rows.sort(function (a, b) {
+      if (numeric) {
+        var x = cellNum(a, i), y = cellNum(b, i);
+        if (x === null && y === null) return 0;
+        if (x === null) return 1;          // missing always sinks
+        if (y === null) return -1;
+        return (x - y) * sortDir;
+      }
+      return cellText(a, i).localeCompare(cellText(b, i), undefined, {numeric: true, sensitivity: 'base'}) * sortDir;
+    });
+    var frag = document.createDocumentFragment();
+    rows.forEach(function (r) { frag.appendChild(r); });
+    tbody.appendChild(frag);
+  }
+
+  heads.forEach(function (h, i) {
+    h.addEventListener('click', function () { sortBy(i); });
+  });
+
+  var q = document.getElementById('q');
+  var timer = null;
+  function filter() {
+    var terms = q.value.toLowerCase().split(/\s+/).filter(Boolean);
+    var n = 0;
+    rows.forEach(function (r) {
+      var hay = r.textContent.toLowerCase();
+      // Every term must match, so "warehouse crc" narrows rather than widens.
+      var ok = terms.every(function (t) { return hay.indexOf(t) !== -1; });
+      r.style.display = ok ? '' : 'none';
+      if (ok) n++;
+    });
+    shown.textContent = n + (n === rows.length ? ' rows' : ' of ' + rows.length + ' rows');
+  }
+  q.addEventListener('input', function () {
+    clearTimeout(timer);
+    timer = setTimeout(filter, 90);
+  });
+  q.addEventListener('keydown', function (e) { if (e.key === 'Escape') { q.value = ''; filter(); } });
+})();
+</script>
+</body>
+</html>

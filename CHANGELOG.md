@@ -117,6 +117,16 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
   them, and a missed spelling can be added and the reports re-run without
   re-sweeping the estate.
 
+**Web**
+- **`web/cucm-reports.php`** — a single drop-in PHP file presenting the three
+  reports as a browsable page: tabs, full-text search across all columns
+  (multiple words narrow), click-to-sort on every column in both directions
+  with numeric-aware ordering, a sweep selector defaulting to and following
+  the latest, per-tab row counts, and CSV export of what is on screen. CSS
+  and JavaScript are inline — no CDN, since the target host has no internet
+  route. Read-only: needs `SELECT` and nothing else, and no user input
+  reaches SQL.
+
 **Probe**
 - `phone_probe_schemes` / `--schemes` controls which schemes the probe tries
   against a handset. Set to `https` on an all-HTTPS estate; the HTTP

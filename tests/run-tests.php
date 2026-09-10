@@ -1042,6 +1042,96 @@ eq('network errors normalised', (int)($one['adapters']['network']['normalised'][
 $r = run("$php $root/bin/cucm-phone-netstats.php 10.10.10.5 --config $C --json");
 eq('auth-required phone exits 2', $r['rc'], 2);
 
+// ------------------------------------------------------------- web report --
+section('integration: the single-file web report');
+$webPort = $port + 300;
+$webSrv = proc_open(
+    sprintf('exec env CPS_DB_HOST=%s CPS_DB_PORT=%d CPS_DB_NAME=%s CPS_DB_USER=%s CPS_DB_PASS=%s '
+          . 'php -S 127.0.0.1:%d -t %s',
+        escapeshellarg($dbHost), $dbPort, escapeshellarg($dbName),
+        escapeshellarg($dbUser), escapeshellarg($dbPass), $webPort, escapeshellarg("$root/web")),
+    [1 => ['file', '/tmp/cps-web.log', 'a'], 2 => ['file', '/tmp/cps-web.log', 'a']], $wpipes
+);
+register_shutdown_function(function () use ($webSrv) {
+    if (is_resource($webSrv)) {
+        $st = proc_get_status($webSrv);
+        if ($st['running']) { proc_terminate($webSrv); }
+    }
+});
+for ($i = 0; $i < 40; $i++) {
+    $f = @fsockopen('127.0.0.1', $webPort, $e1, $e2, 0.2);
+    if ($f) { fclose($f); break; }
+    usleep(100000);
+}
+
+$fetch = function (string $qs) use ($webPort) {
+    $ctx = stream_context_create(['http' => ['ignore_errors' => true, 'timeout' => 10]]);
+    $body = @file_get_contents("http://127.0.0.1:$webPort/cucm-reports.php$qs", false, $ctx);
+    $code = 0;
+    foreach ($http_response_header ?? [] as $hline) {
+        if (preg_match('#^HTTP/\S+ (\d+)#', $hline, $m)) { $code = (int)$m[1]; }
+    }
+    return ['code' => $code, 'body' => (string)$body];
+};
+
+foreach (['speed-mismatch' => 'Speed mismatch',
+          'errors'         => 'Errors',
+          'error-trend'    => 'Increasing errors'] as $key => $title) {
+    $res = $fetch("?r=$key");
+    eq("web: $key returns 200", $res['code'], 200);
+    ok("web: $key renders its title", str_contains($res['body'], $title), substr($res['body'], 0, 200));
+    // Tab links are relative, so match on the query string itself rather
+    // than assuming the script name appears in the href.
+    foreach (['speed-mismatch', 'errors', 'error-trend'] as $tab) {
+        ok("web: $key links to the $tab tab",
+           str_contains($res['body'], 'r=' . $tab), 'tab link for ' . $tab);
+    }
+    ok("web: $key ships its own CSS and JS (no CDN)",
+       !preg_match('#<(script|link)[^>]+(src|href)=["\']https?://#i', $res['body']),
+       'external asset reference found');
+}
+
+// PHP errors must not leak into the page.
+$res = $fetch('?r=errors');
+ok('web: no PHP warnings or notices in the output',
+   !preg_match('/(Warning|Notice|Fatal error|Deprecated):/', $res['body']), substr($res['body'], 0, 300));
+ok('web: the errors table carries the switch columns',
+   str_contains($res['body'], 'Switch port'), 'switch columns');
+
+// An unknown report must fall back, not error.
+$res = $fetch('?r=../../etc/passwd');
+eq('web: an unknown report falls back to the default', $res['code'], 200);
+ok('web: and does not echo the input', !str_contains($res['body'], 'etc/passwd'), 'input echoed');
+
+// The default must follow the NEWEST sweep, and must not pin: a page
+// bookmarked today should show tomorrow's data.
+$latest = (int)$db->query('SELECT id FROM sweeps WHERE finished_at IS NOT NULL
+                           ORDER BY started_at DESC, id DESC LIMIT 1')[0]['id'];
+$res = $fetch('?r=errors');
+ok('web: defaults to the latest sweep', str_contains($res['body'], "Sweep #$latest"), "expected sweep #$latest");
+ok('web: the latest option is selected by default',
+   preg_match('/<option[^>]*selected[^>]*>\s*Latest sweep/', $res['body']) === 1, 'latest not selected');
+ok('web: and no sweep id is pinned in the tab links',
+   !preg_match('/href="\?r=[a-z-]+&amp;sweep=/', $res['body']), 'sweep pinned into tab links');
+
+// Choosing a specific sweep pins it, and offers a way back.
+$older = (int)$db->query('SELECT id FROM sweeps WHERE finished_at IS NOT NULL
+                          ORDER BY started_at ASC, id ASC LIMIT 1')[0]['id'];
+if ($older !== $latest) {
+    $res = $fetch("?r=errors&sweep=$older");
+    ok('web: an explicitly chosen sweep is honoured', str_contains($res['body'], "Sweep #$older"), "expected #$older");
+    ok('web: and offers a way back to latest', str_contains($res['body'], 'Back to latest'), 'no way back');
+}
+
+// A non-existent sweep id must not reach SQL.
+$res = $fetch('?r=errors&sweep=999999');
+eq('web: an unknown sweep id is rejected safely', $res['code'], 200);
+ok('web: no SQL error surfaced', !str_contains($res['body'], 'SQLSTATE'), substr($res['body'], 0, 200));
+
+$res = $fetch('?r=errors&csv=1');
+eq('web: CSV export returns 200', $res['code'], 200);
+ok('web: CSV has a header row', str_contains($res['body'], 'Device,'), substr($res['body'], 0, 120));
+
 // ------------------------------------------------------------------- probe
 section('integration: probe honours --schemes');
 $r = run("$php $root/bin/cucm-probe.php --config $C --phone 10.10.10.4 --schemes https --out /tmp/cps-probe-https");

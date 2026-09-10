@@ -308,6 +308,38 @@ belonging to anyone called Joseph. Use `--device-prefixes` for device types
 (it anchors to the start of the name), or scope the search to one field with
 `--match name:SEP0`.
 
+## The web page
+
+`web/cucm-reports.php` is a **single file**: drop it in a web root, point it
+at the database, done. Three tabs — speed mismatch, errors, increasing
+errors — each searchable, with every column sortable ascending and
+descending.
+
+```bash
+cp web/cucm-reports.php /var/www/html/
+cp cucm.conf /var/www/html/            # or set CPS_DB_* in the environment
+```
+
+Configuration is taken from `CPS_DB_*` environment variables, then a
+`cucm.conf` beside the script, then built-in defaults. **The account needs
+only `SELECT`** — nothing on this page writes.
+
+- **Search** matches across every column, and multiple words narrow rather
+  than widen: `warehouse crc` means both.
+- **Sort** by clicking a heading, again to reverse. Numeric columns sort
+  numerically, and a missing counter sinks to the bottom instead of being
+  treated as zero.
+- **Sweep** defaults to the latest and *follows* it — no sweep id is put in
+  the URL unless you pick one, so a bookmarked page keeps showing current
+  data. Choosing a specific sweep pins it and offers a way back.
+- **Download CSV** exports exactly the rows on screen.
+- The tab badges show each report's row count, so an empty report is
+  visible without clicking into it.
+
+No CDN, no framework: the CSS and JavaScript are inline, because the host
+this is for has no route to the internet and a page that silently loses its
+sorting on deployment is worse than a plain table.
+
 ## Reports
 
 **`speed-mismatch`** — phones whose access (PC) port is running at a
