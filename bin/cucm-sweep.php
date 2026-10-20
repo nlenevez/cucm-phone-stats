@@ -17,6 +17,7 @@
  *   php bin/cucm-sweep.php --match name:SEP0011            # scoped to one field
  *   php bin/cucm-sweep.php --limit 5 --no-db --json   # the FIRST five (one node, one site)
  *   php bin/cucm-sweep.php --phones-from phones.csv   # poll a list, skip CUCM
+ *   php bin/cucm-sweep.php --only-problems            # re-check what the last sweep flagged
  *
  * On a large estate reach for --sample, not --limit: RisPort returns devices
  * grouped by node, so the first N are usually all from one subscriber.
@@ -45,7 +46,9 @@ if (!empty($opts['help'])) {
                  . "  --exclude-subnet CIDR[,CIDR]  leave these subnets alone\n"
                  . "  --device-prefixes SEP[,CSF]   device types to poll (default SEP)\n"
                  . "  --all-devices                 poll every registered device, soft clients included\n"
-                 . "  --parallel N                  phones in flight at once (default 10)\n");
+                 . "  --parallel N                  phones in flight at once (default 10)\n"
+                 . "  --only-problems [SWEEP]       only phones the last (or given) sweep flagged:\n"
+                 . "                                speed mismatch, errors, switch mismatch\n");
     exit(0);
 }
 
@@ -60,12 +63,39 @@ $adapters = is_string($opts['adapters'] ?? null)
     ? preg_split('/[\s,]+/', $opts['adapters'], -1, PREG_SPLIT_NO_EMPTY)
     : preg_split('/[\s,]+/', (string)$cfg['adapters'], -1, PREG_SPLIT_NO_EMPTY);
 
+// --only-problems [N]: re-poll just the phones sweep N (default: the latest
+// completed one) flagged - mismatch, errors, or switch mismatch.
+$problemNames = null;
+if (isset($opts['only-problems'])) {
+    $pdb  = new CpsDb($cfg);
+    $from = is_string($opts['only-problems']) ? (int)$opts['only-problems'] : $pdb->latestSweepId();
+    if (!$from) { cps_die('--only-problems needs a completed sweep to start from'); }
+    $problemNames = array_map('strval', $pdb->problemPhones($from));
+    cps_log(count($problemNames) . " phones flagged in sweep #$from");
+    if (!$problemNames) {
+        cps_log("nothing to re-check - sweep #$from flagged no phones");
+        exit(0);
+    }
+}
+
 // ---------------------------------------------------------------- discovery
 $t0 = microtime(true);
 if (isset($opts['phones-from']) && is_string($opts['phones-from'])) {
     $phones = cps_phones_from_file($opts['phones-from']);
     $source = 'file:' . basename($opts['phones-from']);
     cps_log(count($phones) . ' phones loaded from ' . $opts['phones-from']);
+    if ($problemNames !== null) {
+        $want   = array_flip($problemNames);
+        $phones = array_values(array_filter($phones, fn($r) => isset($want[$r['name']])));
+        $source = "problems:#$from";
+    }
+} elseif ($problemNames !== null) {
+    // Ask RisPort for these names only: the estate-wide enumeration is the
+    // slow, rate-limited part of a sweep, and polling is already parallel.
+    if (!cps_server_urls($cfg)) { cps_die('no cucm_servers configured (see cucm.conf.example)'); }
+    $phones = cps_discover_named_phones($cfg, $problemNames, $status);
+    $source = "problems:#$from";
+    cps_log(sprintf('%d of %d flagged phones are currently %s', count($phones), count($problemNames), $status));
 } else {
     if (!cps_server_urls($cfg)) { cps_die('no cucm_servers configured (see cucm.conf.example)'); }
     $phones = cps_discover_phones($cfg, $source, $status, $opts);

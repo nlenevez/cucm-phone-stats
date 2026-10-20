@@ -905,6 +905,43 @@ class CpsRisportClient
         return ['devices' => $byName, 'errors' => $errors, 'per_server' => $perServer];
     }
 
+    /**
+     * Look up a known list of device names rather than enumerating the estate.
+     *
+     * Names go in SelectItems verbatim, a chunk at a time, so a few hundred
+     * phones cost a few queries per cluster instead of the node/partition
+     * walk. A name registered on the other cluster simply comes back empty.
+     *
+     * @param CpsRisportClient[] $clients
+     * @param string[] $names
+     * @return array{devices: array<string,array>, errors: array<int,array>}
+     */
+    public static function discoverNames(array $clients, array $names, string $status = 'Registered', int $chunk = 200): array
+    {
+        $byName = [];
+        $errors = [];
+        foreach ($clients as $c) {
+            foreach (array_chunk(array_values(array_unique($names)), $chunk) as $part) {
+                try {
+                    $rows = $c->selectCmDevice($status, 'Phone', $part);
+                } catch (Throwable $e) {
+                    $errors[] = ['server' => $c->baseUrl(), 'error' => $e->getMessage()];
+                    cps_warn($c->baseUrl() . ': ' . $e->getMessage());
+                    continue 2;
+                }
+                foreach ($rows as $r) {
+                    $r['ris_server'] = $c->baseUrl();
+                    $name = $r['name'];
+                    if ($name === '') { continue; }
+                    if (!isset($byName[$name]) || self::isBetter($r, $byName[$name])) {
+                        $byName[$name] = $r;
+                    }
+                }
+            }
+        }
+        return ['devices' => $byName, 'errors' => $errors];
+    }
+
     private static function isBetter(array $new, array $old): bool
     {
         $score = function (array $r): int {

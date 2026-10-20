@@ -781,6 +781,14 @@ $stillNeg = false;
 foreach ($tr ?: [] as $row) { if ((int)$row['errors_delta'] < 0) { $stillNeg = true; } }
 ok('trend report contains no negative deltas', !$stillNeg);
 
+section('integration: --only-problems re-polls just what the last sweep flagged');
+$flagged = $db->problemPhones((int)$db->latestSweepId());
+$r = run("$php $root/bin/cucm-sweep.php --config $C --json --only-problems");
+$op = json_decode($r['out'], true);
+ok('problems sweep exits 0', $r['rc'] === 0, $r['err']);
+eq('polls exactly the flagged phones', (int)($op['polled'] ?? -1), count($flagged));
+ok('and fewer than the estate', count($flagged) > 0 && count($flagged) < 7, implode(',', $flagged));
+
 // ------------------------------------------- large estate / RisPort cap ---
 section('integration: RisPort response cap and the partitioning fallback');
 file_get_contents("http://127.0.0.1:$port/_big/300");   // 300 phones, cap 120

@@ -516,6 +516,33 @@ class CpsDb
         return $st->fetchAll();
     }
 
+    /**
+     * Device names flagged by a sweep: phone speed/duplex mismatch, any
+     * non-zero error counter, or a switch-side mismatch. The switch view is
+     * optional so this still works before cucm-initdb.php has added it.
+     *
+     * @return string[]
+     */
+    public function problemPhones(int $sweepId): array
+    {
+        $names = [];
+        $sources = [
+            'SELECT device_name FROM v_port_speed_mismatch WHERE sweep_id = ?',
+            'SELECT device_name FROM v_port_errors WHERE sweep_id = ?',
+            'SELECT device_name FROM v_switch_port_mismatch WHERE sweep_id = ?',
+        ];
+        foreach ($sources as $i => $sql) {
+            try {
+                foreach ($this->query($sql, [$sweepId]) as $r) { $names[$r['device_name']] = true; }
+            } catch (PDOException $e) {
+                if ($i < 2) { throw $e; }
+            }
+        }
+        $out = array_keys($names);
+        sort($out);
+        return $out;
+    }
+
     public function latestSweepId(): ?int
     {
         $r = $this->query('SELECT id FROM sweeps WHERE finished_at IS NOT NULL ORDER BY started_at DESC, id DESC LIMIT 1');

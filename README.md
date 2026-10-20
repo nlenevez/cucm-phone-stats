@@ -132,6 +132,20 @@ php bin/cucm-report.php error-trend
 | `bin/cucm-report.php` | The reports, over one sweep or all of them. |
 | `bin/cucm-initdb.php` | Creates/updates tables and views. Safe to re-run. |
 
+### Re-checking only the problem phones
+
+```bash
+php bin/cucm-sweep.php --only-problems        # what the latest sweep flagged
+php bin/cucm-sweep.php --only-problems 42     # what sweep #42 flagged
+```
+
+Polls only phones the sweep flagged: a speed/duplex mismatch, any non-zero
+error counter, or a switch mismatch. RisPort is asked for those device names
+directly, so the full-estate enumeration (the slow, throttled part) is
+skipped. The result is an ordinary sweep with source `problems:#N`, so it
+becomes the "latest" sweep in the reports. Error counters only clear when a
+phone reboots, so a phone that ever logged an error stays in the set.
+
 ### Testing against a subset
 
 On an estate of thousands, do not sweep the lot to find out whether it works:

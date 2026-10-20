@@ -14,6 +14,22 @@ require_once __DIR__ . '/config.php';
  *
  * @return array<int,array<string,mixed>>
  */
+/**
+ * Discover only the named phones (--only-problems). RisPort only: the point
+ * is to skip enumerating the estate, which is the slow, throttled part.
+ */
+function cps_discover_named_phones(array $cfg, array $names, string $status): array
+{
+    $res = CpsRisportClient::discoverNames(cps_risport_clients($cfg), $names, $status);
+    if (!$res['devices'] && $res['errors']) {
+        cps_die('every RisPort server failed; nothing discovered');
+    }
+    $rows = array_values($res['devices']);
+    foreach ($rows as &$r) { $r['source'] = 'risport'; }
+    unset($r);
+    return cps_resolve_model_names($rows, $cfg);
+}
+
 function cps_discover_phones(array $cfg, string $source, string $status, array $opts = []): array
 {
     if ($source === 'risport') {

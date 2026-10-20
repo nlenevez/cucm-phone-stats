@@ -7,6 +7,10 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
 
 ### Added
 
+**`cucm-sweep.php --only-problems [SWEEP]`** re-polls only the phones a
+sweep flagged (speed mismatch, errors, switch mismatch), looking them up in
+RisPort by name instead of enumerating the estate.
+
 **Switch-side speed/duplex check**
 - `bin/cucm-switch-import.php` loads Catalyst `show interface status`
   captures (a folder of per-switch files, e.g. from an Ansible playbook) into

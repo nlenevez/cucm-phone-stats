@@ -442,7 +442,8 @@ SELECT
   COALESCE(cn.id, ci.id)               AS capture_id,
   COALESCE(cn.captured_at, ci.captured_at) AS captured_at,
   sp.port             AS switch_if,
-  sp.name             AS switch_if_name,
+  -- first word only; the full description is in switch_ports.name
+  SUBSTRING_INDEX(TRIM(sp.name), ' ', 1) AS switch_if_name,
   sp.status           AS switch_status,
   sp.vlan             AS switch_vlan,
   sp.speed_raw        AS switch_speed,
