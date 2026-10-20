@@ -33,4 +33,6 @@ First release.
   sweep selector, CSV export and light/dark theme.
 - `cucm-probe.php` to check a new cluster and phone; `cucm-initdb.php` for
   schema creation and migrations.
+- `cucm-prune.php --keep-days N`: retention for sweeps and switch captures
+  (dry run unless `--apply`; keeps the newest sweep).
 - Test suite with a mock CUCM and mock phones.

@@ -1140,6 +1140,18 @@ if ($evidence) {
     eq('Informix FIRST passes', $ids['axl:sql:informix-first'] ?? null, 'PASS');
 }
 
+section('integration: cucm-prune removes old sweeps, keeps the newest');
+$latest = (int)$db->latestSweepId();
+$db->pdo()->exec('UPDATE sweeps SET started_at = NOW() - INTERVAL 30 DAY');
+$before = (int)$db->query('SELECT COUNT(*) c FROM sweeps')[0]['c'];
+run("$php $root/bin/cucm-prune.php --config $C --keep-days 7");
+eq('dry run deletes nothing', (int)$db->query('SELECT COUNT(*) c FROM sweeps')[0]['c'], $before);
+$r = run("$php $root/bin/cucm-prune.php --config $C --keep-days 7 --apply");
+ok('prune --apply exits 0', $r['rc'] === 0, $r['err']);
+eq('only the newest sweep is left', array_map('intval', array_column($db->query('SELECT id FROM sweeps'), 'id')), [$latest]);
+eq('child rows of deleted sweeps go with them',
+   (int)$db->query('SELECT COUNT(*) c FROM port_stats WHERE sweep_id <> ?', [$latest])[0]['c'], 0);
+
 section('negative control: a wrong column must fail');
 $axl = new CpsAxlClient(new CpsSoapClient("http://127.0.0.1:$port", 'axluser', 'axlpass', false, 10), '14.0');
 $threw = false;

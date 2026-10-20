@@ -33,15 +33,13 @@ cp cucm.conf.example cucm.conf && $EDITOR cucm.conf
 ```sql
 CREATE DATABASE cucm_phone_stats CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
--- schema owner: runs bin/cucm-initdb.php
-CREATE USER 'cucm_admin'@'%' IDENTIFIED BY '...';
-GRANT CREATE, DROP, ALTER, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW,
-      SELECT, INSERT, UPDATE ON cucm_phone_stats.* TO 'cucm_admin'@'%';
-
--- runtime: the account in cucm.conf
+-- the account in cucm.conf. DDL is for cucm-initdb.php, DELETE for cucm-prune.php.
 CREATE USER 'cucm'@'%' IDENTIFIED BY '...';
-GRANT SELECT, INSERT, UPDATE ON cucm_phone_stats.* TO 'cucm'@'%';
+GRANT CREATE, DROP, ALTER, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW,
+      SELECT, INSERT, UPDATE, DELETE ON cucm_phone_stats.* TO 'cucm'@'%';
 ```
+
+Only `cucm-prune.php` deletes rows; sweeps, imports and reports never do.
 
 ```bash
 php bin/cucm-initdb.php --create-database   # tables, views, migrations; safe to re-run
@@ -234,6 +232,23 @@ php bin/cucm-set-profile.php --undo 20261020-153012 --apply                 # re
 - **Apply Config restarts the phones** (calls in progress drop). Run it out
   of hours.
 
+### cucm-prune.php
+
+Deletes sweeps (with their registrations, port stats, page data and
+uplinks) and superseded switch captures older than N days.
+
+```bash
+php bin/cucm-prune.php --keep-days 7                                        # dry run: counts only
+php bin/cucm-prune.php --keep-days 7 --apply
+```
+
+- Dry run unless `--apply`. The account in `cucm.conf` needs `DELETE`.
+- Always keeps the newest completed sweep and the newest capture of each
+  switch, so a cron that stopped for a week cannot empty the database.
+- Keeps the phone inventory, Common Phone Profiles and `profile_changes`
+  (needed for `--undo`).
+- `error-trend` and `--problems growing` only see the sweeps that remain.
+
 ### cucm-initdb.php
 
 Creates or updates tables and views and applies migrations. Safe to re-run.
@@ -262,6 +277,9 @@ avoid overlapping runs.
 
 ```cron
 # m  h    dom mon dow  command
+# Keep 7 days of history. Same lock as the sweeps.
+45 0    *   *   *    cd /path/to/cucm-phone-stats && flock -n /tmp/cucm-sweep.lock php bin/cucm-prune.php --keep-days 7 --apply >> /var/log/cucm-phone-stats.log 2>&1
+
 # Nightly full sweep.
 15 1    *   *   *    cd /path/to/cucm-phone-stats && flock -n /tmp/cucm-sweep.lock php bin/cucm-sweep.php --quiet >> /var/log/cucm-phone-stats.log 2>&1
 
