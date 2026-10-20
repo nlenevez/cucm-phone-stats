@@ -4,14 +4,18 @@
  * cucm-switch-import.php - load "show interface status" captures.
  *
  * Usage:
- *   php bin/cucm-switch-import.php [--config FILE] [--switch NAME]
+ *   php bin/cucm-switch-import.php [--config FILE] [--switch NAME] [--name-regex RE]
  *       [--captured-at "YYYY-MM-DD HH:MM:SS"] [--dry-run] [--json] PATH...
  *
  * PATH is a file or a directory (every non-hidden file in it). The switch
  * is named by a "HOST#show interface status" prompt in the text if there is
  * one, else by the file name minus .txt/.log/.out/.json - which is what an
  * Ansible playbook writing switch-outputs/<inventory_hostname>.txt gives.
- * --switch overrides that for a single file.
+ * A trailing "-status" / "_status" (or "-int-status", "-show-interface-
+ * status", ...) is dropped, so HOSTNAME-status.txt names HOSTNAME.
+ * --name-regex takes the name from capture group 1 of a pattern matched
+ * against the file name instead, e.g. '/^show_(.+)\.txt$/'. --switch
+ * overrides both for a single file.
  *
  * The capture time is the file's mtime (tar keeps it across the airgap)
  * unless --captured-at is given. Identical output already imported for a
@@ -33,7 +37,8 @@ $p    = cps_parse_args($argv, ['dry-run', 'json', 'verbose', 'quiet', 'debug', '
 $opts = $p['opts'];
 if (!empty($opts['help']) || !$p['args']) {
     fwrite(STDERR, "Usage: php bin/cucm-switch-import.php [--config FILE] [--switch NAME]\n"
-                 . "       [--captured-at 'YYYY-MM-DD HH:MM:SS'] [--dry-run] [--json] PATH...\n");
+                 . "       [--name-regex '/^(.+)-status\\.txt$/'] [--captured-at 'YYYY-MM-DD HH:MM:SS']\n"
+                 . "       [--dry-run] [--json] PATH...\n");
     exit($p['args'] ? 0 : 1);
 }
 
@@ -57,6 +62,22 @@ $override = is_string($opts['switch'] ?? null) ? $opts['switch'] : null;
 if ($override !== null && count($files) > 1) {
     cps_die('--switch names one switch, so it needs exactly one file');
 }
+$nameRe = is_string($opts['name-regex'] ?? null) ? $opts['name-regex'] : null;
+if ($nameRe !== null && @preg_match($nameRe, '') === false) {
+    cps_die("--name-regex is not a valid PCRE pattern: $nameRe");
+}
+
+/** The switch a capture file names, before any prompt in its text overrides it. */
+function cps_switch_name_from_file(string $file, ?string $re): ?string
+{
+    $base = basename($file);
+    if ($re !== null) {
+        return preg_match($re, $base, $m) && ($m[1] ?? '') !== '' ? $m[1] : null;
+    }
+    $n = (string)preg_replace('/\.(txt|log|out|json)$/i', '', $base);
+    return (string)preg_replace('/[-_](?:show[-_])?(?:int(?:erfaces?)?[-_])?status$/i', '', $n);
+}
+
 $at = is_string($opts['captured-at'] ?? null) ? $opts['captured-at'] : null;
 if ($at !== null && !preg_match('/^\d{4}-\d\d-\d\d( \d\d:\d\d(:\d\d)?)?$/', $at)) {
     cps_die("--captured-at wants 'YYYY-MM-DD HH:MM:SS', got '$at'");
@@ -78,7 +99,12 @@ foreach ($files as $file) {
     $raw = file_get_contents($file);
     if ($raw === false) { cps_warn("$file: unreadable"); $skipped++; continue; }
     $text = cps_switch_unwrap($raw);
-    $fromFile = $override ?? (string)preg_replace('/\.(txt|log|out|json)$/i', '', basename($file));
+    $fromFile = $override ?? cps_switch_name_from_file($file, $nameRe);
+    if ($fromFile === null) {
+        cps_warn("$file: does not match --name-regex - not imported");
+        $skipped++;
+        continue;
+    }
 
     foreach (cps_switch_split($text, $fromFile) as $block) {
         $name   = $override ?? $block['switch'];

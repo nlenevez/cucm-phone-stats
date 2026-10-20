@@ -243,7 +243,7 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
         case 'switch-mismatch':
         case 'switch-compare':
             $sql = 'SELECT device_name, description, ip_address, switch_name, switch_port,
-                           switch_if, switch_if_name, switch_status, switch_vlan,
+                           switch_key, port_key, switch_if, switch_if_name, switch_status, switch_vlan,
                            phone_speed_mbps, phone_duplex, switch_speed, switch_duplex,
                            result, captured_at, started_at
                     FROM ' . ($report === 'switch-mismatch' ? 'v_switch_port_mismatch' : 'v_switch_port_compare')
@@ -254,17 +254,20 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
                 $params[] = $opts['result'];
             }
             $sql .= ' ORDER BY result, switch_name, switch_port, device_name';
-            return [$sql, $params, ['device_name', 'switch_name', 'switch_port', 'switch_status',
+            // switch_key / port_key are what the match is made on: a
+            // no-capture row is explained by comparing its switch_key with
+            // switch-captures' switch_key.
+            return [$sql, $params, ['device_name', 'switch_name', 'switch_key', 'switch_port', 'switch_status',
                 'phone_speed_mbps', 'phone_duplex', 'switch_speed', 'switch_duplex', 'result']];
 
         case 'switch-captures':
-            $sql = 'SELECT c.id, c.switch_name, c.switch_ip, c.source_file, c.captured_at, c.imported_at,
+            $sql = 'SELECT c.id, c.switch_name, c.switch_key, c.switch_ip, c.source_file, c.captured_at, c.imported_at,
                            c.ports_parsed, c.lines_unparsed,
                            (l.id IS NOT NULL) AS is_latest
                     FROM switch_captures c
                     LEFT JOIN v_switch_latest_capture l ON l.id = c.id
                     ORDER BY c.switch_key, c.captured_at DESC, c.id DESC';
-            return [$sql, [], ['id', 'switch_name', 'captured_at', 'ports_parsed', 'lines_unparsed',
+            return [$sql, [], ['id', 'switch_name', 'switch_key', 'captured_at', 'ports_parsed', 'lines_unparsed',
                 'is_latest', 'source_file']];
 
         case 'phones':

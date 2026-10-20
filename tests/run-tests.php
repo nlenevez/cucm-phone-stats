@@ -656,6 +656,10 @@ file_put_contents("$swDir/capture.log", "sw-access-01#show interface status\n\n$
     . "sw-access-01#\n");
 file_put_contents("$swDir/sw-access-02.example.local.txt", $hdr
     . "Gi1/0/7                         connected    30         a-half  a-100 10/100/1000BaseTX\n");
+// And the other way round: the phone reports an FQDN, the file is the bare
+// hostname - what an Ansible inventory of short names produces.
+file_put_contents("$swDir/sw-edge-07-status.txt", $hdr
+    . "Gi1/0/33                        connected    40         a-full  a-100 10/100/1000BaseTX\n");
 $r = run("$php $root/bin/cucm-switch-import.php --config $C $swDir");
 ok('switch import exits 0', $r['rc'] === 0, $r['err'] . $r['out']);
 $r = run("$php $root/bin/cucm-report.php switch-compare --config $C --json");
@@ -664,14 +668,15 @@ foreach (json_decode($r['out'], true) ?: [] as $x) { $cmp[$x['device_name']] = $
 eq('401 agrees with the switch (100/full)', $cmp['SEP001122334401'] ?? null, 'match');
 eq('402 runs 1000 where the switch says 100', $cmp['SEP001122334402'] ?? null, 'speed');
 eq('403 full where the switch says a-half', $cmp['SEP001122334403'] ?? null, 'duplex');
-eq('404 is on a switch not imported', $cmp['SEP001122334404'] ?? null, 'no-capture');
+ok('404 (FQDN from the phone) finds sw-edge-07-status.txt', ($cmp['SEP001122334404'] ?? 'no-capture') !== 'no-capture',
+   (string)($cmp['SEP001122334404'] ?? 'missing'));
 $r = run("$php $root/bin/cucm-report.php switch-mismatch --config $C --json");
 $mmSw = array_column(json_decode($r['out'], true) ?: [], 'device_name');
 sort($mmSw);
 eq('switch-mismatch lists exactly the two', $mmSw, ['SEP001122334402', 'SEP001122334403']);
 run("$php $root/bin/cucm-switch-import.php --config $C $swDir");
 eq('re-importing the same output stores nothing new',
-   (int)$db->query('SELECT COUNT(*) c FROM switch_captures')[0]['c'], 2);
+   (int)$db->query('SELECT COUNT(*) c FROM switch_captures')[0]['c'], 3);
 
 section('report: labels tells us what the phones actually send');
 $r = run("$php $root/bin/cucm-report.php labels --config $C --grep neighbor --json");

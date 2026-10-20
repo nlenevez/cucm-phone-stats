@@ -416,7 +416,11 @@ php bin/cucm-report.php switch-captures
 ```
 
 - **Switch name**: a `HOST#show interface status` prompt in the file if
-  there is one, otherwise the file name minus `.txt/.log/.out/.json`. Matched
+  there is one, otherwise the file name minus `.txt/.log/.out/.json` and a
+  trailing `-status`/`_status` (also `-int-status`, `_show_interface_status`
+  …), so `SW01-status.txt` is `SW01`. Other layouts: `--name-regex
+  '/^show_(.+)\.txt$/'` (group 1 is the name). Run `--dry-run` first and
+  check the `switch` column. Matched
   case-insensitively with the domain and any `(serial)` stripped, so CDP's
   `sw01.corp.local` matches `SW01`. A file named by IP matches the CDP
   management address instead.

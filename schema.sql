@@ -434,6 +434,8 @@ SELECT
   u.switch_name,
   u.switch_port,
   u.neighbour_source,
+  u.switch_key,
+  u.port_key,
   COALESCE(n.link_up, e.link_up)       AS phone_link_up,
   COALESCE(n.speed_mbps, e.speed_mbps) AS phone_speed_mbps,
   COALESCE(n.duplex, e.duplex)         AS phone_duplex,
