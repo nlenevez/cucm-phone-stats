@@ -816,6 +816,10 @@ $r = run("$php $root/bin/cucm-set-profile.php --config $C --from $STD --to $FIX 
 $sp = json_decode($r['out'], true);
 ok('--apply exits 0', $r['rc'] === 0, $r['err']);
 eq('402 is now on the new profile', $liveCpp('SEP001122334402'), $FIX);
+$r = run("$php $root/bin/cucm-set-profile.php --config $C --apply-config " . escapeshellarg((string)($sp['batch'] ?? 'x')) . " --apply");
+ok('--apply-config BATCH --apply exits 0', $r['rc'] === 0, $r['err']);
+eq('and marks the batch applied',
+   (int)$db->query('SELECT MIN(applied) a FROM profile_changes WHERE batch = ?', [(string)($sp['batch'] ?? 'x')])[0]['a'], 1);
 $r = run("$php $root/bin/cucm-set-profile.php --config $C --undo " . escapeshellarg((string)($sp['batch'] ?? 'x')) . " --apply");
 ok('--undo exits 0', $r['rc'] === 0, $r['err']);
 eq('and --undo puts it back', $liveCpp('SEP001122334402'), $STD);

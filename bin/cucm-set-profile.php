@@ -9,6 +9,7 @@
  *       [--result speed|duplex|speed+duplex] [--device NAME[,NAME]] [--limit N]
  *       [--apply [--apply-config]] [--json] [--config FILE]
  *   php bin/cucm-set-profile.php --undo BATCH [--apply [--apply-config]]
+ *   php bin/cucm-set-profile.php --apply-config BATCH [--apply]
  *
  * Candidates are the phones in the switch-mismatch report for the sweep
  * (default: the latest) whose stored profile is --from. Nothing is changed
@@ -19,6 +20,8 @@
  * The profile change takes effect when the phone picks up its config:
  * --apply-config sends AXL applyPhone (Apply Config) after each update;
  * without it, use Apply Config in CUCM or wait for the next reset.
+ * --apply-config BATCH sends it later, to every phone a batch changed
+ * (e.g. change now, apply out of hours); listed only, unless --apply.
  *
  * Every attempt is logged to profile_changes under a batch id, printed at
  * the end. --undo BATCH puts that batch's phones back on their old profile
@@ -29,13 +32,15 @@ require_once dirname(__DIR__) . '/lib/config.php';
 require_once dirname(__DIR__) . '/lib/db.php';
 require_once dirname(__DIR__) . '/lib/axl.php';
 
-$p    = cps_parse_args($argv, ['apply', 'apply-config', 'json', 'verbose', 'quiet', 'debug', 'help']);
+// apply-config is not a declared flag: bare it is true, "--apply-config BATCH" takes a value.
+$p    = cps_parse_args($argv, ['apply', 'json', 'verbose', 'quiet', 'debug', 'help']);
 $opts = $p['opts'];
 if (!empty($opts['help'])) {
     fwrite(STDERR, "Usage: php bin/cucm-set-profile.php --from UUID --to UUID [--sweep N]\n"
                  . "       [--result speed|duplex|speed+duplex] [--device NAME[,NAME]] [--limit N]\n"
                  . "       [--apply [--apply-config]] [--json]\n"
                  . "       php bin/cucm-set-profile.php --undo BATCH [--apply [--apply-config]]\n"
+                 . "       php bin/cucm-set-profile.php --apply-config BATCH [--apply]\n"
                  . "\n  Dry run unless --apply.\n");
     exit(0);
 }
@@ -45,6 +50,44 @@ $db    = new CpsDb($cfg);
 $apply = !empty($opts['apply']);
 $undo  = is_string($opts['undo'] ?? null) ? $opts['undo'] : null;
 if ((string)($cfg['axl_user'] ?? '') === '') { cps_die('axl_user is not configured'); }
+
+// ------------------------------------------- Apply Config for a past batch
+if (is_string($opts['apply-config'] ?? null)) {
+    $b    = $opts['apply-config'];
+    $rows = $db->query('SELECT id, device_name, axl_server, applied FROM profile_changes
+                        WHERE batch = ? AND ok = 1 ORDER BY id', [$b]);
+    if (!$rows) { cps_die("batch '$b' has no successful changes"); }
+    $mark = $db->pdo()->prepare('UPDATE profile_changes SET applied = 1 WHERE id = ?');
+    $out = [];
+    $failed = 0;
+    foreach ($rows as $r) {
+        $row = ['device_name' => $r['device_name'], 'previously_applied' => (int)$r['applied'], 'action' => '', 'note' => ''];
+        if (!$apply) {
+            $row['action'] = 'would apply config';
+        } else {
+            try {
+                cps_axl_client($cfg, $r['axl_server'] ?: null)->applyPhone($r['device_name']);
+                $mark->execute([$r['id']]);
+                $row['action'] = 'applied';
+            } catch (Throwable $e) {
+                $failed++;
+                $row['action'] = 'failed';
+                $row['note']   = $e->getMessage();
+                cps_warn("{$r['device_name']}: " . $e->getMessage());
+            }
+        }
+        $out[] = $row;
+    }
+    if (!empty($opts['json'])) {
+        echo cps_json(['batch' => $b, 'dry_run' => !$apply, 'phones' => $out]);
+    } else {
+        echo cps_render_table($out, ['device_name', 'previously_applied', 'action', 'note']);
+        fwrite(STDERR, $apply
+            ? sprintf("\nbatch %s: Apply Config sent to %d phone(s), %d failed\n", $b, count($out) - $failed, $failed)
+            : sprintf("\nDRY RUN: %d phone(s) would get Apply Config. Re-run with --apply.\n", count($out)));
+    }
+    exit($failed ? 2 : 0);
+}
 
 // ------------------------------------------------------------ candidates
 // Each candidate: phone_id, device_name, from, to, server, why.

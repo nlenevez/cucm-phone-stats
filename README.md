@@ -151,7 +151,9 @@ does the same live checks.
 
 Each change is logged to `profile_changes` under a batch id (printed at the
 end) and `--undo BATCH` reverts it. Phones pick up the new profile on Apply
-Config or reset; `--apply-config` sends AXL `applyPhone` after each update.
+Config or reset; `--apply-config` sends AXL `applyPhone` after each update,
+or later for a whole batch with `--apply-config BATCH --apply` (e.g. change
+during the day, apply out of hours; without `--apply` it only lists).
 Needs an AXL role with write access (Standard AXL API Access, not the
 read-only role).
 
