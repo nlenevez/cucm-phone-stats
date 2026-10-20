@@ -11,6 +11,12 @@
  *                    network port (both ports up)
  *   errors           ports with any non-zero error counter
  *   error-trend      ports whose error counters grew between sweeps
+ *   switch-mismatch  phones whose network port speed/duplex differs from what
+ *                    the switch's "show interface status" says (see
+ *                    bin/cucm-switch-import.php)
+ *   switch-compare   every uplink against the switch, with the reason a
+ *                    comparison could not be made; --result R to filter
+ *   switch-captures  the imported switch captures
  *   phones           current inventory
  *   sweeps           collection history
  *
@@ -32,11 +38,15 @@ $p      = cps_parse_args($argv, ['json', 'csv', 'table', 'all', 'verbose', 'quie
 $opts   = $p['opts'];
 $report = $p['args'][0] ?? null;
 
-$known = ['speed-mismatch', 'errors', 'error-trend', 'phones', 'sweeps', 'uplinks', 'labels'];
+$known = ['speed-mismatch', 'errors', 'error-trend', 'switch-mismatch', 'switch-compare', 'switch-captures',
+          'phones', 'sweeps', 'uplinks', 'labels'];
 if (!empty($opts['help']) || $report === null) {
     fwrite(STDERR, "Usage: php bin/cucm-report.php <" . implode('|', $known) . "> [--sweep N|--all]\n"
                  . "       [--min N] [--since YYYY-MM-DD] [--json|--csv|--table]\n"
                  . "\n  uplinks  what each phone reports being plugged into (CDP/LLDP)\n"
+                 . "  switch-mismatch  phone network port vs the switch's show interface status\n"
+                 . "  switch-compare   every uplink vs the switch; --result no-port|no-capture|match|...\n"
+                 . "  switch-captures  imported switch outputs\n"
                  . "  labels   every label the phones returned and how it is interpreted;\n"
                  . "           --grep TEXT to filter, --unmapped-only for the gaps\n"
                  . "\n  error-trend gives one row per phone and port (the most recent growth,\n"
@@ -59,7 +69,7 @@ if (!empty($opts['all'])) {
     $sweepId = (int)$opts['sweep'];
 } else {
     $sweepId = $db->latestSweepId();
-    if ($sweepId === null && $report !== 'sweeps') {
+    if ($sweepId === null && $report !== 'sweeps' && $report !== 'switch-captures') {
         cps_die('no completed sweep in the database yet - run bin/cucm-sweep.php first');
     }
 }
@@ -89,7 +99,7 @@ elseif (!empty($opts['csv']))   { echo cps_render_csv($rows, $sqlCols); }
 else {
     echo cps_render_table($rows, $cols);
     fwrite(STDERR, sprintf("\n%d row(s)%s\n", count($rows),
-        $sweepId !== null && $report !== 'error-trend' && $report !== 'sweeps' ? " (sweep #$sweepId)" : ''));
+        $sweepId !== null && !in_array($report, ['error-trend', 'sweeps', 'switch-captures'], true) ? " (sweep #$sweepId)" : ''));
 }
 
 /**
@@ -229,6 +239,33 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
                     ORDER BY x.errors_delta DESC, x.device_name';
             return [$sql, $params, ['device_name', 'switch_name', 'switch_port', 'port',
                 'prev_errors_total', 'errors_total', 'errors_delta', 'times_grown', 'total_growth']];
+
+        case 'switch-mismatch':
+        case 'switch-compare':
+            $sql = 'SELECT device_name, description, ip_address, switch_name, switch_port,
+                           switch_if, switch_if_name, switch_status, switch_vlan,
+                           phone_speed_mbps, phone_duplex, switch_speed, switch_duplex,
+                           result, captured_at, started_at
+                    FROM ' . ($report === 'switch-mismatch' ? 'v_switch_port_mismatch' : 'v_switch_port_compare')
+                 . ' WHERE 1=1';
+            if ($sweepId !== null) { $sql .= ' AND sweep_id = ?'; $params[] = $sweepId; }
+            if ($report === 'switch-compare' && isset($opts['result']) && is_string($opts['result'])) {
+                $sql .= ' AND result = ?';
+                $params[] = $opts['result'];
+            }
+            $sql .= ' ORDER BY result, switch_name, switch_port, device_name';
+            return [$sql, $params, ['device_name', 'switch_name', 'switch_port', 'switch_status',
+                'phone_speed_mbps', 'phone_duplex', 'switch_speed', 'switch_duplex', 'result']];
+
+        case 'switch-captures':
+            $sql = 'SELECT c.id, c.switch_name, c.switch_ip, c.source_file, c.captured_at, c.imported_at,
+                           c.ports_parsed, c.lines_unparsed,
+                           (l.id IS NOT NULL) AS is_latest
+                    FROM switch_captures c
+                    LEFT JOIN v_switch_latest_capture l ON l.id = c.id
+                    ORDER BY c.switch_key, c.captured_at DESC, c.id DESC';
+            return [$sql, [], ['id', 'switch_name', 'captured_at', 'ports_parsed', 'lines_unparsed',
+                'is_latest', 'source_file']];
 
         case 'phones':
             $sql = 'SELECT device_name, mac_address, description, model, dir_number,

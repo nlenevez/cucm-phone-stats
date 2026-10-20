@@ -111,6 +111,26 @@ const REPORTS = [
                   WHERE x.rn = 1
                   ORDER BY x.errors_delta DESC, x.device_name',
     ],
+    'switch-mismatch' => [
+        'title' => 'Switch mismatch',
+        'blurb' => 'Phones whose network port speed or duplex differs from the switch port, per the newest imported show interface status of that switch.',
+        'view'  => 'v_switch_port_mismatch',
+        'sweep_scoped' => true,
+        'columns' => [
+            'device_name' => 'Device', 'description' => 'Description', 'ip_address' => 'IP',
+            'switch_name' => 'Switch', 'switch_if' => 'Interface', 'switch_if_name' => 'Port name',
+            'switch_vlan' => 'VLAN',
+            'phone_speed_mbps' => 'Phone Mbps', 'phone_duplex' => 'Phone duplex',
+            'switch_speed' => 'Switch speed', 'switch_duplex' => 'Switch duplex',
+            'result' => 'Mismatch', 'captured_at' => 'Captured',
+        ],
+        'numeric' => ['phone_speed_mbps'],
+        'sql' => 'SELECT device_name, description, ip_address, switch_name, switch_if, switch_if_name,
+                         switch_vlan, phone_speed_mbps, phone_duplex, switch_speed, switch_duplex,
+                         result, captured_at
+                  FROM v_switch_port_mismatch WHERE sweep_id = :sweep
+                  ORDER BY switch_name, switch_if, device_name',
+    ],
 ];
 
 const ROW_CAP = 20000;   
@@ -126,6 +146,7 @@ $rows   = [];
 $tabCounts = [];
 $sweeps = [];
 $sweepId = null;
+$coverage = [];
 
 try {
     $pdo = new PDO(
@@ -166,6 +187,17 @@ try {
         $tabCounts['error-trend'] = (int)$pdo->query(
             'SELECT COUNT(*) FROM (SELECT phone_id, port FROM v_port_error_deltas
                                    WHERE errors_delta > 0 GROUP BY phone_id, port) c')->fetchColumn();
+        try {
+            $tabCounts['switch-mismatch'] = (int)$pdo->query(
+                'SELECT COUNT(*) FROM v_switch_port_mismatch WHERE sweep_id = ' . (int)$sweepId)->fetchColumn();
+            if ($report === 'switch-mismatch') {
+                $coverage = $pdo->query(
+                    'SELECT result, COUNT(*) AS n FROM v_switch_port_compare WHERE sweep_id = ' . (int)$sweepId
+                    . ' GROUP BY result ORDER BY n DESC')->fetchAll(PDO::FETCH_KEY_PAIR);
+            }
+        } catch (Throwable $e) {
+            if ($report === 'switch-mismatch') { throw new RuntimeException($e->getMessage() . ' - re-run bin/cucm-initdb.php', 0, $e); }
+        }
     }
 } catch (Throwable $e) {
     $error = $e->getMessage();
@@ -342,6 +374,11 @@ try {
   <div class="err"><strong>Cannot show reports.</strong><br><?= h($error) ?></div>
 <?php else: ?>
   <p class="blurb"><?= h($spec['blurb']) ?></p>
+  <?php if ($coverage): ?>
+    <p class="blurb">Uplinks compared:
+      <?php foreach ($coverage as $res => $n): ?><span class="count"><?= h((string)$res) ?> <?= (int)$n ?></span> <?php endforeach; ?>
+    </p>
+  <?php endif; ?>
   <div class="bar">
     <input type="search" id="q" placeholder="Search any column - device, switch, port, description..." autofocus>
     <?php if ($spec['sweep_scoped']): ?>

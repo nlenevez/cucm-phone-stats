@@ -643,6 +643,36 @@ foreach (['speed-mismatch', 'error-trend'] as $rep) {
        str_contains($h, 'switch_name') && str_contains($h, 'switch_port'), $h);
 }
 
+section('report: phone network port against show interface status');
+// CDP says "GigabitEthernet1/0/12"; the switch prints "Gi1/0/12". The
+// second switch is named only by its file, with a domain the CDP name lacks.
+$swDir = sys_get_temp_dir() . '/cps-switch-outputs';
+@mkdir($swDir);
+array_map('unlink', glob("$swDir/*") ?: []);
+$hdr = "Port         Name               Status       Vlan       Duplex  Speed Type\n";
+file_put_contents("$swDir/capture.log", "sw-access-01#show interface status\n\n$hdr"
+    . "Gi1/0/11                        notconnect   20           auto   auto 10/100/1000BaseTX\n"
+    . "Gi1/0/12     Desk 12 phone      connected    20         a-full  a-100 10/100/1000BaseTX\n"
+    . "sw-access-01#\n");
+file_put_contents("$swDir/sw-access-02.example.local.txt", $hdr
+    . "Gi1/0/7                         connected    30         a-half  a-100 10/100/1000BaseTX\n");
+$r = run("$php $root/bin/cucm-switch-import.php --config $C $swDir");
+ok('switch import exits 0', $r['rc'] === 0, $r['err'] . $r['out']);
+$r = run("$php $root/bin/cucm-report.php switch-compare --config $C --json");
+$cmp = [];
+foreach (json_decode($r['out'], true) ?: [] as $x) { $cmp[$x['device_name']] = $x['result']; }
+eq('401 agrees with the switch (100/full)', $cmp['SEP001122334401'] ?? null, 'match');
+eq('402 runs 1000 where the switch says 100', $cmp['SEP001122334402'] ?? null, 'speed');
+eq('403 full where the switch says a-half', $cmp['SEP001122334403'] ?? null, 'duplex');
+eq('404 is on a switch not imported', $cmp['SEP001122334404'] ?? null, 'no-capture');
+$r = run("$php $root/bin/cucm-report.php switch-mismatch --config $C --json");
+$mmSw = array_column(json_decode($r['out'], true) ?: [], 'device_name');
+sort($mmSw);
+eq('switch-mismatch lists exactly the two', $mmSw, ['SEP001122334402', 'SEP001122334403']);
+run("$php $root/bin/cucm-switch-import.php --config $C $swDir");
+eq('re-importing the same output stores nothing new',
+   (int)$db->query('SELECT COUNT(*) c FROM switch_captures')[0]['c'], 2);
+
 section('report: labels tells us what the phones actually send');
 $r = run("$php $root/bin/cucm-report.php labels --config $C --grep neighbor --json");
 $lb = json_decode($r['out'], true) ?: [];

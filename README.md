@@ -128,6 +128,7 @@ php bin/cucm-report.php error-trend
 | `bin/cucm-phones.php` | Lists registered phones and their IPs. `--json`, `--csv`, `--table`. |
 | `bin/cucm-sweep.php` | The whole job: discover → poll every phone → store. `--sample N` for a small batch. |
 | `bin/cucm-phone-netstats.php` | One phone by IP. Successor to `patching-tools/cisco-phone-netstats.php`. |
+| `bin/cucm-switch-import.php` | Loads `show interface status` captures (a file or a folder) for the switch-side comparison. `--dry-run` parses without a database. |
 | `bin/cucm-report.php` | The reports, over one sweep or all of them. |
 | `bin/cucm-initdb.php` | Creates/updates tables and views. Safe to re-run. |
 
@@ -395,6 +396,63 @@ naive delta goes sharply negative on every reboot. A drop is reported as
 appear to be "improving". `--include-resets` shows the reset rows too, which
 is what you want when a phone keeps clearing its counters and you are working
 out why. `--since YYYY-MM-DD` bounds the window.
+
+**`switch-mismatch`** — phones whose **network** port speed/duplex differs
+from what the switch itself reports in `show interface status`.
+
+```
+device_name      switch_name   switch_port            phone_speed_mbps  phone_duplex  switch_speed  switch_duplex  result
+SEP001122334402  sw-access-01  GigabitEthernet1/0/12  1000              full          a-100         a-full         speed
+SEP001122334403  sw-access-02  GigabitEthernet1/0/7   100               full          a-100         a-half         duplex
+```
+
+Load the captures first, then report:
+
+```bash
+php bin/cucm-switch-import.php switch-outputs/     # one file per switch
+php bin/cucm-report.php switch-mismatch
+php bin/cucm-report.php switch-compare --result no-port   # what did not match, and why
+php bin/cucm-report.php switch-captures
+```
+
+- **Switch name**: a `HOST#show interface status` prompt in the file if
+  there is one, otherwise the file name minus `.txt/.log/.out/.json`. Matched
+  case-insensitively with the domain and any `(serial)` stripped, so CDP's
+  `sw01.corp.local` matches `SW01`. A file named by IP matches the CDP
+  management address instead.
+- **Interface**: CDP's `GigabitEthernet1/0/12` and the switch's `Gi1/0/12`
+  both reduce to `gi1/0/12` (likewise Fa, Te, Tw, Twe, Fi, Fo, Hu, Ap, Po, Eth).
+- Each phone is compared against the **newest** capture of its switch.
+  `captured_at` is the file's mtime (tar preserves it) unless
+  `--captured-at` is given.
+- Identical output re-imported is not stored twice. A file with no interface
+  rows is refused rather than stored, so it cannot hide the last good capture.
+- `switch-compare` shows every uplink with a `result`: `match`, `speed`,
+  `duplex`, `speed+duplex`, or why no comparison was possible —
+  `no-capture`, `no-port`, `switch-not-connected`, `phone-link-down`,
+  `unknown` (a side reported no speed/duplex). The web page has the same as
+  a "Switch mismatch" tab, with these counts above the table.
+
+The raw output is kept in `switch_captures.raw_output`, so a misparse can be
+fixed and re-read without going back to the switches. Plain text, or an
+Ansible registered result saved as JSON (`stdout` / `stdout_lines`), both
+load. A minimal playbook:
+
+```yaml
+- hosts: switches
+  gather_facts: false
+  tasks:
+    - cisco.ios.ios_command:
+        commands: show interface status
+      register: st
+    - ansible.builtin.copy:
+        content: "{{ st.stdout[0] }}\n"
+        dest: "switch-outputs/{{ inventory_hostname }}.txt"
+      delegate_to: localhost
+```
+
+Name the inventory hosts as CDP reports them (the switch hostname). If they
+are IPs, the CDP management address is used to match instead.
 
 ## Schema
 

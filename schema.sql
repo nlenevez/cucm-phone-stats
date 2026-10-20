@@ -7,6 +7,9 @@
 --   port_stats    per sweep, per port: normalised link state + counters
 --   page_fetches  per sweep, per adapter: the verbatim label/value pairs and
 --                 every failure, including the ones that produced no stats
+--   uplinks       per sweep: the switch and port the phone reports (CDP/LLDP)
+--   switch_captures / switch_ports
+--                 imported "show interface status" output, raw and parsed
 --
 -- The trend views use window functions (LAG, and a named WINDOW clause), so
 -- the floor is MySQL 8.0 or MariaDB 10.2. Verified on MySQL 8.0.46 and
@@ -180,6 +183,55 @@ CREATE TABLE IF NOT EXISTS uplinks (
   CONSTRAINT fk_up_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- "show interface status" captures, one row per switch per distinct output.
+--
+-- The raw text is kept beside the parsed rows for the same reason
+-- page_fetches keeps raw pairs: a column the parser misreads can be
+-- re-read later without going back to the switches. Re-importing identical
+-- output only moves captured_at forward (unique on switch + content hash).
+CREATE TABLE IF NOT EXISTS switch_captures (
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  switch_name    VARCHAR(255)    NOT NULL,
+  -- lowercased, domain and "(serial)" stripped; matched against
+  -- v_uplink_keys.switch_key. An IPv4 name is kept whole and also set as
+  -- switch_ip, for inventories that name switches by address.
+  switch_key     VARCHAR(255)    NOT NULL,
+  switch_ip      VARCHAR(45)     NULL,
+  source_file    VARCHAR(512)    NULL,
+  captured_at    DATETIME        NOT NULL,
+  imported_at    DATETIME        NOT NULL,
+  content_sha256 CHAR(64)        NOT NULL,
+  ports_parsed   INT UNSIGNED    NOT NULL DEFAULT 0,
+  lines_unparsed INT UNSIGNED    NOT NULL DEFAULT 0,
+  raw_output     MEDIUMTEXT      NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_sc_switch_content (switch_key, content_sha256),
+  KEY idx_sc_switch_time (switch_key, captured_at),
+  KEY idx_sc_ip (switch_ip)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS switch_ports (
+  id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  capture_id   BIGINT UNSIGNED NOT NULL,
+  port         VARCHAR(64)     NOT NULL,
+  -- "Gi1/0/12" -> "gi1/0/12"; CDP's "GigabitEthernet1/0/12" reduces to the
+  -- same key in v_uplink_keys.
+  port_key     VARCHAR(64)     NOT NULL,
+  name         VARCHAR(64)     NULL,
+  status       VARCHAR(32)     NULL,
+  vlan         VARCHAR(32)     NULL,
+  duplex_raw   VARCHAR(16)     NULL,
+  speed_raw    VARCHAR(16)     NULL,
+  port_type    VARCHAR(64)     NULL,
+  duplex       ENUM('full','half') NULL,
+  speed_mbps   INT UNSIGNED    NULL,
+  duplex_auto  TINYINT         NOT NULL DEFAULT 0,
+  speed_auto   TINYINT         NOT NULL DEFAULT 0,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_sp_capture_port (capture_id, port_key),
+  CONSTRAINT fk_sp_capture FOREIGN KEY (capture_id) REFERENCES switch_captures (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- CUCM's model enum to its name, mirrored from the cluster's typemodel
 -- table. RisPort reports a model as a number; the mapping is version
 -- specific and hundreds of rows, so it is read from the cluster rather than
@@ -308,3 +360,119 @@ WINDOW w AS (PARTITION BY ps.phone_id, ps.port ORDER BY s.started_at, s.id);
 -- REPORT 3: ports whose error counters actually grew between two sweeps.
 CREATE OR REPLACE VIEW v_port_errors_increasing AS
 SELECT * FROM v_port_error_deltas WHERE errors_delta > 0;
+
+-- ---------------------------------------------------------------------------
+-- Switch-side comparison
+-- ---------------------------------------------------------------------------
+
+-- uplinks with the keys it is matched on. MUST agree with cps_switch_key()
+-- and cps_if_key() in lib/switch.php: CDP reports "sw01.corp.local" /
+-- "GigabitEthernet1/0/12" where the switch prints "SW01" / "Gi1/0/12".
+CREATE OR REPLACE VIEW v_uplink_keys AS
+SELECT
+  k.id, k.sweep_id, k.phone_id, k.switch_name, k.switch_port, k.switch_ip,
+  k.neighbour_source, k.switch_key,
+  CONCAT(
+    CASE
+      WHEN k.pfx LIKE 'twe%' THEN 'twe'
+      WHEN k.pfx LIKE 'tw%'  THEN 'tw'
+      WHEN k.pfx LIKE 'te%'  THEN 'te'
+      WHEN k.pfx LIKE 'gi%'  THEN 'gi'
+      WHEN k.pfx LIKE 'fa%'  THEN 'fa'
+      WHEN k.pfx LIKE 'fi%'  THEN 'fi'
+      WHEN k.pfx LIKE 'fo%'  THEN 'fo'
+      WHEN k.pfx LIKE 'hu%'  THEN 'hu'
+      WHEN k.pfx LIKE 'ap%'  THEN 'ap'
+      WHEN k.pfx LIKE 'po%'  THEN 'po'
+      WHEN k.pfx LIKE 'et%'  THEN 'et'
+      WHEN k.pfx LIKE 'vl%'  THEN 'vl'
+      ELSE k.pfx
+    END,
+    SUBSTRING(k.v, CHAR_LENGTH(k.pfx) + 1)
+  ) AS port_key
+FROM (
+  SELECT u.*,
+         LOWER(REPLACE(u.switch_port, ' ', '')) AS v,
+         REGEXP_REPLACE(LOWER(REPLACE(u.switch_port, ' ', '')), '[0-9].*$', '') AS pfx,
+         CASE
+           WHEN TRIM(u.switch_name) REGEXP '^[0-9]+([.][0-9]+){3}$' THEN TRIM(u.switch_name)
+           ELSE LOWER(TRIM(SUBSTRING_INDEX(SUBSTRING_INDEX(u.switch_name, '(', 1), '.', 1)))
+         END AS switch_key
+  FROM uplinks u
+  WHERE u.switch_name IS NOT NULL AND u.switch_port IS NOT NULL
+) k;
+
+-- The newest capture of each switch.
+CREATE OR REPLACE VIEW v_switch_latest_capture AS
+SELECT id, switch_name, switch_key, switch_ip, source_file, captured_at, ports_parsed
+FROM (
+  SELECT c.*, ROW_NUMBER() OVER (PARTITION BY c.switch_key ORDER BY c.captured_at DESC, c.id DESC) AS rn
+  FROM switch_captures c
+) x
+WHERE x.rn = 1;
+
+-- REPORT 4 (base): every phone uplink against the switch's own view of the
+-- port, from the newest capture of that switch.
+--
+-- The phone's NETWORK port is the switch-facing side (ethernet as fallback
+-- for handsets that only expose that page). result is one of:
+--   match | speed | duplex | speed+duplex      the comparison itself
+--   no-capture            switch not imported (matched by name, then by IP)
+--   no-port               switch imported, but the port is not in its output
+--   switch-not-connected  switch says the port is not up
+--   phone-link-down       phone does not report its network port up
+--   unknown               a side gave no usable speed or duplex
+CREATE OR REPLACE VIEW v_switch_port_compare AS
+SELECT
+  u.sweep_id,
+  s.started_at,
+  p.id                AS phone_id,
+  p.device_name,
+  p.description,
+  p.model,
+  r.ip_address,
+  u.switch_name,
+  u.switch_port,
+  u.neighbour_source,
+  COALESCE(n.link_up, e.link_up)       AS phone_link_up,
+  COALESCE(n.speed_mbps, e.speed_mbps) AS phone_speed_mbps,
+  COALESCE(n.duplex, e.duplex)         AS phone_duplex,
+  COALESCE(cn.id, ci.id)               AS capture_id,
+  COALESCE(cn.captured_at, ci.captured_at) AS captured_at,
+  sp.port             AS switch_if,
+  sp.name             AS switch_if_name,
+  sp.status           AS switch_status,
+  sp.vlan             AS switch_vlan,
+  sp.speed_raw        AS switch_speed,
+  sp.duplex_raw       AS switch_duplex,
+  sp.speed_mbps       AS switch_speed_mbps,
+  sp.duplex           AS switch_duplex_norm,
+  sp.speed_auto       AS switch_speed_auto,
+  sp.duplex_auto      AS switch_duplex_auto,
+  CASE
+    WHEN cn.id IS NULL AND ci.id IS NULL THEN 'no-capture'
+    WHEN sp.id IS NULL                   THEN 'no-port'
+    WHEN sp.status <> 'connected'        THEN 'switch-not-connected'
+    WHEN NOT (COALESCE(n.link_up, e.link_up) <=> 1) THEN 'phone-link-down'
+    WHEN sp.speed_mbps IS NULL OR sp.duplex IS NULL
+      OR COALESCE(n.speed_mbps, e.speed_mbps) IS NULL
+      OR COALESCE(n.duplex, e.duplex) IS NULL THEN 'unknown'
+    WHEN sp.speed_mbps <> COALESCE(n.speed_mbps, e.speed_mbps)
+     AND sp.duplex     <> COALESCE(n.duplex, e.duplex)      THEN 'speed+duplex'
+    WHEN sp.speed_mbps <> COALESCE(n.speed_mbps, e.speed_mbps) THEN 'speed'
+    WHEN sp.duplex     <> COALESCE(n.duplex, e.duplex)      THEN 'duplex'
+    ELSE 'match'
+  END AS result
+FROM v_uplink_keys u
+JOIN phones p ON p.id = u.phone_id
+JOIN sweeps s ON s.id = u.sweep_id
+LEFT JOIN registrations r ON r.sweep_id = u.sweep_id AND r.phone_id = u.phone_id
+LEFT JOIN port_stats n ON n.sweep_id = u.sweep_id AND n.phone_id = u.phone_id AND n.port = 'network'
+LEFT JOIN port_stats e ON e.sweep_id = u.sweep_id AND e.phone_id = u.phone_id AND e.port = 'ethernet'
+LEFT JOIN v_switch_latest_capture cn ON cn.switch_key = u.switch_key
+LEFT JOIN v_switch_latest_capture ci ON cn.id IS NULL AND ci.switch_ip IS NOT NULL AND ci.switch_ip = u.switch_ip
+LEFT JOIN switch_ports sp ON sp.capture_id = COALESCE(cn.id, ci.id) AND sp.port_key = u.port_key;
+
+-- REPORT 4: the switch and the phone disagree on speed or duplex.
+CREATE OR REPLACE VIEW v_switch_port_mismatch AS
+SELECT * FROM v_switch_port_compare WHERE result IN ('speed', 'duplex', 'speed+duplex');

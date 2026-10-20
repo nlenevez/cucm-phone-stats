@@ -7,6 +7,17 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
 
 ### Added
 
+**Switch-side speed/duplex check**
+- `bin/cucm-switch-import.php` loads Catalyst `show interface status`
+  captures (a folder of per-switch files, e.g. from an Ansible playbook) into
+  `switch_captures` (raw text kept) and `switch_ports` (parsed).
+- `v_switch_port_compare` / `v_switch_port_mismatch` match each phone's
+  CDP/LLDP switch and port to the newest capture of that switch. Names are
+  normalised on both sides (`GigabitEthernet1/0/12` = `Gi1/0/12`,
+  `sw01.corp.local` = `SW01`) and the phone's network-port speed/duplex is
+  compared with the switch's. Reports `switch-mismatch`, `switch-compare`,
+  `switch-captures`; web tab "Switch mismatch".
+
 **Core**
 - AXL client (`lib/axl.php`): schema-version negotiation, `executeSQLQuery`,
   paged `listPhone` with a row cap, `RegistrationDynamic` fallback query.

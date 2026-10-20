@@ -12,6 +12,7 @@
 
 require_once __DIR__ . '/util.php';
 require_once __DIR__ . '/phone.php';
+require_once __DIR__ . '/switch.php';
 
 /** Counter columns written to port_stats, in schema order. */
 const CPS_PORT_COLUMNS = [
@@ -405,6 +406,73 @@ class CpsDb
             $page['error'] ?? null,
             isset($page['pairs']) ? json_encode($page['pairs'], JSON_UNESCAPED_SLASHES) : null,
         ]);
+    }
+
+    /**
+     * Store one switch's "show interface status" output and its parsed rows.
+     *
+     * Identical output for the same switch is not stored twice: it only
+     * moves captured_at forward, since a re-run that saw the same thing is
+     * still fresher evidence. One transaction per capture, so a failure
+     * never leaves a capture with half its ports.
+     *
+     * $capturedAt is a unix time (a file mtime) or a DATETIME string. The
+     * conversion is done by MySQL, so it lands in the same zone as every
+     * NOW() in this schema even when the CLI's PHP zone differs.
+     *
+     * @return array{id:int, status:string} status is 'new' or 'unchanged'
+     */
+    public function importSwitchCapture(string $switchName, string $raw, array $parsed,
+                                        ?string $sourceFile, int|string $capturedAt): array
+    {
+        $key = cps_switch_key($switchName);
+        $sha = hash('sha256', $raw);
+        $ip  = filter_var($key, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) ? $key : null;
+
+        $at = is_int($capturedAt) ? 'FROM_UNIXTIME(?)' : 'CAST(? AS DATETIME)';
+
+        $have = $this->query('SELECT id FROM switch_captures WHERE switch_key = ? AND content_sha256 = ?', [$key, $sha]);
+        if ($have) {
+            $id = (int)$have[0]['id'];
+            $this->pdo->prepare("UPDATE switch_captures SET captured_at = GREATEST(captured_at, $at), imported_at = NOW()
+                                 WHERE id = ?")->execute([$capturedAt, $id]);
+            return ['id' => $id, 'status' => 'unchanged'];
+        }
+
+        $this->begin();
+        try {
+            $row = $this->clipRow('switch_captures', [
+                'switch_name' => $switchName, 'switch_key' => $key, 'switch_ip' => $ip,
+                'source_file' => $sourceFile, 'content_sha256' => $sha,
+                'ports_parsed' => count($parsed['ports']), 'lines_unparsed' => $parsed['unparsed'],
+                'raw_output' => $raw,
+            ]);
+            $this->pdo->prepare(
+                "INSERT INTO switch_captures (switch_name, switch_key, switch_ip, source_file,
+                   content_sha256, ports_parsed, lines_unparsed, raw_output, captured_at, imported_at)
+                 VALUES (?,?,?,?,?,?,?,?, $at, NOW())"
+            )->execute([...array_values($row), $capturedAt]);
+            $id = (int)$this->pdo->lastInsertId();
+
+            $cols = ['port', 'port_key', 'name', 'status', 'vlan', 'duplex_raw', 'speed_raw', 'port_type',
+                     'duplex', 'speed_mbps', 'duplex_auto', 'speed_auto'];
+            // A port listed twice (paged output captured with a repeat) keeps
+            // its last appearance rather than failing the whole capture.
+            $st = $this->pdo->prepare(
+                'INSERT INTO switch_ports (capture_id, ' . implode(',', $cols) . ')
+                 VALUES (?' . str_repeat(',?', count($cols)) . ')
+                 ON DUPLICATE KEY UPDATE ' . implode(', ', array_map(fn($c) => "$c = VALUES($c)", $cols))
+            );
+            foreach ($parsed['ports'] as $p) {
+                $p = $this->clipRow('switch_ports', array_intersect_key($p, array_flip($cols)));
+                $st->execute(array_merge([$id], array_map(fn($c) => $p[$c] ?? null, $cols)));
+            }
+            $this->commit();
+        } catch (Throwable $e) {
+            $this->rollback();
+            throw $e;
+        }
+        return ['id' => $id, 'status' => 'new'];
     }
 
     public function begin(): void  { $this->pdo->beginTransaction(); }
