@@ -376,6 +376,7 @@ $dbName = getenv('CPS_TEST_DB_NAME') ?: 'cucm_phone_stats_test';
 
 $root = dirname(__DIR__);
 @unlink(__DIR__ . '/.mock-generation');
+@unlink(__DIR__ . '/.mock-cpp');
 
 section("integration: starting mock CUCM on 127.0.0.1:$port");
 $desc = [1 => ['file', '/tmp/cps-mock.log', 'a'], 2 => ['file', '/tmp/cps-mock.log', 'a']];
@@ -579,6 +580,12 @@ ok('unmapped label preserved in raw JSON',
 eq('unmapped_labels counted',
    (int)$db->query("SELECT unmapped_labels u FROM port_stats ps JOIN phones p ON p.id = ps.phone_id
                     WHERE p.device_name = 'SEP001122334404' AND ps.port = 'network'")[0]['u'], 1);
+
+$cpp = array_column($db->query('SELECT p.device_name, pc.common_phone_profile_uuid AS u, pc.common_phone_profile_name AS n
+                                 FROM phone_config pc JOIN phones p ON p.id = pc.phone_id'), null, 'device_name');
+eq('common phone profile stored for every phone', count($cpp), 7);
+eq('its uuid, uppercased as AXL gives it', $cpp['SEP001122334403']['u'] ?? null, 'AC243D17-98B4-4118-8FEB-5FF2E1B781AC');
+eq('and its name', $cpp['SEP001122334403']['n'] ?? null, 'Warehouse CPP');
 
 // ------------------------------------------------------------------ reports
 section('integration: model names are mirrored and backfilled');
@@ -788,6 +795,30 @@ $op = json_decode($r['out'], true);
 ok('problems sweep exits 0', $r['rc'] === 0, $r['err']);
 eq('polls exactly the flagged phones', (int)($op['polled'] ?? -1), count($flagged));
 ok('and fewer than the estate', count($flagged) > 0 && count($flagged) < 7, implode(',', $flagged));
+
+section('integration: cucm-set-profile moves switch-mismatched phones between profiles');
+$STD = '1F5AE3F8-6F07-4E4B-91C5-1D4B6B1B0A01';
+$FIX = '5B0C9E2A-3D4F-4A61-9C7E-2F8D1A6B4C90';
+$liveCpp = function (string $dev) use ($port): string {
+    $env = '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:ns="http://www.cisco.com/AXL/API/14.0">'
+         . "<soapenv:Body><ns:getPhone><name>$dev</name></ns:getPhone></soapenv:Body></soapenv:Envelope>";
+    $ctx = stream_context_create(['http' => ['method' => 'POST', 'content' => $env,
+        'header' => "Content-Type: text/xml\r\nAuthorization: Basic " . base64_encode('axluser:axlpass')]]);
+    preg_match('/uuid="\{([^}]*)\}"/', (string)@file_get_contents("http://127.0.0.1:$port/axl/", false, $ctx), $m);
+    return $m[1] ?? '';
+};
+$r = run("$php $root/bin/cucm-set-profile.php --config $C --from $STD --to $FIX --json");
+$sp = json_decode($r['out'], true);
+eq('dry run proposes only 402 (403 is on another profile)',
+   array_map(fn($x) => [$x['device_name'], $x['action']], $sp['phones'] ?? []), [['SEP001122334402', 'would change']]);
+eq('and changes nothing', $liveCpp('SEP001122334402'), $STD);
+$r = run("$php $root/bin/cucm-set-profile.php --config $C --from $STD --to $FIX --apply --json");
+$sp = json_decode($r['out'], true);
+ok('--apply exits 0', $r['rc'] === 0, $r['err']);
+eq('402 is now on the new profile', $liveCpp('SEP001122334402'), $FIX);
+$r = run("$php $root/bin/cucm-set-profile.php --config $C --undo " . escapeshellarg((string)($sp['batch'] ?? 'x')) . " --apply");
+ok('--undo exits 0', $r['rc'] === 0, $r['err']);
+eq('and --undo puts it back', $liveCpp('SEP001122334402'), $STD);
 
 // ------------------------------------------- large estate / RisPort cap ---
 section('integration: RisPort response cap and the partitioning fallback');

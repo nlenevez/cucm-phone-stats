@@ -26,6 +26,12 @@ A **403 with credentials that work in the web UI** is the signature of an
 account whose access comes through a group rather than directly. Use a
 dedicated application user for automation and the question does not arise.
 
+Everything except `bin/cucm-set-profile.php` only reads. That script calls
+`updatePhone` (and `applyPhone` with `--apply-config`), so it needs AXL
+write access - **Standard AXL API Access**, not *Standard AXL Read Only API
+Access*. A read-only account fails it with an authorisation fault and
+changes nothing.
+
 ## 2. Services that must be running
 
 - **Cisco AXL Web Service** (Serviceability → Tools → Service Activation) —

@@ -7,6 +7,16 @@ anger — see `docs/airgap-runbook.md` and issue #1 for what remains unproven.
 
 ### Added
 
+**`bin/cucm-set-profile.php --from UUID --to UUID [--apply]`** moves the
+phones in the switch-mismatch report from one Common Phone Profile to
+another over AXL `updatePhone`. Dry run by default; live check of each
+phone's current profile; target verified first; every change logged to
+`profile_changes`, `--undo BATCH` reverts; `--apply-config` sends
+`applyPhone`.
+
+**Common Phone Profile** uuid and name per phone, read over AXL each sweep
+into the new `phone_config` table and shown in the `phones` report.
+
 **`cucm-sweep.php --only-problems [SWEEP]`** re-polls only the phones a
 sweep flagged (speed mismatch, errors, switch mismatch), looking them up in
 RisPort by name instead of enumerating the estate.

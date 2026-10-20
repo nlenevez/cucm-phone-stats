@@ -200,6 +200,69 @@ class CpsAxlClient
         return $maxRows > 0 ? array_slice($out, 0, $maxRows) : $out;
     }
 
+    /**
+     * Each phone's Common Phone Profile, in one query.
+     *
+     * device.fkcommonphoneconfig is the profile's pkid - the same value AXL
+     * gives as the uuid attribute of commonPhoneConfigName - so one SQL call
+     * replaces a getPhone per handset. The uuid is normalised the way
+     * listPhones() does it: uppercase, no braces.
+     *
+     * @return array<string,array{uuid:?string,name:?string}> by device name
+     */
+    public function commonPhoneProfiles(): array
+    {
+        $sql = 'SELECT d.name AS devicename, d.fkcommonphoneconfig AS cppuuid, c.name AS cppname '
+             . 'FROM device d LEFT OUTER JOIN commonphoneconfig c ON c.pkid = d.fkcommonphoneconfig '
+             . 'WHERE d.tkclass = 1';
+        $out = [];
+        foreach ($this->executeSqlQuery($sql) as $row) {
+            $name = $row['devicename'] ?? '';
+            if ($name === '') { continue; }
+            $uuid = strtoupper(trim((string)($row['cppuuid'] ?? ''), '{} '));
+            $out[$name] = ['uuid' => $uuid !== '' ? $uuid : null,
+                           'name' => ($row['cppname'] ?? '') !== '' ? $row['cppname'] : null];
+        }
+        return $out;
+    }
+
+    /** "{ac24...}" / "AC24..." -> "AC24..." (uppercase, no braces), or null if not a uuid. */
+    public static function normUuid(string $u): ?string
+    {
+        $u = strtoupper(trim($u, "{} \t"));
+        return preg_match('/^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/', $u) ? $u : null;
+    }
+
+    /** The phone's current Common Phone Profile uuid, live from the cluster. */
+    public function phoneCommonProfileUuid(string $device): ?string
+    {
+        $ret = $this->call('getPhone', '<name>' . cps_xesc($device) . '</name>'
+                         . '<returnedTags><commonPhoneConfigName/></returnedTags>');
+        $el = cps_xml_first($ret, 'commonPhoneConfigName');
+        return $el === null ? null : self::normUuid($el->getAttribute('uuid'));
+    }
+
+    /** Name of the Common Phone Profile with this uuid; throws if it does not exist. */
+    public function commonPhoneProfileName(string $uuid): string
+    {
+        $ret = $this->call('getCommonPhoneConfig', '<uuid>{' . cps_xesc($uuid) . '}</uuid>'
+                         . '<returnedTags><name/></returnedTags>');
+        return (string)cps_xml_text($ret, 'name', '');
+    }
+
+    /** Point a phone at another Common Phone Profile. Takes effect on Apply Config / reset. */
+    public function setPhoneCommonProfile(string $device, string $uuid): void
+    {
+        $this->call('updatePhone', '<name>' . cps_xesc($device) . '</name>'
+                  . '<commonPhoneConfigName uuid="{' . cps_xesc($uuid) . '}"/>');
+    }
+
+    /** "Apply Config" for one phone, so a changed profile is picked up. */
+    public function applyPhone(string $device): void
+    {
+        $this->call('applyPhone', '<name>' . cps_xesc($device) . '</name>');
+    }
+
     /** Cached enum => model name, so one sweep costs one query. */
     private ?array $modelNames = null;
 

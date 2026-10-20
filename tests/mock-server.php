@@ -24,6 +24,14 @@
  */
 
 const GEN_FILE = __DIR__ . '/.mock-generation';
+// Common Phone Profiles. Assignments live in CPP_FILE so updatePhone is seen
+// by getPhone and the SQL query alike. Deleted at the start of a test run.
+const CPP_FILE = __DIR__ . '/.mock-cpp';
+const CPP_PROFILES = [
+    '1f5ae3f8-6f07-4e4b-91c5-1d4b6b1b0a01' => 'Standard Common Phone Profile',
+    'ac243d17-98b4-4118-8feb-5ff2e1b781ac' => 'Warehouse CPP',
+    '5b0c9e2a-3d4f-4a61-9c7e-2f8d1a6b4c90' => 'Fixed 100 Full CPP',
+];
 const BIG_FILE = __DIR__ . '/.mock-big';
 
 /**
@@ -448,6 +456,8 @@ function axl(string $body): void {
         return;
     }
 
+    if (axl_profile_methods($body)) { return; }
+
     if (str_contains($body, 'executeSQLQuery')) {
         preg_match('#<sql>(.*?)</sql>#s', $body, $m);
         $sql = html_entity_decode($m[1] ?? '');
@@ -484,6 +494,42 @@ function axl(string $body): void {
         return;
     }
     soap_fault('unknown AXL method');
+}
+
+/** Common Phone Profile assignment; see CPP_FILE. */
+function cppOf(string $name): string {
+    $set = is_file(CPP_FILE) ? (json_decode((string)file_get_contents(CPP_FILE), true) ?: []) : [];
+    return $set[$name] ?? ($name === 'SEP001122334403'
+        ? 'ac243d17-98b4-4118-8feb-5ff2e1b781ac' : '1f5ae3f8-6f07-4e4b-91c5-1d4b6b1b0a01');
+}
+function axl_profile_methods(string $body): bool {
+    $uuidIn = fn(string $s) => strtolower(trim($s, '{} '));
+    if (str_contains($body, 'getCommonPhoneConfig>')) {
+        preg_match('#<uuid>([^<]*)</uuid>#', $body, $m);
+        $u = $uuidIn($m[1] ?? '');
+        if (!isset(CPP_PROFILES[$u])) { soap_fault('Item not valid: The specified CommonPhoneConfig was not found', '5007'); return true; }
+        soap_out('<ns:getCommonPhoneConfigResponse xmlns:ns="http://www.cisco.com/AXL/API/14.0"><return>'
+               . '<commonPhoneConfig uuid="{' . strtoupper($u) . '}"><name>' . CPP_PROFILES[$u] . '</name></commonPhoneConfig>'
+               . '</return></ns:getCommonPhoneConfigResponse>');
+        return true;
+    }
+    if (!preg_match('#<ns:(getPhone|updatePhone|applyPhone)>#', $body, $op)) { return false; }
+    preg_match('#<name>([^<]*)</name>#', $body, $n);
+    $name = $n[1] ?? '';
+    if (!isset(estate()[$name])) { soap_fault("Item not valid: The specified $name was not found", '5007'); return true; }
+    if ($op[1] === 'updatePhone') {
+        preg_match('#<commonPhoneConfigName uuid="([^"]*)"#', $body, $m);
+        $u = $uuidIn($m[1] ?? '');
+        if (!isset(CPP_PROFILES[$u])) { soap_fault('Item not valid: CommonPhoneConfig not found', '5007'); return true; }
+        $set = is_file(CPP_FILE) ? (json_decode((string)file_get_contents(CPP_FILE), true) ?: []) : [];
+        $set[$name] = $u;
+        file_put_contents(CPP_FILE, json_encode($set));
+    }
+    $inner = $op[1] === 'getPhone'
+        ? '<phone><commonPhoneConfigName uuid="{' . strtoupper(cppOf($name)) . '}">' . CPP_PROFILES[cppOf($name)] . '</commonPhoneConfigName></phone>'
+        : '{' . strtoupper(md5($name)) . '}';
+    soap_out("<ns:{$op[1]}Response xmlns:ns=\"http://www.cisco.com/AXL/API/14.0\"><return>$inner</return></ns:{$op[1]}Response>");
+    return true;
 }
 
 function axl_sql(string $sql): void {
@@ -523,6 +569,16 @@ function axl_sql(string $sql): void {
         $rows = [];
         foreach (modelTable() as $enum => $name) { $rows[] = ['enum' => (string)$enum, 'name' => $name]; }
         if (preg_match('/select\s+first\s+(\d+)/', $l, $m)) { $rows = array_slice($rows, 0, (int)$m[1]); }
+        soap_out(axl_rows($rows));
+        return;
+    }
+    if (str_contains($l, 'commonphoneconfig')) {
+        // pkids come back lowercase with no braces, as Informix stores them.
+        $rows = [];
+        foreach (estate() as $name => $e) {
+            $u = cppOf($name);
+            $rows[] = ['devicename' => $name, 'cppuuid' => $u, 'cppname' => CPP_PROFILES[$u]];
+        }
         soap_out(axl_rows($rows));
         return;
     }

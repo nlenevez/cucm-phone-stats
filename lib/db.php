@@ -388,6 +388,31 @@ class CpsDb
         ]);
     }
 
+    /**
+     * Store each phone's Common Phone Profile, for phones already in the
+     * inventory. Keyed by phone: it is configuration, updated in place.
+     *
+     * @param array<string,array{uuid:?string,name:?string,server:string}> $profiles
+     */
+    public function upsertPhoneConfig(array $profiles): int
+    {
+        $st = $this->pdo->prepare(
+            'INSERT INTO phone_config (phone_id, common_phone_profile_uuid, common_phone_profile_name, axl_server, updated_at)
+             SELECT id, ?, ?, ?, NOW() FROM phones WHERE device_name = ?
+             ON DUPLICATE KEY UPDATE
+               common_phone_profile_uuid = VALUES(common_phone_profile_uuid),
+               common_phone_profile_name = VALUES(common_phone_profile_name),
+               axl_server = VALUES(axl_server), updated_at = NOW()'
+        );
+        $n = 0;
+        foreach ($profiles as $name => $p) {
+            $row = $this->clipRow('phone_config', ['common_phone_profile_name' => $p['name'], 'axl_server' => $p['server']]);
+            $st->execute([$p['uuid'], $row['common_phone_profile_name'], $row['axl_server'], (string)$name]);
+            $n += $st->rowCount() > 0 ? 1 : 0;
+        }
+        return $n;
+    }
+
     public function insertPageFetch(int $sweepId, int $phoneId, string $adapter, array $page): void
     {
         $st = $this->pdo->prepare(
@@ -521,22 +546,27 @@ class CpsDb
      * non-zero error counter, or a switch-side mismatch. The switch view is
      * optional so this still works before cucm-initdb.php has added it.
      *
+     * @param array<string,int> $counts filled with phones per reason
      * @return string[]
      */
-    public function problemPhones(int $sweepId): array
+    public function problemPhones(int $sweepId, array &$counts = []): array
     {
         $names = [];
         $sources = [
-            'SELECT device_name FROM v_port_speed_mismatch WHERE sweep_id = ?',
-            'SELECT device_name FROM v_port_errors WHERE sweep_id = ?',
-            'SELECT device_name FROM v_switch_port_mismatch WHERE sweep_id = ?',
+            'phone speed mismatch'  => 'SELECT device_name FROM v_port_speed_mismatch WHERE sweep_id = ?',
+            'errors'                => 'SELECT device_name FROM v_port_errors WHERE sweep_id = ?',
+            'switch speed mismatch' => 'SELECT device_name FROM v_switch_port_mismatch WHERE sweep_id = ?',
         ];
-        foreach ($sources as $i => $sql) {
+        foreach ($sources as $why => $sql) {
             try {
-                foreach ($this->query($sql, [$sweepId]) as $r) { $names[$r['device_name']] = true; }
+                $rows = $this->query($sql, [$sweepId]);
             } catch (PDOException $e) {
-                if ($i < 2) { throw $e; }
+                if ($why !== 'switch speed mismatch') { throw $e; }
+                cps_warn('switch mismatches not included (' . $e->getMessage() . ') - re-run bin/cucm-initdb.php');
+                continue;
             }
+            $counts[$why] = count(array_unique(array_column($rows, 'device_name')));
+            foreach ($rows as $r) { $names[$r['device_name']] = true; }
         }
         $out = array_keys($names);
         sort($out);

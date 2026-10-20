@@ -129,8 +129,31 @@ php bin/cucm-report.php error-trend
 | `bin/cucm-sweep.php` | The whole job: discover → poll every phone → store. `--sample N` for a small batch. |
 | `bin/cucm-phone-netstats.php` | One phone by IP. Successor to `patching-tools/cisco-phone-netstats.php`. |
 | `bin/cucm-switch-import.php` | Loads `show interface status` captures (a file or a folder) for the switch-side comparison. `--dry-run` parses without a database. |
+| `bin/cucm-set-profile.php` | **Writes to CUCM**: moves switch-mismatched phones from one Common Phone Profile to another. Dry run unless `--apply`; `--undo BATCH`. |
 | `bin/cucm-report.php` | The reports, over one sweep or all of them. |
 | `bin/cucm-initdb.php` | Creates/updates tables and views. Safe to re-run. |
+
+### Moving switch-mismatched phones to another Common Phone Profile
+
+```bash
+php bin/cucm-set-profile.php --from OLD-UUID --to NEW-UUID            # dry run
+php bin/cucm-set-profile.php --from OLD-UUID --to NEW-UUID --apply    # change
+php bin/cucm-set-profile.php --undo 20261020-153012 --apply           # revert a batch
+```
+
+**The only tool here that writes to CUCM.** Candidates are the phones in
+`switch-mismatch` for the latest sweep (`--sweep N`, `--result speed`,
+`--device NAME,...`, `--limit N` narrow it) whose stored profile is
+`--from`. Before touching anything it checks `--to` exists on that cluster,
+and for each phone asks AXL for the profile it is on **now**; a phone not
+currently on `--from` is skipped. Dry run unless `--apply`, and the dry run
+does the same live checks.
+
+Each change is logged to `profile_changes` under a batch id (printed at the
+end) and `--undo BATCH` reverts it. Phones pick up the new profile on Apply
+Config or reset; `--apply-config` sends AXL `applyPhone` after each update.
+Needs an AXL role with write access (Standard AXL API Access, not the
+read-only role).
 
 ### Re-checking only the problem phones
 
@@ -477,6 +500,15 @@ are IPs, the CDP management address is used to match instead.
 **After upgrading, run `php bin/cucm-initdb.php` before the next sweep.** It
 creates anything new and applies column migrations to an existing database.
 It is idempotent, so running it when nothing has changed costs nothing.
+
+### Common Phone Profile
+
+Each sweep reads every phone's Common Phone Profile over AXL (one
+`executeSQLQuery` per server: `device.fkcommonphoneconfig` joined to
+`commonphoneconfig`) into `phone_config`, one row per phone, updated in
+place. The uuid is uppercase without braces, as AXL's `uuid` attribute
+gives it. Shown in `cucm-report.php phones`; `collect_phone_profiles = 0`
+turns it off. Needs `axl_user`; a failure warns and the sweep carries on.
 
 ### Model names
 

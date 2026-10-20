@@ -232,6 +232,41 @@ CREATE TABLE IF NOT EXISTS switch_ports (
   CONSTRAINT fk_sp_capture FOREIGN KEY (capture_id) REFERENCES switch_captures (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Per-phone CUCM configuration read over AXL. One row per phone, updated in
+-- place each sweep. The uuid is device.fkcommonphoneconfig (= AXL's uuid
+-- attribute), uppercase, no braces.
+CREATE TABLE IF NOT EXISTS phone_config (
+  phone_id                  BIGINT UNSIGNED NOT NULL,
+  common_phone_profile_uuid CHAR(36)        NULL,
+  common_phone_profile_name VARCHAR(128)    NULL,
+  axl_server                VARCHAR(255)    NULL,
+  updated_at                DATETIME        NOT NULL,
+  PRIMARY KEY (phone_id),
+  KEY idx_pc_cpp (common_phone_profile_uuid),
+  CONSTRAINT fk_pc_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Every Common Phone Profile change bin/cucm-set-profile.php made or tried,
+-- by batch, so a batch can be reviewed and undone (--undo BATCH).
+CREATE TABLE IF NOT EXISTS profile_changes (
+  id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  batch        VARCHAR(32)     NOT NULL,
+  phone_id     BIGINT UNSIGNED NOT NULL,
+  device_name  VARCHAR(64)     NOT NULL,
+  from_uuid    CHAR(36)        NOT NULL,
+  to_uuid      CHAR(36)        NOT NULL,
+  axl_server   VARCHAR(255)    NULL,
+  sweep_id     BIGINT UNSIGNED NULL,
+  ok           TINYINT         NOT NULL DEFAULT 0,
+  applied      TINYINT         NOT NULL DEFAULT 0,
+  error        TEXT            NULL,
+  changed_at   DATETIME        NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_pch_batch (batch),
+  KEY idx_pch_phone (phone_id),
+  CONSTRAINT fk_pch_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- CUCM's model enum to its name, mirrored from the cluster's typemodel
 -- table. RisPort reports a model as a number; the mapping is version
 -- specific and hundreds of rows, so it is read from the cluster rather than

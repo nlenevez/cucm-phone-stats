@@ -271,10 +271,13 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
                 'is_latest', 'source_file']];
 
         case 'phones':
-            $sql = 'SELECT device_name, mac_address, description, model, dir_number,
-                           serial_number, last_ip, first_seen, last_seen
-                    FROM phones ORDER BY device_name';
-            return [$sql, [], ['device_name', 'last_ip', 'model', 'dir_number', 'description', 'last_seen']];
+            $sql = 'SELECT p.device_name, p.mac_address, p.description, p.model, p.dir_number,
+                           p.serial_number, p.last_ip, p.first_seen, p.last_seen,
+                           pc.common_phone_profile_name, pc.common_phone_profile_uuid
+                    FROM phones p LEFT JOIN phone_config pc ON pc.phone_id = p.id
+                    ORDER BY p.device_name';
+            return [$sql, [], ['device_name', 'last_ip', 'model', 'dir_number', 'description',
+                'common_phone_profile_name', 'common_phone_profile_uuid', 'last_seen']];
 
         case 'uplinks':
             $sql = 'SELECT p.device_name, p.description, r.ip_address,

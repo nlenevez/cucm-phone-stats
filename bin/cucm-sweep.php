@@ -70,8 +70,10 @@ if (isset($opts['only-problems'])) {
     $pdb  = new CpsDb($cfg);
     $from = is_string($opts['only-problems']) ? (int)$opts['only-problems'] : $pdb->latestSweepId();
     if (!$from) { cps_die('--only-problems needs a completed sweep to start from'); }
-    $problemNames = array_map('strval', $pdb->problemPhones($from));
-    cps_log(count($problemNames) . " phones flagged in sweep #$from");
+    $why = [];
+    $problemNames = array_map('strval', $pdb->problemPhones($from, $why));
+    cps_log(sprintf('%d phones flagged in sweep #%d (%s)', count($problemNames), $from,
+        implode(', ', array_map(fn($k, $v) => "$k $v", array_keys($why), $why))));
     if (!$problemNames) {
         cps_log("nothing to re-check - sweep #$from flagged no phones");
         exit(0);
@@ -323,6 +325,18 @@ foreach ($results as $name => $res) {
     $phoneErrors++;
     cps_warn("$name: skipped after an unexpected error: " . get_class($e) . ': ' . $e->getMessage());
   }
+}
+
+// Common Phone Profile per phone: one AXL SQL query per server, joined to
+// the inventory by name. Context only - a failure warns and the sweep stands.
+if ($db && (string)($cfg['axl_user'] ?? '') !== '' && cps_cfg_bool($cfg, 'collect_phone_profiles', true)) {
+    try {
+        $profiles = cps_common_phone_profiles($cfg);
+        $stored   = $profiles ? $db->upsertPhoneConfig($profiles) : 0;
+        cps_log(sprintf('common phone profile: %d known to AXL, %d stored', count($profiles), $stored));
+    } catch (Throwable $e) {
+        cps_warn('could not store common phone profiles: ' . $e->getMessage());
+    }
 }
 
 $GLOBALS['CPS_SWEEP_FINISHED'] = true;

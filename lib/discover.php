@@ -15,6 +15,32 @@ require_once __DIR__ . '/config.php';
  * @return array<int,array<string,mixed>>
  */
 /**
+ * Common Phone Profile per device name, from every configured server.
+ *
+ * Two clusters each know only their own phones, so each is asked and the
+ * answers merged. A server that fails is warned about and skipped - the
+ * profile is context, never a reason to lose a sweep.
+ *
+ * @return array<string,array{uuid:?string,name:?string,server:string}>
+ */
+function cps_common_phone_profiles(array $cfg): array
+{
+    $out = [];
+    foreach (cps_server_urls($cfg) as $url) {
+        try {
+            foreach (cps_axl_client($cfg, $url)->commonPhoneProfiles() as $name => $p) {
+                if (!isset($out[$name]) || ($out[$name]['uuid'] === null && $p['uuid'] !== null)) {
+                    $out[$name] = $p + ['server' => $url];
+                }
+            }
+        } catch (Throwable $e) {
+            cps_warn("$url: could not read common phone profiles: " . $e->getMessage());
+        }
+    }
+    return $out;
+}
+
+/**
  * Discover only the named phones (--only-problems). RisPort only: the point
  * is to skip enumerating the estate, which is the slow, throttled part.
  */
