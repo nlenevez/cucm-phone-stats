@@ -1,124 +1,76 @@
-; cucm-phone-stats configuration
-;
-; Copy to cucm.conf and edit. Searched for, in order:
-;   ./cucm.conf, <repo>/cucm.conf, ~/.cucm-phone-stats.conf
-; or name one explicitly with --config FILE.
-;
-; Any setting can be overridden from the environment as CPS_<UPPERCASE_KEY>,
-; e.g. CPS_AXL_PASS. Command-line flags beat both.
+; cucm-phone-stats configuration. Copy to cucm.conf and edit.
+; Looked up in ./cucm.conf, <repo>/cucm.conf, ~/.cucm-phone-stats.conf, or --config FILE.
+; Any key can be overridden as CPS_<UPPERCASE_KEY> in the environment; CLI flags win over both.
 
 ; ---------------------------------------------------------------- CUCM ----
-; List the SUBSCRIBERS that phones register to, comma or space separated.
-; A bare hostname gets https:// and cucm_port; a full URL is used as given.
-; Each node reports the whole cluster, but a node whose RIS service is
-; unhealthy contributes nothing and says nothing about it - listing several
-; and letting the tool merge is the cheap insurance.
+; CUCM nodes to query, comma or space separated; bare hostnames get https:// and cucm_port.
 cucm_servers   = cucm-sub1.example.local, cucm-sub2.example.local
 cucm_port      = 8443
 
-; An application user (not an end user) holding "Standard AXL API Access".
-; See docs/cucm-permissions.md.
+; Application user with Standard AXL API Access (see docs/cucm-permissions.md).
 axl_user       = axluser
-; Prefer axl_pass_file or axl_pass_env over an inline password.
+; Password inline, from a file, or from a named environment variable.
 axl_pass       =
 axl_pass_file  =
 axl_pass_env   =
-
-; Leave blank to negotiate automatically (tries 15.0 down to 10.0).
+; AXL schema version; blank negotiates (15.0 down to 10.0).
 axl_version    =
 
-; Store each phone's Common Phone Profile (uuid + name) every sweep: one
-; AXL SQL query per server. 0 to skip.
+; Record each phone's Common Phone Profile every sweep (1/0).
 collect_phone_profiles = 1
 
-; CUCM ships a self-signed certificate unless someone has replaced it.
-; Set verify_tls = 1 and point ca_bundle at the cluster's CA to verify.
+; Verify CUCM's TLS certificate (1/0) against this CA bundle.
 verify_tls     = 0
 ca_bundle      =
 
+; SOAP request timeout, seconds.
 soap_timeout   = 60
-; RisPort is rate limited per user; this is the pause between paged calls.
-; RisPort is rate limited per user, per node, and the budget is shared with
-; anything else querying realtime data as this account. ris_rate_per_min is
-; a sliding window: the allowance is spent as fast as is safe, then it waits.
-; Keep it under the cluster's limit (commonly 15). If you see
-; "Exceeded allowed rate for Realtime information", LOWER this - the tool
-; also backs off and retries such faults automatically.
+; RisPort requests per minute (sliding window); keep below the cluster limit (often 15).
 ris_rate_per_min = 12
+; Retries after a RisPort rate-limit fault.
 ris_rate_retries = 4
-; Optional extra minimum spacing between calls; 0 leaves it to the window.
+; Extra minimum gap between RisPort calls, ms.
 ris_gap_ms     = 0
+; Devices asked for per RisPort query (RisPort maximum 1000).
 ris_max_devices = 1000
-
-; How to enumerate an estate larger than one RisPort response will carry.
-; RisPort caps a single selectCmDevice conversation and does NOT say it has
-; truncated - StateInfo just stops and the short answer looks complete.
-;   auto  (default) one plain query; if it returns fewer devices than
-;                   TotalDevicesFound claims, re-run split by name prefix
-;   off             never split (use only to reproduce the truncation)
-;   <list>          explicit patterns, e.g. "SEP0*,SEP1*,SEP2*"
+; auto = re-query each node if the answer is at the cap; always = always per node; off = one query.
 ris_partitions = auto
 
-; When the cheap strategies are unavailable, ask AXL for the real device
-; names and compute exact partitions from them instead of discovering where
-; the estate divides one expensive query at a time. AXL is not subject to
-; the RisPort throttle. Set to 0 only if listPhone is denied to the account.
-ris_use_axl_names = 1
-
 ; --------------------------------------------------------------- phones ---
-; "{ip}" is replaced with each phone's address. Use http://{ip} if the
-; estate has not enabled HTTPS on the handsets.
+; Phone web base URL; {ip} is replaced with the phone's address.
 phone_url_base = https://{ip}
-; Only needed when Web Access is set to "Authenticated" rather than "Enabled".
+; Phone web credentials, only for Web Access = Authenticated.
 phone_user     =
 phone_pass     =
 phone_pass_file =
 phone_pass_env  =
 
-; Device-name prefixes worth polling. SEP is a hard handset; CSF/TCT/BOT/TAB
-; are Jabber clients, CIPC a softphone, ATA an analog adapter - none of which
-; have a switch or PC port to report on. A Jabber client also registers from
-; the USER'S WORKSTATION, so polling one means an HTTPS request at someone's
-; desk. Blank = poll everything; --all-devices overrides for a single run.
+; Device-name prefixes to poll (SEP = desk phones); blank = all; --all-devices overrides.
 poll_device_prefixes = SEP
 
-; Subnets to leave alone entirely, comma separated CIDR. Applies to both
-; discovery and sweeps. An invalid entry stops the run rather than being
-; ignored, and a prefix matching nothing is reported - a silently dropped
-; exclusion would let the tool poll a subnet you believe is off limits.
-; exclude_subnets = 10.20.0.0/16, 10.30.4.0/24
+; CIDRs never polled, comma separated, e.g. 10.20.0.0/16, 10.30.4.0/24.
 exclude_subnets =
 
-; Schemes bin/cucm-probe.php tries when probing a handset directly.
-; If every phone is HTTPS, set this to "https" - the http attempts do not
-; fail fast, they TIME OUT, costing phone_timeout twice per probe run.
-; This has no effect on collection: sweeps only ever use phone_url_base.
+; Schemes cucm-probe.php tries on a phone; does not affect sweeps.
 phone_probe_schemes = https,http
 
-; Phones in flight at once. Requests roll: as one finishes another starts,
-; so a handset that times out costs only its own latency. Measured on 100
-; phones with one in eight slow: 5 -> 4.6s, 10 -> 3.1s, 20 -> 1.6s, then it
-; plateaus. 20-25 is reasonable for a large estate.
+; Phones polled at once.
 phone_parallel = 10
+; Per-request and connect timeouts, seconds.
 phone_timeout  = 10
 phone_connect_timeout = 5
 
-; Pages to collect. network and access are the two port pages; ethernet is
-; the device-wide counter page; device and config add identity and CDP
-; context. Dropping some makes a large sweep faster.
-adapters       = network,access,ethernet,device
+; Phone pages to fetch; config carries CDP/LLDP for the switch comparison.
+adapters       = network,access,ethernet,device,config
 
 ; ------------------------------------------------------------- database ---
+; Store results in MySQL (1/0).
 db_enabled     = 1
-; localhost makes PDO use the UNIX SOCKET (db_port is ignored); an IP forces
-; TCP. On RHEL that distinction matters: SELinux gates the TCP path behind
-; httpd_can_network_connect_db, so for a database on THIS machine prefer
-; localhost. For one on another host, use its address and set that boolean.
+; localhost uses the UNIX socket (db_port ignored); an IP uses TCP.
 db_host        = localhost
 db_port        = 3306
 db_name        = cucm_phone_stats
-; The RUNTIME account: SELECT, INSERT, UPDATE only. Schema changes are done
-; separately by an account with DDL rights - see "Database setup" in README.md.
+; Runtime account: SELECT, INSERT, UPDATE.
 db_user        = cucm
 db_pass        =
 db_pass_file   =

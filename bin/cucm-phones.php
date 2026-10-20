@@ -6,12 +6,12 @@
  * Usage:
  *   php bin/cucm-phones.php [--config FILE] [--status Registered|UnRegistered|Any]
  *                           [--source risport|axl-sql] [--json|--csv|--table]
- *                           [--with-ip-only] [--verbose]
+ *                           [--with-ip-only] [--exclude-subnet CIDR] [--all-devices]
  *
  * Examples:
  *   php bin/cucm-phones.php --csv > phones.csv
  *   php bin/cucm-phones.php --status Any --json
- *   php bin/cucm-phones.php --source axl-sql        # when RisPort is unavailable
+ *   php bin/cucm-phones.php --source axl-sql        # without RisPort
  */
 
 require_once dirname(__DIR__) . '/lib/config.php';
@@ -21,9 +21,16 @@ $p    = cps_parse_args($argv, ['json', 'csv', 'table', 'verbose', 'quiet', 'debu
 $opts = $p['opts'];
 
 if (!empty($opts['help'])) {
-    fwrite(STDERR, "Usage: php bin/cucm-phones.php [--config FILE] [--status S] [--source risport|axl-sql]\n"
-                 . "       [--json|--csv|--table] [--with-ip-only] [--exclude-subnet CIDR[,CIDR]]\n"
-                 . "       [--device-prefixes SEP] [--all-devices] [--verbose]\n");
+    fwrite(STDERR, "Usage: php bin/cucm-phones.php [options]\n"
+                 . "  --config FILE                 config file\n"
+                 . "  --status S                    Registered (default), UnRegistered or Any\n"
+                 . "  --source risport|axl-sql      discovery source (default risport)\n"
+                 . "  --json | --csv | --table      output format (default table)\n"
+                 . "  --with-ip-only                drop devices without an IP\n"
+                 . "  --exclude-subnet CIDR[,CIDR]  leave these subnets out\n"
+                 . "  --device-prefixes SEP[,CSF]   device name prefixes (default SEP)\n"
+                 . "  --all-devices                 every device type, soft clients included\n"
+                 . "  --verbose                     progress on stderr\n");
     exit(0);
 }
 

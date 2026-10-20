@@ -1,18 +1,13 @@
 <?php
 /**
- * db.php - MySQL persistence for sweeps, phones and port statistics.
- *
- * One sweep is one transaction-per-phone rather than one giant transaction:
- * a sweep of a few thousand handsets takes long enough that holding a single
- * transaction open across all of it turns a mid-run failure into a total
- * loss of the run. Per-phone commits mean an interrupted sweep still leaves
- * usable data, and the sweep row's finished_at (NULL until the end) marks it
- * as partial so the reporting views can exclude it.
+ * db.php - MySQL persistence for sweeps, phones, port stats and switch captures.
+ * Writes are one transaction per phone; finished_at stays NULL on a partial sweep.
  */
 
 require_once __DIR__ . '/util.php';
 require_once __DIR__ . '/phone.php';
 require_once __DIR__ . '/switch.php';
+require_once __DIR__ . '/axl.php';
 
 /** Counter columns written to port_stats, in schema order. */
 const CPS_PORT_COLUMNS = [
@@ -47,15 +42,8 @@ class CpsDb
     public function pdo(): PDO { return $this->pdo; }
 
     /**
-     * Apply schema.sql.
-     *
-     * Comment lines are stripped BEFORE splitting, not after. Splitting
-     * first and then skipping any chunk that begins with "--" throws away
-     * every statement that happens to be preceded by a comment block - which
-     * silently cost this schema its page_fetches table and all five views,
-     * while still reporting success. Statements are separated by ";" at end
-     * of line, which is safe here because the schema has no stored programs
-     * and no semicolons inside string literals.
+     * Apply schema.sql; returns the number of statements run.
+     * Strip "--" lines before splitting on ";" at end of line.
      */
     public function applySchema(string $file): int
     {
@@ -84,15 +72,7 @@ class CpsDb
         return $n;
     }
 
-    /**
-     * Column widths that must be at least this wide, applied on every
-     * initdb run.
-     *
-     * CREATE TABLE IF NOT EXISTS cannot widen a column that already exists,
-     * so a schema change to a live database needs an explicit, idempotent
-     * ALTER. Only widening is ever attempted - narrowing would truncate real
-     * data - and a column already wide enough is left alone.
-     */
+    /** Minimum column widths enforced by migrate(); only ever widens. */
     private const MIN_WIDTHS = [
         ['phones', 'dir_number', 'VARCHAR(512) NULL', 512],
     ];
@@ -134,19 +114,7 @@ class CpsDb
         return $this->widths[$table];
     }
 
-    /**
-     * Clip over-long strings to what the column can hold.
-     *
-     * A single over-long value used to fail the whole INSERT, and because
-     * writes are one transaction per phone that cost the entire handset -
-     * its registration, its port statistics, everything - over one field.
-     * Losing the tail of a field is a far better outcome, and it is
-     * announced rather than silent.
-     *
-     * Driven by the live column widths, so it also covers the fields nobody
-     * predicted would overflow. That is the point: dir_number was widened
-     * because it was the one that broke, but it will not be the last.
-     */
+    /** Clip over-long strings to the live column width, warning once per column. */
     private function clipRow(string $table, array $row): array
     {
         $w = $this->widths($table);
@@ -156,7 +124,7 @@ class CpsDb
             $key = "$table.$col";
             if (!isset($this->clipWarned[$key])) {
                 $this->clipWarned[$key] = true;
-                cps_warn(sprintf('%s: value of %d chars clipped to %d (e.g. "%s") - widen the column if this matters',
+                cps_warn(sprintf('%s: %d chars clipped to %d ("%s")',
                     $key, mb_strlen($v), $w[$col], mb_substr($v, 0, 40)));
             }
             $row[$col] = mb_substr($v, 0, $w[$col]);
@@ -171,7 +139,9 @@ class CpsDb
         $st = $this->pdo->prepare(
             'INSERT INTO sweeps (started_at, source, cucm_servers, tool_version) VALUES (NOW(), ?, ?, ?)'
         );
-        $st->execute([$source, implode(', ', $servers), $toolVersion]);
+        $row = $this->clipRow('sweeps', ['source' => $source, 'cucm_servers' => implode(', ', $servers),
+                                         'tool_version' => $toolVersion]);
+        $st->execute(array_values($row));
         return (int)$this->pdo->lastInsertId();
     }
 
@@ -187,14 +157,7 @@ class CpsDb
         ]);
     }
 
-    /**
-     * Insert or update the inventory row for a device and return its id.
-     *
-     * COALESCE on update so a sweep that could not reach the phone (and so
-     * learned no serial number) does not wipe the serial a previous sweep
-     * did learn. Losing known-good inventory to a failed poll is a quiet,
-     * cumulative kind of damage.
-     */
+    /** Upsert a phone and return its id; empty values never overwrite known ones. */
     public function upsertPhone(array $p): int
     {
         $st = $this->pdo->prepare(
@@ -205,16 +168,16 @@ class CpsDb
              VALUES (?,?,?,?,?,?,?,?,?,?, NOW(), NOW(), ?)
              ON DUPLICATE KEY UPDATE
                mac_address       = COALESCE(VALUES(mac_address), mac_address),
-               description       = COALESCE(NULLIF(VALUES(description),  ""), description),
-               model             = COALESCE(NULLIF(VALUES(model),        ""), model),
-               product           = COALESCE(NULLIF(VALUES(product),      ""), product),
-               device_class      = COALESCE(NULLIF(VALUES(device_class), ""), device_class),
-               dir_number        = COALESCE(NULLIF(VALUES(dir_number),   ""), dir_number),
-               serial_number     = COALESCE(NULLIF(VALUES(serial_number),""), serial_number),
-               model_number      = COALESCE(NULLIF(VALUES(model_number), ""), model_number),
-               hardware_revision = COALESCE(NULLIF(VALUES(hardware_revision), ""), hardware_revision),
+               description       = COALESCE(NULLIF(VALUES(description),  \'\'), description),
+               model             = COALESCE(NULLIF(VALUES(model),        \'\'), model),
+               product           = COALESCE(NULLIF(VALUES(product),      \'\'), product),
+               device_class      = COALESCE(NULLIF(VALUES(device_class), \'\'), device_class),
+               dir_number        = COALESCE(NULLIF(VALUES(dir_number),   \'\'), dir_number),
+               serial_number     = COALESCE(NULLIF(VALUES(serial_number),\'\'), serial_number),
+               model_number      = COALESCE(NULLIF(VALUES(model_number), \'\'), model_number),
+               hardware_revision = COALESCE(NULLIF(VALUES(hardware_revision), \'\'), hardware_revision),
                last_seen         = NOW(),
-               last_ip           = COALESCE(NULLIF(VALUES(last_ip), ""), last_ip),
+               last_ip           = COALESCE(NULLIF(VALUES(last_ip), \'\'), last_ip),
                id                = LAST_INSERT_ID(id)'
         );
         $row = $this->clipRow('phones', [
@@ -261,7 +224,7 @@ class CpsDb
         $st->execute([
             $sweepId, $phoneId,
             $row['ip_address'],
-            isset($r['ip_addresses']) ? json_encode($r['ip_addresses']) : null,
+            isset($r['ip_addresses']) ? (json_encode($r['ip_addresses'], JSON_INVALID_UTF8_SUBSTITUTE) ?: null) : null,
             $row['status'], $row['status_reason'], $row['node_name'], $row['ris_server'],
             $row['protocol'], $row['active_load'], $row['inactive_load'],
             $http, $row['ris_timestamp'], $row['source'],
@@ -303,14 +266,7 @@ class CpsDb
     }
 
     /**
-     * Store what the phone says it is plugged into for this sweep.
-     *
-     * @param array $n       raw cdp_ and lldp_ fields
-     * @param array $summary collapsed switch_name/switch_port/switch_ip/source
-     */
-    /**
      * Mirror the cluster's model-enum table.
-     *
      * @param array<int,string> $names
      */
     public function upsertDeviceModels(array $names): int
@@ -328,13 +284,7 @@ class CpsDb
         return $n;
     }
 
-    /**
-     * Replace numeric models already stored with their names.
-     *
-     * A sweep fixes every phone it sees, but a handset that is not currently
-     * registered would keep its enum indefinitely - so this catches the rest
-     * without needing them to come back online.
-     */
+    /** Replace stored numeric models with their names. */
     public function backfillModelNames(): int
     {
         return (int)$this->pdo->exec(
@@ -344,6 +294,11 @@ class CpsDb
         );
     }
 
+    /**
+     * Store the phone's reported uplink for this sweep.
+     * @param array $n       raw cdp_ and lldp_ fields
+     * @param array $summary collapsed switch_name/switch_port/switch_ip/source
+     */
     public function insertUplink(int $sweepId, int $phoneId, array $n, array $summary): void
     {
         $st = $this->pdo->prepare(
@@ -389,9 +344,7 @@ class CpsDb
     }
 
     /**
-     * Store each phone's Common Phone Profile, for phones already in the
-     * inventory. Keyed by phone: it is configuration, updated in place.
-     *
+     * Upsert each known phone's Common Phone Profile.
      * @param array<string,array{uuid:?string,name:?string,server:string}> $profiles
      */
     public function upsertPhoneConfig(array $profiles): int
@@ -407,7 +360,8 @@ class CpsDb
         $n = 0;
         foreach ($profiles as $name => $p) {
             $row = $this->clipRow('phone_config', ['common_phone_profile_name' => $p['name'], 'axl_server' => $p['server']]);
-            $st->execute([$p['uuid'], $row['common_phone_profile_name'], $row['axl_server'], (string)$name]);
+            $st->execute([CpsAxlClient::normUuid((string)$p['uuid']), $row['common_phone_profile_name'],
+                          $row['axl_server'], (string)$name]);
             $n += $st->rowCount() > 0 ? 1 : 0;
         }
         return $n;
@@ -429,22 +383,13 @@ class CpsDb
             $page['http_code'] ?? null,
             $page['error_kind'] ?? null,
             $page['error'] ?? null,
-            isset($page['pairs']) ? json_encode($page['pairs'], JSON_UNESCAPED_SLASHES) : null,
+            isset($page['pairs']) ? (json_encode($page['pairs'], JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE) ?: null) : null,
         ]);
     }
 
     /**
-     * Store one switch's "show interface status" output and its parsed rows.
-     *
-     * Identical output for the same switch is not stored twice: it only
-     * moves captured_at forward, since a re-run that saw the same thing is
-     * still fresher evidence. One transaction per capture, so a failure
-     * never leaves a capture with half its ports.
-     *
-     * $capturedAt is a unix time (a file mtime) or a DATETIME string. The
-     * conversion is done by MySQL, so it lands in the same zone as every
-     * NOW() in this schema even when the CLI's PHP zone differs.
-     *
+     * Store one switch capture and its ports; identical output only advances captured_at.
+     * $capturedAt (unix time or DATETIME string) is converted by MySQL to match NOW().
      * @return array{id:int, status:string} status is 'new' or 'unchanged'
      */
     public function importSwitchCapture(string $switchName, string $raw, array $parsed,
@@ -481,8 +426,7 @@ class CpsDb
 
             $cols = ['port', 'port_key', 'name', 'status', 'vlan', 'duplex_raw', 'speed_raw', 'port_type',
                      'duplex', 'speed_mbps', 'duplex_auto', 'speed_auto'];
-            // A port listed twice (paged output captured with a repeat) keeps
-            // its last appearance rather than failing the whole capture.
+            // A repeated port keeps its last row.
             $st = $this->pdo->prepare(
                 'INSERT INTO switch_ports (capture_id, ' . implode(',', $cols) . ')
                  VALUES (?' . str_repeat(',?', count($cols)) . ')
@@ -507,14 +451,7 @@ class CpsDb
     }
 
     /**
-     * Run a query and return both the rows and the SELECT's column names.
-     *
-     * The column list comes from the statement rather than from the first
-     * row, so a result with no rows still knows its shape. CSV output needs
-     * that: a report with nothing to say should be a header and no data
-     * rows, not a zero-byte file, which is indistinguishable from the
-     * command having failed.
-     *
+     * Run a query and return its rows and column names (known even with no rows).
      * @return array{rows: array<int,array<string,mixed>>, columns: string[]}
      */
     public function queryWithColumns(string $sql, array $params = []): array
@@ -527,8 +464,7 @@ class CpsDb
             $meta = @$st->getColumnMeta($i);
             if (is_array($meta) && isset($meta['name'])) { $cols[] = (string)$meta['name']; }
         }
-        // Drivers are allowed to refuse metadata; fall back to the keys of
-        // the first row, and to nothing if there is not one.
+        // No driver metadata: fall back to the first row's keys.
         if (!$cols && $rows) { $cols = array_keys($rows[0]); }
         return ['rows' => $rows, 'columns' => $cols];
     }
@@ -542,27 +478,31 @@ class CpsDb
     }
 
     /**
-     * Device names flagged by a sweep: phone speed/duplex mismatch, any
-     * non-zero error counter, or a switch-side mismatch. The switch view is
-     * optional so this still works before cucm-initdb.php has added it.
-     *
+     * Device names flagged by a sweep. $reasons: mismatch, errors, growing,
+     * switch (default all but growing). A missing switch view is skipped.
      * @param array<string,int> $counts filled with phones per reason
      * @return string[]
      */
-    public function problemPhones(int $sweepId, array &$counts = []): array
+    public function problemPhones(int $sweepId, array &$counts = [], ?array $reasons = null, int $minErrors = 1): array
     {
         $names = [];
-        $sources = [
-            'phone speed mismatch'  => 'SELECT device_name FROM v_port_speed_mismatch WHERE sweep_id = ?',
-            'errors'                => 'SELECT device_name FROM v_port_errors WHERE sweep_id = ?',
-            'switch speed mismatch' => 'SELECT device_name FROM v_switch_port_mismatch WHERE sweep_id = ?',
+        $all = [
+            'mismatch' => ['SELECT device_name FROM v_port_speed_mismatch WHERE sweep_id = ?', [$sweepId]],
+            'errors'   => ['SELECT device_name FROM v_port_errors WHERE sweep_id = ? AND errors_total >= ?', [$sweepId, $minErrors]],
+            'growing'  => ['SELECT device_name FROM v_port_errors_increasing WHERE sweep_id = ?', [$sweepId]],
+            'switch'   => ['SELECT device_name FROM v_switch_port_mismatch WHERE sweep_id = ?', [$sweepId]],
         ];
-        foreach ($sources as $why => $sql) {
+        $reasons ??= ['mismatch', 'errors', 'switch'];
+        foreach ($reasons as $why) {
+            if (!isset($all[$why])) {
+                throw new InvalidArgumentException("unknown problem '$why'; known: " . implode(', ', array_keys($all)));
+            }
+            [$sql, $params] = $all[$why];
             try {
-                $rows = $this->query($sql, [$sweepId]);
+                $rows = $this->query($sql, $params);
             } catch (PDOException $e) {
-                if ($why !== 'switch speed mismatch') { throw $e; }
-                cps_warn('switch mismatches not included (' . $e->getMessage() . ') - re-run bin/cucm-initdb.php');
+                if ($why !== 'switch') { throw $e; }
+                cps_warn('switch mismatches skipped, run cucm-initdb.php: ' . $e->getMessage());
                 continue;
             }
             $counts[$why] = count(array_unique(array_column($rows, 'device_name')));

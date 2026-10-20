@@ -1,14 +1,9 @@
 <?php
 /**
- * soap.php - minimal SOAP-over-HTTPS transport for CUCM's AXL and RisPort70.
+ * soap.php - minimal SOAP-over-HTTPS transport for CUCM AXL and RisPort70.
  *
- * Why not PHP's SoapClient: it wants a WSDL, and CUCM's AXL WSDL is not
- * published anywhere - you download AXLAPI.wsdl from the cluster's plugin
- * page and it must match the cluster version. On an airgapped host that is
- * an extra artefact to carry and keep in step with every CUCM upgrade.
- * Hand-built envelopes over curl have no such dependency, and the responses
- * are parsed namespace-blind (see cps_xml_find) so a schema version bump
- * does not break parsing.
+ * Hand-built envelopes over curl (no WSDL needed); responses are parsed
+ * namespace-blind.
  */
 
 require_once __DIR__ . '/util.php';
@@ -96,8 +91,7 @@ class CpsSoapClient
         }
         cps_log("SOAP <- HTTP $code, " . strlen($body) . " bytes", 3);
 
-        // A SOAP Fault arrives as HTTP 500 with a parseable body, so parse
-        // before judging the status code - the fault text is the diagnosis.
+        // Parse before checking the status: faults arrive as HTTP 500.
         $doc = new DOMDocument();
         $ok  = @$doc->loadXML($body);
 
@@ -106,18 +100,13 @@ class CpsSoapClient
             if ($fault !== null) {
                 throw $this->faultFrom($fault, $code);
             }
-            // AXL does not always wrap its errors in a SOAP Fault: a rejected
-            // schema version comes back as HTTP 599 carrying a bare
-            // <axlError>. Treated as a transport failure that ends the
-            // request, it stops version negotiation dead; treated as the
-            // application-level error it is, the next version gets tried.
+            // AXL may return a bare <axlError> (e.g. HTTP 599) without a Fault.
             if (cps_xml_first($doc, 'axlError') !== null || cps_xml_first($doc, 'axlcode') !== null) {
                 throw $this->faultFrom($doc->documentElement ?? $doc, $code);
             }
         }
 
-        // 599 is AXL's own "this request was understood and refused" code.
-        // Whatever the body looks like, it is not a transport problem.
+        // 599: AXL refused the request; an application error, not transport.
         if ($code === 599) {
             $snippet = trim(preg_replace('/\s+/', ' ', strip_tags($body)));
             throw new CpsSoapFault(

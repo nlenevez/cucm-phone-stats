@@ -1,33 +1,19 @@
 #!/usr/bin/env php
 <?php
 /**
- * cucm-switch-import.php - load "show interface status" captures.
+ * cucm-switch-import.php - load "show interface status" captures from files or directories.
  *
  * Usage:
  *   php bin/cucm-switch-import.php [--config FILE] [--switch NAME] [--name-regex RE]
  *       [--captured-at "YYYY-MM-DD HH:MM:SS"] [--dry-run] [--json] PATH...
  *
- * PATH is a file or a directory (every non-hidden file in it). The switch
- * is named by a "HOST#show interface status" prompt in the text if there is
- * one, else by the file name minus .txt/.log/.out/.json - which is what an
- * Ansible playbook writing switch-outputs/<inventory_hostname>.txt gives.
- * A trailing "-status" / "_status" (or "-int-status", "-show-interface-
- * status", ...) is dropped, so HOSTNAME-status.txt names HOSTNAME.
- * --name-regex takes the name from capture group 1 of a pattern matched
- * against the file name instead, e.g. '/^show_(.+)\.txt$/'. --switch
- * overrides both for a single file.
- *
- * The capture time is the file's mtime (tar keeps it across the airgap)
- * unless --captured-at is given. Identical output already imported for a
- * switch is not stored again; its capture time is moved forward.
- *
- * --dry-run parses and prints without touching the database, so a new
- * capture format can be checked on a box with no pdo_mysql.
+ * Switch name: prompt in the text, else file name minus extension and -status suffix.
+ * Capture time: file mtime unless --captured-at.
  *
  * Examples:
  *   php bin/cucm-switch-import.php switch-outputs/
  *   php bin/cucm-switch-import.php --dry-run --json switch-outputs/sw01.txt
- *   php bin/cucm-report.php switch-mismatch
+ *   php bin/cucm-switch-import.php --name-regex '/^show_(.+)\.txt$/' captures/
  */
 
 require_once dirname(__DIR__) . '/lib/config.php';
@@ -36,9 +22,13 @@ require_once dirname(__DIR__) . '/lib/switch.php';
 $p    = cps_parse_args($argv, ['dry-run', 'json', 'verbose', 'quiet', 'debug', 'help']);
 $opts = $p['opts'];
 if (!empty($opts['help']) || !$p['args']) {
-    fwrite(STDERR, "Usage: php bin/cucm-switch-import.php [--config FILE] [--switch NAME]\n"
-                 . "       [--name-regex '/^(.+)-status\\.txt$/'] [--captured-at 'YYYY-MM-DD HH:MM:SS']\n"
-                 . "       [--dry-run] [--json] PATH...\n");
+    fwrite(STDERR, "Usage: php bin/cucm-switch-import.php [options] PATH...\n"
+                 . "  --config FILE           config file\n"
+                 . "  --switch NAME           switch name (single file only)\n"
+                 . "  --name-regex RE         switch name from capture group 1 of RE (default: file name minus extension and -status)\n"
+                 . "  --captured-at 'YYYY-MM-DD HH:MM:SS'  capture time (default file mtime)\n"
+                 . "  --dry-run               parse only, no database\n"
+                 . "  --json                  JSON output\n");
     exit($p['args'] ? 0 : 1);
 }
 
@@ -72,10 +62,12 @@ function cps_switch_name_from_file(string $file, ?string $re): ?string
 {
     $base = basename($file);
     if ($re !== null) {
-        return preg_match($re, $base, $m) && ($m[1] ?? '') !== '' ? $m[1] : null;
+        if (!preg_match($re, $base, $m)) { return null; }
+        if (!array_key_exists(1, $m)) { cps_die("--name-regex needs a capture group for the switch name: $re"); }
+        return $m[1] !== '' ? $m[1] : null;
     }
     $n = (string)preg_replace('/\.(txt|log|out|json)$/i', '', $base);
-    return (string)preg_replace('/[-_](?:show[-_])?(?:int(?:erfaces?)?[-_])?status$/i', '', $n);
+    return (string)preg_replace('/[-_](?:sh(?:ow)?[-_])?(?:int(?:erfaces?)?[-_])?stat(?:us)?$/i', '', $n);
 }
 
 $at = is_string($opts['captured-at'] ?? null) ? $opts['captured-at'] : null;
@@ -106,19 +98,29 @@ foreach ($files as $file) {
         continue;
     }
 
+    $blocks = [];
     foreach (cps_switch_split($text, $fromFile) as $block) {
+        $blocks[] = $block + ['parsed' => cps_parse_interface_status($block['text'])];
+    }
+    $anyPorts = (bool)array_filter($blocks, fn($b) => $b['parsed']['ports']);
+    $isCapture = (bool)preg_match('/^Port\s+Name\s+Status/mi', $text);
+
+    foreach ($blocks as $block) {
         $name   = $override ?? $block['switch'];
-        $parsed = cps_parse_interface_status($block['text']);
+        $parsed = $block['parsed'];
         $row = ['switch' => $name, 'file' => $file, 'ports' => count($parsed['ports']),
                 'unparsed' => $parsed['unparsed'], 'status' => $dry ? 'parsed' : null, 'capture_id' => null];
 
-        // A block with no ports is not a capture of an idle switch - it is
-        // the wrong command, an error message, or a login banner. Storing it
-        // would make it the newest capture and hide the last good one.
+        // No ports = wrong command, an error page, or text before the prompt; never store it.
         if (!$parsed['ports']) {
-            cps_warn("$file ($name): no interface rows found - not imported");
+            if ($anyPorts) { cps_log("$file ($name): block without interface rows ignored", 2); continue; }
             $row['status'] = 'skipped';
-            $skipped++;
+            if ($isCapture) {
+                cps_warn("$file ($name): no interface rows found - not imported");
+                $skipped++;
+            } else {
+                cps_warn("$file: not a 'show interface status' capture - ignored");
+            }
         } elseif (!$dry) {
             try {
                 $res = $db->importSwitchCapture($name, $block['text'], $parsed, $file,

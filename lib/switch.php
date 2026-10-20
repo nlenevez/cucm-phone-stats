@@ -1,26 +1,12 @@
 <?php
 /**
  * switch.php - parse Catalyst "show interface status" captures.
- *
- * The captures arrive as files, one per switch (an Ansible playbook writes
- * switch-outputs/<inventory_hostname>.txt). The switch is named by a prompt
- * in the text when there is one ("SW01#show interface status"), otherwise
- * by the file name, since ios_command output carries no prompt.
- *
- * Matching against what the phones report is done on KEYS, not on the
- * strings as printed: CDP gives "sw01.corp.local" and
- * "GigabitEthernet1/0/12", the switch prints "SW01" and "Gi1/0/12". The SQL
- * view v_uplink_keys applies the same two rules to the uplinks table; the
- * two implementations must agree, so change both or neither.
+ * cps_if_key() and cps_switch_key() must agree with the SQL in v_uplink_keys.
  */
 
 require_once __DIR__ . '/util.php';
 
-/**
- * Interface-type prefixes reduced to the abbreviation IOS prints. Order
- * matters: "twe" (TwentyFiveGigE) must be tested before "tw"
- * (TwoGigabitEthernet), and every long form starts with its abbreviation.
- */
+/** Interface abbreviations as IOS prints them; "twe" must precede "tw". */
 const CPS_IF_PREFIXES = ['twe', 'tw', 'te', 'gi', 'fa', 'fi', 'fo', 'hu', 'ap', 'po', 'et', 'vl'];
 
 /** "GigabitEthernet1/0/12", "Gi1/0/12", "gi 1/0/12" -> "gi1/0/12". */
@@ -65,10 +51,7 @@ function cps_switch_duplex(string $raw): array
     return [in_array($s, ['full', 'half'], true) ? $s : null, $auto];
 }
 
-/**
- * Unwrap a capture that was saved as Ansible JSON rather than plain text
- * (a registered ios_command result, or a bare stdout / stdout_lines list).
- */
+/** Unwrap a capture saved as Ansible JSON (stdout / stdout_lines) to plain text. */
 function cps_switch_unwrap(string $text): string
 {
     $t = ltrim($text);
@@ -85,12 +68,8 @@ function cps_switch_unwrap(string $text): string
 }
 
 /**
- * Split a capture into one block per switch.
- *
- * A prompt line ("HOST#sh int status") starts a new block named HOST. Text
- * before any prompt belongs to $defaultName - the file name - which is the
- * whole file in the Ansible case.
- *
+ * Split a capture into one block per "HOST#sh int status" prompt; text before
+ * any prompt belongs to $defaultName.
  * @return array<int,array{switch:string,text:string}>
  */
 function cps_switch_split(string $text, string $defaultName): array
@@ -116,15 +95,8 @@ function cps_switch_split(string $text, string $defaultName): array
 }
 
 /**
- * Parse the table.
- *
- * Name and Type both contain spaces and Name may be blank, so a line is not
- * simply whitespace-split. The header gives the column where Status starts:
- * the Port/Name part is cut there, and the tail is anchored on the duplex
- * token, the one field whose vocabulary is fixed (full/half/auto, with an
- * a- prefix when negotiated). Without a header the same anchor is applied
- * to the whole line.
- *
+ * Parse the table. Port/Name is cut at the header's Status column; the rest
+ * is anchored on the duplex token, since Name and Type may contain spaces.
  * @return array{ports: array<int,array>, unparsed: int}
  */
 function cps_parse_interface_status(string $text): array
@@ -141,8 +113,7 @@ function cps_parse_interface_status(string $text): array
             $statusCol = stripos($line, 'Status');
             continue;
         }
-        // Only lines that start with an interface name are rows; prompts,
-        // banners, "--More--" and blank lines are skipped without comment.
+        // Rows start with an interface name; skip everything else.
         if (!preg_match('/^[A-Za-z][A-Za-z\-]*\d[^\s#>]*(\s|$)/', $line)) { continue; }
 
         $row = null;

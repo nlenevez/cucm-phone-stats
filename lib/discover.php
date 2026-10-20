@@ -1,25 +1,14 @@
 <?php
 /**
- * discover.php - build the list of phones to poll.
- *
- * Shared by cucm-phones.php (report the list) and cucm-sweep.php (poll it),
- * so the two can never disagree about what "a registered phone" means.
+ * discover.php - build the list of phones to poll (shared by cucm-phones.php
+ * and cucm-sweep.php).
  */
 
 require_once __DIR__ . '/config.php';
 
 /**
- * Discover phones from RisPort70 (default) or, as a fallback, from the AXL
- * configuration database.
- *
- * @return array<int,array<string,mixed>>
- */
-/**
- * Common Phone Profile per device name, from every configured server.
- *
- * Two clusters each know only their own phones, so each is asked and the
- * answers merged. A server that fails is warned about and skipped - the
- * profile is context, never a reason to lose a sweep.
+ * Common Phone Profile per device name, merged across all servers.
+ * Failing servers are warned about and skipped.
  *
  * @return array<string,array{uuid:?string,name:?string,server:string}>
  */
@@ -40,10 +29,7 @@ function cps_common_phone_profiles(array $cfg): array
     return $out;
 }
 
-/**
- * Discover only the named phones (--only-problems). RisPort only: the point
- * is to skip enumerating the estate, which is the slow, throttled part.
- */
+/** Discover only the named phones via RisPort (--only-problems). */
 function cps_discover_named_phones(array $cfg, array $names, string $status): array
 {
     $res = CpsRisportClient::discoverNames(cps_risport_clients($cfg), $names, $status);
@@ -56,57 +42,20 @@ function cps_discover_named_phones(array $cfg, array $names, string $status): ar
     return cps_resolve_model_names($rows, $cfg);
 }
 
+/**
+ * Discover phones from RisPort70 or the AXL database (axl-sql).
+ *
+ * @return array<int,array<string,mixed>>
+ */
 function cps_discover_phones(array $cfg, string $source, string $status, array $opts = []): array
 {
     if ($source === 'risport') {
-        $parts = (string)($cfg['ris_partitions'] ?? 'auto');
-        $mode  = in_array(strtolower(trim($parts)), ['auto', 'off', 'always'], true)
-            ? strtolower(trim($parts))
-            : preg_split('/[\s,]+/', $parts, -1, PREG_SPLIT_NO_EMPTY);
-        // Enumerate only the device types that will actually be polled.
-        // Splitting the estate to recover CSF/TCT/BOT rows that the prefix
-        // filter then discards spends the rate-limit budget on nothing.
-        $prefixes = [];
-        if (empty($opts['all-devices'])) {
-            $raw = is_string($opts['device-prefixes'] ?? null)
-                ? $opts['device-prefixes']
-                : (string)($cfg['poll_device_prefixes'] ?? '');
-            $prefixes = preg_split('/[\s,]+/', trim($raw), -1, PREG_SPLIT_NO_EMPTY);
+        $mode = strtolower(trim((string)($cfg['ris_partitions'] ?? 'auto')));
+        if (!in_array($mode, ['auto', 'off', 'always'], true)) {
+            cps_warn("ris_partitions = '$mode' is not auto|always|off; using auto");
+            $mode = 'auto';
         }
-        if ($prefixes) {
-            // Say what is being asked for. The "N skipped as not SEP" line
-            // no longer appears once the query itself is scoped, and a
-            // quietly smaller number is exactly what makes an operator
-            // wonder whether devices went missing.
-            cps_log('querying only ' . implode('*, ', $prefixes) . '* device names');
-        }
-        // AXL knows every configured device name and is not subject to
-        // RisPort's per-minute throttle, so it is the cheap way to learn
-        // where the estate actually divides. Lazily invoked: only the
-        // strategies that need it will call this.
-        $nameProvider = null;
-        if (((string)($cfg['axl_user'] ?? '')) !== '' && cps_cfg_bool($cfg, 'ris_use_axl_names', true)) {
-            $nameProvider = function () use ($cfg, $prefixes) {
-                $axl  = cps_axl_client($cfg);
-                $out  = [];
-                foreach ($prefixes ?: [''] as $p) {
-                    $like = $p === '' ? '%' : strtoupper($p) . '%';
-                    foreach ($axl->listPhones(['name'], 1000, $like) as $row) {
-                        if (!empty($row['name'])) { $out[] = $row['name']; }
-                    }
-                }
-                cps_log('AXL knows ' . count($out) . ' configured device names');
-                return $out;
-            };
-        }
-        $res = CpsRisportClient::discover(cps_risport_clients($cfg), $status, 'Phone', $mode, $prefixes, $nameProvider);
-        foreach ($res['per_server'] ?? [] as $srv => $st) {
-            $enum = $st['enumeration'] ?? null;
-            if ($enum && !empty($enum['truncated'])) {
-                cps_warn(sprintf('%s: still short after partitioning - %d returned, %s claimed',
-                    $srv, $enum['returned'], $enum['total_devices_found'] ?? '?'));
-            }
-        }
+        $res = CpsRisportClient::discover(cps_risport_clients($cfg), $status, 'Phone', $mode);
         foreach ($res['errors'] as $e) {
             cps_warn("RisPort {$e['server']}: {$e['error']}");
         }
@@ -120,9 +69,6 @@ function cps_discover_phones(array $cfg, string $source, string $status, array $
     }
 
     if ($source === 'axl-sql') {
-        // A discovery failure should read as a diagnosis, not a stack trace:
-        // this is the first thing that runs, and whatever it says is what
-        // someone acts on.
         try {
             $axl = cps_axl_client($cfg);
             $axl->discoverVersion();
@@ -137,9 +83,7 @@ function cps_discover_phones(array $cfg, string $source, string $status, array $
                 'model'         => $r['model'] ?? '',
                 'ip'            => $r['lastknownipaddress'] ?? '',
                 'node_name'     => $r['lastknownucm'] ?? '',
-                // RegistrationDynamic records where a device last was, not
-                // that it is there now, so the status is explicitly not
-                // claimed to be "Registered".
+                // Last known location, not current registration.
                 'status'        => 'LastKnown',
                 'ris_timestamp' => $r['lastseen'] ?? '',
                 'source'        => 'axl-sql',
@@ -152,11 +96,7 @@ function cps_discover_phones(array $cfg, string $source, string $status, array $
 }
 
 /**
- * Apply the configured/CLI subnet exclusions to a discovered phone list.
- *
- * Shared by cucm-phones.php and cucm-sweep.php on purpose: if the listing
- * and the sweep disagreed about what is in scope, a CSV carried between
- * them would quietly re-introduce the phones the operator excluded.
+ * Drop phones in the configured/CLI excluded subnets.
  *
  * @return array<int,array<string,mixed>> the phones still in scope
  */
@@ -170,11 +110,9 @@ function cps_apply_subnet_exclusions(array $phones, array $cfg, array $opts): ar
 
     $res = cps_filter_by_cidr($phones, $cidrs);
     foreach ($res['by_cidr'] as $cidr => $n) {
-        // Report every prefix, including the ones that matched nothing. A
-        // zero is the signal that a CIDR is wrong or the estate moved, and
-        // it is invisible if only non-zero counts are printed.
+        // A prefix matching nothing is shown at default verbosity.
         cps_log(sprintf('exclude %-18s %d phone(s)%s', $cidr, $n,
-            $n === 0 ? '  <- matched nothing, check this prefix' : ''));
+            $n === 0 ? '  <- matched nothing, check this prefix' : ''), $n === 0 ? 1 : 2);
     }
     cps_log(sprintf('%d phone(s) excluded by subnet, %d remain',
         count($res['excluded']), count($res['kept'])));
@@ -182,19 +120,14 @@ function cps_apply_subnet_exclusions(array $phones, array $cfg, array $opts): ar
 }
 
 /**
- * Restrict a discovered list to pollable device types.
- *
- * Reports what it dropped, broken down by prefix. A filter that shrinks the
- * estate without saying so is how a partial sweep gets mistaken for a
- * complete one - and here it is also the answer to "why do I see 2,000
- * phones when CUCM says 3,000".
+ * Keep only devices whose name starts with a pollable prefix; logs the drops.
  *
  * @return array<int,array<string,mixed>>
  */
 function cps_apply_device_prefixes(array $phones, array $cfg, array $opts): array
 {
     if (!empty($opts['all-devices'])) {
-        cps_log('--all-devices: device-prefix filtering disabled');
+        cps_log('--all-devices: device-prefix filtering disabled', 2);
         return $phones;
     }
     $raw = is_string($opts['device-prefixes'] ?? null)
@@ -214,16 +147,8 @@ function cps_apply_device_prefixes(array $phones, array $cfg, array $opts): arra
 }
 
 /**
- * Turn numeric model enums into names.
- *
- * RisPort reports the model as an enum, which is useless in a report. The
- * names come from CUCM's typemodel table via AXL - authoritative for that
- * release, where a hard-coded list would eventually be wrong without
- * saying so.
- *
- * Only numeric values are touched, so a cluster that already returns a name
- * is left alone, and a failure to reach AXL leaves the enums in place
- * rather than losing the field.
+ * Replace numeric model enums with names from AXL's typemodel table.
+ * On AXL failure the enums are kept.
  *
  * @param array<int,array<string,mixed>> $rows
  * @return array<int,array<string,mixed>>
@@ -254,6 +179,6 @@ function cps_resolve_model_names(array $rows, array $cfg): array
         }
     }
     unset($r);
-    cps_log("resolved $hit model enum(s) to names from typemodel (" . count($names) . ' known)');
+    cps_log("resolved $hit model enum(s) to names (" . count($names) . ' known)', 2);
     return $rows;
 }

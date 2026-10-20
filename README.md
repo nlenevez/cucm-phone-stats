@@ -1,485 +1,201 @@
 # cucm-phone-stats
 
-Discover registered Cisco IP phones from CUCM, pull the network and access
-port statistics from each handset, and store it all in MySQL so the estate
-can be reported on over time.
+Finds registered Cisco IP phones through CUCM (RisPort70, with AXL for
+configuration), reads each phone's network and access port speed, duplex and
+error counters from its web pages, and stores them in MySQL. Reports speed
+mismatches, errors and error trends from the CLI or a single-file web page.
 
-**PHP 8.2+**, no Composer, no external packages — it is meant to be copied
-onto an airgapped box and run. Verified on **8.2, 8.3, 8.4 and 8.5**, and on
-**RHEL 8.10** with its AppStream PHP 8.2. The floor is 8.2 because that is
-the oldest version actually tested, not the oldest that might work.
+It can also import Catalyst `show interface status` captures and compare the
+switch port with the phone, record each phone's Common Phone Profile, and
+move switch-mismatched phones to another profile.
 
-Extensions: `curl` and `dom`, plus `pdo_mysql` **only for the database
-half**. `cucm-probe.php`, `cucm-phones.php`, `cucm-phone-netstats.php` and
-`cucm-sweep.php --no-db` all run without `pdo_mysql`, which is deliberate —
-the probe can go across the airgap before anyone has provisioned a database.
+## Requirements
 
-```bash
-php -r 'foreach (["curl","dom","pdo_mysql"] as $e) printf("%-10s %s\n", $e, extension_loaded($e) ? "yes" : "NO");'
-```
+- PHP 8.2+ (tested on 8.2 to 8.5) with `curl` and `dom`. No Composer.
+- `pdo_mysql` and MySQL 8.0/8.4 for storing and reporting. Probe, listing,
+  single-phone and `--no-db` runs work without it.
+- A CUCM application user with **Standard AXL API Access**, and Web Access
+  enabled on the phones. See [docs/cucm-permissions.md](docs/cucm-permissions.md).
 
-### On RHEL 8.10
-
-RHEL splits the PHP extensions across separate RPMs, and **`php-cli` alone
-does not include DOM** — every script here parses through DOM, so that is a
-hard blocker rather than a degraded mode. The AppStream default stream is
-still **php 7.2**, which is far too old, and RHEL 8 has **no 8.3 stream** —
-8.2 is the newest without a third-party repo such as Remi.
+On RHEL 8, `dom` comes from `php-xml`, not `php-cli`:
 
 ```bash
-dnf module reset php
-dnf module enable php:8.2
-dnf install php-cli php-xml php-mysqlnd     # php-pdo, php-common come as deps
+dnf module reset php && dnf module enable php:8.2
+dnf install php-cli php-xml php-mysqlnd php-mbstring
 ```
 
-| Package | Provides | Needed for |
-|---|---|---|
-| `php-cli` | the interpreter, `curl`, `json` | everything |
-| `php-xml` | **`dom`** | everything — not optional |
-| `php-mysqlnd` | `pdo_mysql` (pulls `php-pdo`) | storing and reporting only |
+## Install and database setup
 
-`mbstring` is *not* required. On the airgapped host these come from your
-Satellite or local AppStream mirror; it is one module stream plus three
-packages.
-
-**Verified** on RHEL 8.10 (Ootpa) with PHP 8.2.33 from AppStream, against
-**MySQL 8.0.46** and **MySQL 8.4.11**: 84 checks, exit 0 on each. Both are
-covered so it does not matter which AppStream stream the host carries.
-(MariaDB 10.3 also passes, but MySQL is the deployment target.)
-
-### Database setup
-
-The tool needs two levels of access, and they are worth separating: building
-the schema needs DDL, running a sweep does not. These grants are tested — a
-sweep and all three reports run with nothing beyond SELECT/INSERT/UPDATE.
+```bash
+cp cucm.conf.example cucm.conf && $EDITOR cucm.conf
+```
 
 ```sql
 CREATE DATABASE cucm_phone_stats CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
--- setup: run bin/cucm-initdb.php as this account, once per deploy/upgrade
+-- schema owner: runs bin/cucm-initdb.php
 CREATE USER 'cucm_admin'@'%' IDENTIFIED BY '...';
 GRANT CREATE, DROP, ALTER, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW,
       SELECT, INSERT, UPDATE ON cucm_phone_stats.* TO 'cucm_admin'@'%';
 
--- runtime: what cucm.conf uses for sweeps and reports
+-- runtime: the account in cucm.conf
 CREATE USER 'cucm'@'%' IDENTIFIED BY '...';
 GRANT SELECT, INSERT, UPDATE ON cucm_phone_stats.* TO 'cucm'@'%';
 ```
 
-No `DELETE` is granted, and none is needed — nothing in this tool deletes a
-row. History is what the trend report reads, so pruning it is a deliberate
-retention decision for later, not something a sweep should be able to do by
-accident. Confirmed by negative control: the runtime user is refused `DROP`,
-`CREATE` and `DELETE`, and still reads every reporting view.
-
-Restrict the host part (`'cucm'@'10.0.0.5'`) rather than leaving `'%'`.
-
-## What it does
-
-```
-CUCM subscribers                    each phone                   MySQL
-┌────────────────────┐              ┌──────────────┐             ┌──────────────┐
-│ RisPort70          │  name, IP,   │ /CGI/Java/   │  port       │ sweeps       │
-│ selectCmDevice     ├─ status,  ──►│ Serviceability│─ counters ─►│ phones       │
-│                    │  model       │  ?adapter=…  │  speed      │ registrations│
-│ AXL (fallback)     │              │              │  duplex     │ port_stats   │
-│ RegistrationDynamic│              │              │             │ page_fetches │
-└────────────────────┘              └──────────────┘             └──────────────┘
+```bash
+php bin/cucm-initdb.php --create-database   # tables, views, migrations; safe to re-run
 ```
 
-**AXL cannot answer this on its own.** The `device` table is configuration —
-it says a phone is *configured*, not that it is *registered*, and it does not
-hold the address the phone is on right now. Registration is runtime state and
-belongs to **RisPort70** on the subscribers, which is why that is the primary
-source here. AXL still contributes the configuration context RisPort omits,
-and `executeSQLQuery` against `RegistrationDynamic` is a usable fallback when
-RisPort is throttled or deactivated.
+Run `cucm-initdb.php` again after every upgrade.
 
 ## Quick start
 
 ```bash
-cp cucm.conf.example cucm.conf && $EDITOR cucm.conf
-
-php bin/cucm-probe.php --phone 10.0.0.50   # confirm the assumptions first
-php bin/cucm-initdb.php --create-database  # tables, views, and column migrations
-php bin/cucm-sweep.php                     # discover, poll, store
-
+php bin/cucm-probe.php --phone 10.0.0.50    # check the cluster and one phone
+php bin/cucm-sweep.php --sample 20 --no-db  # 20 random phones, nothing stored
+php bin/cucm-sweep.php                      # discover, poll, store
 php bin/cucm-report.php speed-mismatch
-php bin/cucm-report.php errors
-php bin/cucm-report.php error-trend
 ```
 
-## The tools
+## Tools
 
-| Script | What it is for |
+### cucm-probe.php
+
+Tests each assumption about the cluster and one phone with its own request.
+Prints PASS/FAIL/SKIP and writes JSON evidence.
+
+```bash
+php bin/cucm-probe.php --phone 10.0.0.50 --out probe-evidence [--server HOST] [--schemes https]
+```
+
+### cucm-phones.php
+
+Lists registered phones and their IPs.
+
+```bash
+php bin/cucm-phones.php --csv > phones.csv
+```
+
+### cucm-phone-netstats.php
+
+Port statistics for one phone by IP.
+
+```bash
+php bin/cucm-phone-netstats.php 10.0.0.50
+```
+
+### cucm-sweep.php
+
+Discover, poll every phone, store.
+
+```bash
+php bin/cucm-sweep.php                              # full sweep
+php bin/cucm-sweep.php --sample 50                  # 50 random phones
+php bin/cucm-sweep.php --match Warehouse --sample 5 # filter, then sample
+php bin/cucm-sweep.php --no-db --json               # poll, print, store nothing
+php bin/cucm-sweep.php --phones-from phones.csv     # skip CUCM, use a list
+```
+
+| Option | Effect |
 |---|---|
-| `bin/cucm-probe.php` | Verifies each assumption against a real cluster, one request at a time, and writes JSON evidence. **Run this first on a new cluster.** |
+| `--sample N` / `--limit N` | N random phones / the first N |
+| `--match TEXT` | substring on name, description, model or IP; `field:value` scopes it |
+| `--device-prefixes SEP,ATA` / `--all-devices` | device types to poll (default `poll_device_prefixes`, `SEP`) |
+| `--exclude-subnet CIDR[,CIDR]` | leave subnets alone (also `exclude_subnets`) |
+| `--parallel N` | phones in flight at once (default 10) |
+| `--adapters a,b` | phone pages to fetch |
+| `--skip-no-http` | skip phones CUCM reports as having no web server |
+| `--phones-from FILE` | CSV or JSON from `cucm-phones.php`; CUCM is not queried |
+| `--no-db`, `--json` | do not store; print JSON |
+| `--quiet`, `--verbose` | less or more logging |
 
-> **All-HTTPS estate?** Set `phone_probe_schemes = https` (or pass
-> `--schemes https`). Only the *probe* ever tries plaintext, and only to
-> discover what a handset answers on; sweeps build every URL from
-> `phone_url_base` and never attempt HTTP. The http attempts time out rather
-> than failing fast, so turning them off saves two timeouts per probe run.
->
-> Collection is additionally pinned: with an `https://` base, curl is
-> configured to refuse a redirect to `http://`. Web Access = Authenticated
-> sends credentials, and a phone bouncing to a plaintext page would otherwise
-> have them re-sent in the clear.
-| `bin/cucm-phones.php` | Lists registered phones and their IPs. `--json`, `--csv`, `--table`. |
-| `bin/cucm-sweep.php` | The whole job: discover → poll every phone → store. `--sample N` for a small batch. |
-| `bin/cucm-phone-netstats.php` | One phone by IP. Successor to `patching-tools/cisco-phone-netstats.php`. |
-| `bin/cucm-switch-import.php` | Loads `show interface status` captures (a file or a folder) for the switch-side comparison. `--dry-run` parses without a database. |
-| `bin/cucm-set-profile.php` | **Writes to CUCM**: moves switch-mismatched phones from one Common Phone Profile to another. Dry run unless `--apply`; `--undo BATCH`. |
-| `bin/cucm-report.php` | The reports, over one sweep or all of them. |
-| `bin/cucm-initdb.php` | Creates/updates tables and views. Safe to re-run. |
+`--match` is a substring search (`--match SEP` also matches `CSFJOSEPH`); use
+`--device-prefixes` for device types.
 
-### Moving switch-mismatched phones to another Common Phone Profile
+#### Re-sweeping only the problem phones
 
-```bash
-php bin/cucm-set-profile.php --from OLD-UUID --to NEW-UUID            # dry run
-php bin/cucm-set-profile.php --from OLD-UUID --to NEW-UUID --apply    # change
-php bin/cucm-set-profile.php --undo 20261020-153012 --apply           # revert a batch
-```
+`--only-problems [SWEEP]` polls only the phones flagged by the latest (or the
+given) sweep, asking RisPort for those names instead of enumerating the
+cluster. The result is stored as a normal sweep and becomes the latest one.
 
-**The only tool here that writes to CUCM.** Candidates are the phones in
-`switch-mismatch` for the latest sweep (`--sweep N`, `--result speed`,
-`--device NAME,...`, `--limit N` narrow it) whose stored profile is
-`--from`. Before touching anything it checks `--to` exists on that cluster,
-and for each phone asks AXL for the profile it is on **now**; a phone not
-currently on `--from` is skipped. Dry run unless `--apply`, and the dry run
-does the same live checks.
-
-Each change is logged to `profile_changes` under a batch id (printed at the
-end) and `--undo BATCH` reverts it. Phones pick up the new profile on Apply
-Config or reset; `--apply-config` sends AXL `applyPhone` after each update,
-or later for a whole batch with `--apply-config BATCH --apply` (e.g. change
-during the day, apply out of hours; without `--apply` it only lists).
-Needs an AXL role with write access (Standard AXL API Access, not the
-read-only role).
-
-### Re-checking only the problem phones
-
-```bash
-php bin/cucm-sweep.php --only-problems        # what the latest sweep flagged
-php bin/cucm-sweep.php --only-problems 42     # what sweep #42 flagged
-```
-
-Polls only phones the sweep flagged: a speed/duplex mismatch, any non-zero
-error counter, or a switch mismatch. RisPort is asked for those device names
-directly, so the full-estate enumeration (the slow, throttled part) is
-skipped. The result is an ordinary sweep with source `problems:#N`, so it
-becomes the "latest" sweep in the reports. Error counters only clear when a
-phone reboots, so a phone that ever logged an error stays in the set.
-
-### Testing against a subset
-
-On an estate of thousands, do not sweep the lot to find out whether it works:
-
-```bash
-php bin/cucm-sweep.php --sample 20 --no-db          # 20 random phones, nothing stored
-php bin/cucm-sweep.php --match Warehouse --sample 5  # narrow first, then sample
-php bin/cucm-sweep.php --sample 50                  # 50 random, stored as a real sweep
-```
-
-### Large estates: the RisPort response cap
-
-RisPort caps how many devices one `selectCmDevice` conversation yields, and
-**it does not report that it truncated** — `StateInfo` simply stops arriving,
-so a short answer is well formed, error free and indistinguishable from a
-complete one. On a multi-thousand-phone cluster that means a confidently
-wrong estate size.
-
-**`TotalDevicesFound` alone is not enough.** On a capped response some
-releases report the *capped* number, so a cluster with 2,300 phones answers
-with 1,000 devices and says 1,000 exist — internally consistent, and a
-comparison concludes the answer is complete.
-
-`ris_partitions = auto` (the default) therefore uses two signals: fewer
-devices than `TotalDevicesFound` claims, **or** a result sitting at or near
-the cap. An estate having exactly 1,000 registered phones is vanishingly
-unlikely; splitting when it does costs one extra pass, whereas not splitting
-when it has been truncated loses devices silently. When either fires, the
-enumeration re-runs split by device-name prefix — 16 buckets on the first hex digit of the MAC
-for `SEP*`, plus the soft-client prefixes — merging by device name. The
-truncation is logged rather than swallowed:
-
-```
-WARN: https://cucm1: RisPort returned 120 of 300 devices it says exist -
-      re-running split by name prefix
-```
-
-Discovery also reports **per server**: how many devices each one returned,
-how many were new, and the per-node breakdown from `CmNodes`. With more than
-one cluster in play, a single total cannot show which one came up short.
-
-**Then splitting on the LAST character of the name**, because device names
-are MACs and prefix buckets are hopeless when a fleet shares an OUI: on a
-real estate `SEP4*`, `SEP44*`, `SEP44B*`, `SEP44B6*`, `SEP44B6B*` and
-`SEP44B6BE*` were all over the cap in turn — six levels, sixteen queries
-each, to separate nothing. The trailing digits are the device serial and are
-close to uniform, so they give sixteen even buckets in one level.
-
-Whether a cluster accepts a leading wildcard is probed with a single query
-and the answer is *verified* — the rows must arrive, be under the cap, and
-actually end in the requested digit — because a cluster that ignored the
-pattern would return the whole capped set and look like success. If it is
-not supported, prefix splitting is the fallback.
-
-**Then computing exact buckets from AXL.** If the cluster will not match on
-the end of a name — ours does not; `SEP*0` returns nothing — the device names
-are fetched from AXL, which is *not* subject to the RisPort throttle, and the
-buckets are computed from where the estate actually divides: descend only
-where a bucket is genuinely too big, and only into characters that really
-occur, so no query is ever spent on an empty branch. On a 2,300-phone fleet
-all sharing one OUI that is nine buckets, computed, versus roughly a hundred
-and twelve queries discovered the hard way.
-
-Set `ris_use_axl_names = 0` only if `listPhone` is denied to the account.
-Blind prefix splitting remains the last resort and says so loudly.
-
-A bucket that itself comes back at the cap is subdivided a character deeper
-(`SEP0*` → `SEP00*`…`SEP0Z*`), up to three levels. Results merge by device
-name throughout, so subdividing can only add devices, never lose them.
-
-`ris_partitions = always` forces the split regardless — reach for it if
-counts still look low. `off` reproduces the untruncated behaviour, and an
-explicit pattern list is also accepted.
-
-### Speed
-
-Phones are fetched through a **rolling window** of `phone_parallel`
-concurrent requests (default 10, `--parallel N` to override). A finished
-request is replaced immediately, so a handset that times out costs only its
-own latency and never holds up phones that already answered.
-
-Measured on 100 phones, one in eight slow (1.5s), one adapter each:
-
-| `--parallel` | Elapsed |
+| `--problems` reason | Phones whose... |
 |---|---|
-| batched (previous behaviour) | 12.2s |
-| 5 | 4.6s |
-| **10 (default)** | **3.1s** |
-| 20 | 1.6s |
-| 30 | 1.6s |
+| `mismatch` | access port speed/duplex differs from the network port |
+| `errors` | port has an error counter of at least `--min-errors` (default 1) |
+| `growing` | error counters rose since the previous sweep |
+| `switch` | network port differs from the switch's `show interface status` |
 
-It plateaus once the window is wide enough that the slow handsets overlap;
-past that you are bounded by their own latency. **20–25 is a reasonable
-setting for a large estate.** The other lever is `adapters` — each one is a
-separate request per phone, so trimming `adapters` to `network,access`
-halves the work against the four-adapter default.
-
-### Which devices get polled
-
-By default only **`SEP*`** devices — hard handsets. Everything else CUCM
-registers has no switch port and no PC port, so there are no port statistics
-to collect from it:
-
-| Prefix | What it is | Has ports? |
-|---|---|---|
-| `SEP` | desk handset | **yes** |
-| `CSF` / `TCT` / `BOT` / `TAB` | Jabber desktop / iPhone / Android / tablet | no |
-| `CIPC` | IP Communicator softphone | no |
-| `ATA` | analog adapter | no |
-
-This matters beyond tidiness: **a Jabber client registers from the user's
-workstation**, so an unfiltered sweep of a few thousand devices fires an
-HTTPS request at every desk in the estate. Nothing about the *address* says
-not to poll it — only the device name does.
-
-```ini
-poll_device_prefixes = SEP          # cucm.conf; blank polls everything
-```
-
-This scopes the **RisPort query itself**, not just the results: `SelectItems`
-asks the cluster for `SEP*` only, so CSF/TCT/BOT/TAB devices are never
-gathered, never returned and never partitioned. Cheaper for CUCM, less data
-back, and on an estate with a large Jabber population it can keep a node
-under the response cap it would otherwise exceed purely because of soft
-clients.
-
-If a scoped query returns nothing at all — which would mean the cluster does
-not accept a wildcard in `SelectItems` — it retries once unscoped and says
-so, rather than reporting an empty estate.
-```bash
-php bin/cucm-sweep.php --all-devices             # poll everything, once
-php bin/cucm-sweep.php --device-prefixes SEP,ATA # explicit list
-```
-
-The skip is always reported with a per-prefix breakdown, so the count is
-explained rather than mysteriously short:
-
-```
-4 device(s) skipped as not SEP (CSF=1, TCT=1, BOT=1, ATA=1) - no ports to poll
-```
-
-That line is also the answer to "CUCM says 3,000 devices and I only see
-2,000": the difference is soft clients.
-
-### Leaving subnets alone
-
-```ini
-exclude_subnets = 10.20.0.0/16, 10.30.4.0/24     # cucm.conf
-```
-```bash
-php bin/cucm-sweep.php  --exclude-subnet 10.20.0.0/16,10.30.4.0/24
-php bin/cucm-phones.php --exclude-subnet 10.20.0.0/16
-```
-
-Applies to discovery and sweeps alike, and both tools share one
-implementation — if the listing and the sweep disagreed about scope, a CSV
-carried between them would quietly put the excluded phones back.
-
-Two deliberate behaviours: an **invalid prefix is fatal**, never ignored
-(a silently dropped exclusion means the tool polls a subnet you believe is
-off limits and nothing says so), and a prefix that **matched nothing is
-called out by name**, since a zero is how you find out a CIDR is wrong or
-the estate has moved.
-
-`--sample N` takes a **random** spread; `--limit N` takes the **first** N.
-They are not the same test. RisPort returns devices grouped by node, so the
-first N are typically all from one subscriber, one site, often one switch —
-the population least likely to show up a problem only part of the estate
-has. `--match` filters on name, description, model or IP and is applied
-before sampling.
-
-**`--match` is a substring search, not a device-type filter.** `--match SEP`
-also matches `CSFJOSEPH`, because JO-**SEP**-H contains it — a Jabber client
-belonging to anyone called Joseph. Use `--device-prefixes` for device types
-(it anchors to the start of the name), or scope the search to one field with
-`--match name:SEP0`.
-
-## The web page
-
-`web/cucm-reports.php` is a **single file**: drop it in a web root, point it
-at the database, done. Three tabs — speed mismatch, errors, increasing
-errors — each searchable, with every column sortable ascending and
-descending.
+Default: `mismatch,errors,switch`.
 
 ```bash
-cp web/cucm-reports.php /var/www/html/
-cp cucm.conf /var/www/html/            # or set CPS_DB_* in the environment
+php bin/cucm-sweep.php --only-problems
+php bin/cucm-sweep.php --only-problems --problems errors --min-errors 100
+php bin/cucm-sweep.php --only-problems --problems growing
+php bin/cucm-sweep.php --only-problems 42 --problems errors    # flagged in sweep 42
 ```
 
-Configuration is taken from `CPS_DB_*` environment variables, then a
-`cucm.conf` beside the script, then built-in defaults. **The account needs
-only `SELECT`** — nothing on this page writes.
+Error counters are cumulative until the phone reboots; use `--min-errors` or
+`growing` to focus on current faults. With `--phones-from`, the file is
+filtered to the flagged phones.
 
-- **Search** matches across every column, and multiple words narrow rather
-  than widen: `warehouse crc` means both.
-- **Sort** by clicking a heading, again to reverse. Numeric columns sort
-  numerically, and a missing counter sinks to the bottom instead of being
-  treated as zero.
-- **Sweep** defaults to the latest and *follows* it — no sweep id is put in
-  the URL unless you pick one, so a bookmarked page keeps showing current
-  data. Choosing a specific sweep pins it and offers a way back.
-- **Download CSV** exports exactly the rows on screen.
-- The tab badges show each report's row count, so an empty report is
-  visible without clicking into it.
-- **Columns that are empty for every row are hidden**, since which counters a
-  firmware reports varies. They are named underneath with a link to show
-  them, so nothing disappears silently. An always-empty counter is worth
-  chasing though — it usually means a label the normaliser does not
-  recognise, and `bin/cucm-report.php labels --unmapped-only` will say which.
-- **Theme follows the browser**, with a toggle in the top right to override
-  it. The button cycles Auto → Light → Dark → Auto; an explicit choice is
-  remembered per browser and wins over the system setting in either
-  direction. It is applied before first paint, so there is no flash of the
-  wrong theme on load.
+#### RisPort enumeration
 
-No CDN, no framework: the CSS and JavaScript are inline, because the host
-this is for has no route to the internet and a page that silently loses its
-sorting on deployment is worse than a plain table.
+RisPort returns at most 1000 devices per answer and does not say when it has
+truncated. Discovery sends one query; if the answer is at or near the cap (or
+short of `TotalDevicesFound`) it queries each CUCM node separately and merges
+the results. A node still at the cap is reported as incomplete.
+`ris_partitions`: `auto` (default), `always` (always query per node), `off`
+(one query only). Device-type scoping (`poll_device_prefixes`,
+`--all-devices`) is applied to the results.
 
-> **If the tabs seem to do nothing** — the page reloads but always shows the
-> first report — the web server is not passing the query string to PHP. The
-> page detects this and says which nginx directive is missing.
-> [docs/web-deployment.md](docs/web-deployment.md) has the known-good server
-> block.
-
-## Reports
-
-**`speed-mismatch`** — phones whose access (PC) port is running at a
-different speed or duplex from the network (switch) port.
-
-```
-device_name      ip_address  network_speed_mbps  network_duplex  access_speed_mbps  access_duplex  mismatch_kind
-SEP001122334402  10.10.10.2  1000                full            100                full           speed
-SEP001122334403  10.10.10.3  100                 full            100                half           duplex
-```
-
-Only phones with **both ports up** are compared. An access port with nothing
-plugged into it is not a mismatch, and counting it as one would bury the real
-findings under every unused PC port in the building. Duplex is reported
-alongside speed because a duplex mismatch is the more damaging of the two and
-the query is the same join.
-
-**`errors`** — any port with a non-zero error counter, worst first.
-`--min N` raises the floor. Counts CRC, alignment, runt, giant, jabber and
-overrun on receive; collisions, late and excessive collisions, excessive
-deferral and excess length on transmit. Traffic counters (broadcast,
-multicast, unicast) are deliberately *not* errors.
-
-**`error-trend`** — ports whose error counters actually grew between two
-sweeps, with the growth, not just the total.
-
-**One row per phone and port**, being the most recent growth, plus
-`times_grown` (how many sweeps it grew in) and `total_growth` (how much
-across them). This is a time series underneath, so without collapsing it a
-port that has grown across five sweeps appears five times with five
-different counts — which reads as duplicate rows rather than as history.
-`--history` gives every transition when that is what you actually want.
-
-Phone counters are free-running and clear when the handset reboots, so a
-naive delta goes sharply negative on every reboot. A drop is reported as
-`counter_reset = 1` with a NULL delta instead, so a rebooting phone can never
-appear to be "improving". `--include-resets` shows the reset rows too, which
-is what you want when a phone keeps clearing its counters and you are working
-out why. `--since YYYY-MM-DD` bounds the window.
-
-**`switch-mismatch`** — phones whose **network** port speed/duplex differs
-from what the switch itself reports in `show interface status`.
-
-```
-device_name      switch_name   switch_port            phone_speed_mbps  phone_duplex  switch_speed  switch_duplex  result
-SEP001122334402  sw-access-01  GigabitEthernet1/0/12  1000              full          a-100         a-full         speed
-SEP001122334403  sw-access-02  GigabitEthernet1/0/7   100               full          a-100         a-half         duplex
-```
-
-Load the captures first, then report:
+### cucm-report.php
 
 ```bash
-php bin/cucm-switch-import.php switch-outputs/     # one file per switch
-php bin/cucm-report.php switch-mismatch
-php bin/cucm-report.php switch-compare --result no-port   # what did not match, and why
-php bin/cucm-report.php switch-captures
+php bin/cucm-report.php <report> [--sweep N|--all] [--min N] [--since YYYY-MM-DD] [--json|--csv|--table]
 ```
 
-- **Switch name**: a `HOST#show interface status` prompt in the file if
-  there is one, otherwise the file name minus `.txt/.log/.out/.json` and a
-  trailing `-status`/`_status` (also `-int-status`, `_show_interface_status`
-  …), so `SW01-status.txt` is `SW01`. Other layouts: `--name-regex
-  '/^show_(.+)\.txt$/'` (group 1 is the name). Run `--dry-run` first and
-  check the `switch` column. Matched
-  case-insensitively with the domain and any `(serial)` stripped, so CDP's
-  `sw01.corp.local` matches `SW01`. A file named by IP matches the CDP
-  management address instead.
-- **Interface**: CDP's `GigabitEthernet1/0/12` and the switch's `Gi1/0/12`
-  both reduce to `gi1/0/12` (likewise Fa, Te, Tw, Twe, Fi, Fo, Hu, Ap, Po, Eth).
-- Each phone is compared against the **newest** capture of its switch.
-  `captured_at` is the file's mtime (tar preserves it) unless
-  `--captured-at` is given.
-- Identical output re-imported is not stored twice. A file with no interface
-  rows is refused rather than stored, so it cannot hide the last good capture.
-- `switch-compare` shows every uplink with a `result`: `match`, `speed`,
-  `duplex`, `speed+duplex`, or why no comparison was possible —
-  `no-capture`, `no-port`, `switch-not-connected`, `phone-link-down`,
-  `unknown` (a side reported no speed/duplex). The web page has the same as
-  a "Switch mismatch" tab, with these counts above the table.
+| Report | Shows |
+|---|---|
+| `speed-mismatch` | access port speed/duplex differs from the network port (both ports up) |
+| `errors` | ports with non-zero error counters, worst first; `--min N` |
+| `error-trend` | ports whose errors grew between sweeps, one row per port with `times_grown` and `total_growth`; `--history`, `--include-resets` |
+| `switch-mismatch` | phone network port differs from the switch port |
+| `switch-compare` | every uplink against the switch; `--result match\|speed\|duplex\|no-capture\|no-port\|...` |
+| `switch-captures` | imported switch captures |
+| `phones` | inventory, including Common Phone Profile |
+| `uplinks` | switch and port each phone reports (CDP/LLDP) |
+| `labels` | every label returned by phones and how it maps; `--grep TEXT`, `--unmapped-only` |
+| `sweeps` | sweep history |
 
-The raw output is kept in `switch_captures.raw_output`, so a misparse can be
-fixed and re-read without going back to the switches. Plain text, or an
-Ansible registered result saved as JSON (`stdout` / `stdout_lines`), both
-load. A minimal playbook:
+`error-trend` needs at least two sweeps. A counter that drops (phone reboot)
+is marked `counter_reset = 1` instead of being shown as a negative delta.
+
+### cucm-switch-import.php
+
+Loads `show interface status` captures (files or folders, plain text or
+Ansible JSON with `stdout`/`stdout_lines`) for the switch comparison.
+
+```bash
+php bin/cucm-switch-import.php switch-outputs/ --dry-run   # parse only, check the switch column
+php bin/cucm-switch-import.php switch-outputs/
+php bin/cucm-switch-import.php captures/ --name-regex '/^show_(.+)\.txt$/'
+```
+
+- Switch name: a `HOST#show interface status` prompt in the file, otherwise
+  the file name without `.txt/.log/.out/.json` and a trailing `-status` /
+  `_status` (also `-int-status`, `_show_interface_status`). So
+  `SW01-status.txt` is `SW01`. `--name-regex` takes capture group 1;
+  `--switch NAME` sets it outright.
+- Names match CDP case-insensitively with the domain removed; a file named
+  by IP matches the CDP management address. Interface names are normalised
+  (`GigabitEthernet1/0/12` = `Gi1/0/12`).
+- Each phone is compared with the newest capture of its switch.
+  `captured_at` is the file mtime unless `--captured-at` is given.
+- Identical re-imports are not stored twice; files with no interface rows
+  are rejected.
+
+Example playbook:
 
 ```yaml
 - hosts: switches
@@ -494,80 +210,109 @@ load. A minimal playbook:
       delegate_to: localhost
 ```
 
-Name the inventory hosts as CDP reports them (the switch hostname). If they
-are IPs, the CDP management address is used to match instead.
+### cucm-set-profile.php
+
+**Writes to CUCM.** Moves phones in `switch-mismatch` (latest sweep) from one
+Common Phone Profile to another with AXL `updatePhone`. Needs an AXL account
+with write access (Standard AXL API Access, not the read-only role).
+
+```bash
+php bin/cucm-set-profile.php --from OLD-UUID --to NEW-UUID                  # dry run
+php bin/cucm-set-profile.php --from OLD-UUID --to NEW-UUID --apply          # change
+php bin/cucm-set-profile.php --from OLD-UUID --to NEW-UUID --apply --apply-config
+php bin/cucm-set-profile.php --apply-config latest --apply                  # Apply Config to the last batch
+php bin/cucm-set-profile.php --apply-config 20261020-153012 --apply         # ...or a named batch
+php bin/cucm-set-profile.php --undo 20261020-153012 --apply                 # revert a batch
+```
+
+- Dry run unless `--apply`; the dry run does the same live checks.
+- Verifies `--to` exists and skips phones not currently on `--from`.
+- Narrow with `--sweep N`, `--result speed|duplex|speed+duplex`,
+  `--device NAME[,NAME]`, `--limit N`.
+- Changes are logged to `profile_changes` under a batch id. Phones pick up
+  the new profile on Apply Config or reset.
+- **Apply Config restarts the phones** (calls in progress drop). Run it out
+  of hours.
+
+### cucm-initdb.php
+
+Creates or updates tables and views and applies migrations. Safe to re-run.
+
+```bash
+php bin/cucm-initdb.php [--create-database]
+```
+
+## Web page
+
+`web/cucm-reports.php` is a single file showing the reports as tabs with
+search, sorting, a sweep selector and CSV export. It needs only `SELECT`.
+
+```bash
+cp web/cucm-reports.php /var/www/html/
+```
+
+Configuration comes from `CPS_DB_*` environment variables, `CPS_CONF`, or a
+`cucm.conf` next to the script. See
+[docs/web-deployment.md](docs/web-deployment.md).
+
+## Running from cron
+
+Run as the user that owns `cucm.conf`. Use absolute paths and `flock` to
+avoid overlapping runs.
+
+```cron
+# m  h    dom mon dow  command
+# Nightly full sweep.
+15 1    *   *   *    cd /path/to/cucm-phone-stats && flock -n /tmp/cucm-sweep.lock php bin/cucm-sweep.php --quiet >> /var/log/cucm-phone-stats.log 2>&1
+
+# Import switch captures. The Ansible pull (e.g. 01:00) runs separately;
+# import after the captures land and before the profile step.
+45 1    *   *   *    cd /path/to/cucm-phone-stats && php bin/cucm-switch-import.php switch-outputs/ --quiet >> /var/log/cucm-phone-stats.log 2>&1
+
+# Business hours: re-check phones whose errors are climbing.
+0  8-18 *   *   1-5  cd /path/to/cucm-phone-stats && flock -n /tmp/cucm-sweep.lock php bin/cucm-sweep.php --only-problems --problems growing --quiet >> /var/log/cucm-phone-stats.log 2>&1
+
+# Profile changes (WRITES TO CUCM): move switch-mismatched phones, then send
+# Apply Config out of hours. Or use "--apply --apply-config" in one step.
+0  2    *   *   *    cd /path/to/cucm-phone-stats && php bin/cucm-set-profile.php --from OLD-UUID --to NEW-UUID --apply >> /var/log/cucm-phone-stats.log 2>&1
+30 2    *   *   *    cd /path/to/cucm-phone-stats && php bin/cucm-set-profile.php --apply-config latest --apply >> /var/log/cucm-phone-stats.log 2>&1
+```
+
+Run the `cucm-set-profile.php` dry run by hand before scheduling `--apply`.
+Apply Config restarts the phones, so keep it out of hours. To confirm the
+fix once they have re-registered (allow a few minutes), re-sweep the
+switch-mismatched phones:
+
+```bash
+php bin/cucm-sweep.php --only-problems --problems switch
+```
+
+## Configuration
+
+All settings are in [cucm.conf.example](cucm.conf.example), one line each.
+The file is looked up in `./cucm.conf`, `<repo>/cucm.conf`,
+`~/.cucm-phone-stats.conf`, or given with `--config FILE`. Any key can be
+set from the environment as `CPS_<KEY>` (e.g. `CPS_AXL_PASS`); command-line
+flags take priority over both.
 
 ## Schema
 
-**After upgrading, run `php bin/cucm-initdb.php` before the next sweep.** It
-creates anything new and applies column migrations to an existing database.
-It is idempotent, so running it when nothing has changed costs nothing.
-
-### Common Phone Profile
-
-Each sweep reads every phone's Common Phone Profile over AXL (one
-`executeSQLQuery` per server: `device.fkcommonphoneconfig` joined to
-`commonphoneconfig`) into `phone_config`, one row per phone, updated in
-place. The uuid is uppercase without braces, as AXL's `uuid` attribute
-gives it. Shown in `cucm-report.php phones`; `collect_phone_profiles = 0`
-turns it off. Needs `axl_user`; a failure warns and the sweep carries on.
-
-### Model names
-
-RisPort reports a phone's model as a **numeric enum** (627, 684, …), which is
-useless in a report. The names come from CUCM's own `typemodel` table via
-AXL — read from the cluster rather than hard-coded, because the mapping is
-version-specific and a built-in list would eventually be wrong without
-saying so.
-
-Resolution happens at collection, and the mapping is mirrored into
-`device_models` so rows collected earlier can be corrected without waiting
-for those handsets to register again — `bin/cucm-initdb.php` applies that
-backfill. If AXL cannot be reached the enum is **kept**: a number is poor, a
-blank model is worse. A cluster that already returns names is left alone.
-
-`sweeps` one run · `phones` inventory keyed on device name · `registrations`
-where each phone was in each sweep · `port_stats` normalised link state and
-counters per port · `page_fetches` the verbatim label/value pairs and every
-failure.
-
-`page_fetches.pairs` keeps **every** label the phone returned, mapped or not.
-Label text drifts between firmware releases, and a counter the normaliser has
-not seen is then still recoverable from the database afterwards rather than
-needing a second sweep of the estate to collect again. `port_stats.unmapped_labels`
-counts how many a page had — if that number is large on your firmware, the
-alias table in `lib/phone.php` wants extending.
-
-Reporting views: `v_port_speed_mismatch`, `v_port_errors`,
-`v_port_error_deltas`, `v_port_errors_increasing`, `v_latest_sweep`. They are
-plain SQL, so Grafana or Excel can read them without going through this tool.
-
-## Prerequisites on the cluster
-
-An **application user** with the **Standard AXL API Access** role, and
-**Web Access enabled** on the phones (Common Phone Profile, or per device).
-Full detail, including the CUCM 12.5+ default that turns phone web access
-off, is in [docs/cucm-permissions.md](docs/cucm-permissions.md).
+Tables: `sweeps`, `phones`, `registrations`, `port_stats`, `page_fetches`
+(raw label/value pairs and failures), `uplinks`, `phone_config`,
+`device_models`, `switch_captures`, `switch_ports`, `profile_changes`.
+Reporting views (`v_port_speed_mismatch`, `v_port_errors`,
+`v_port_error_deltas`, `v_port_errors_increasing`, `v_switch_port_compare`,
+`v_switch_port_mismatch`, `v_latest_sweep`) are plain SQL. See
+[schema.sql](schema.sql).
 
 ## Testing
 
 ```bash
 php tests/run-tests.php --unit     # no server, no database
-php tests/run-tests.php            # + mock CUCM over HTTP + real MySQL
+php tests/run-tests.php            # adds a mock CUCM and phones, and MySQL
 ```
 
-`tests/mock-server.php` stands in for a CUCM cluster and eight phones chosen
-to produce specific outcomes — a speed mismatch, a duplex mismatch, growing
-errors, a phone that demands authentication, a phone with its web server off,
-an unregistered phone that must not appear, and an access port that is down.
-
-**What the tests prove, and what they do not.** They exercise the plumbing:
-SOAP construction, namespace-blind parsing, RisPort StateInfo paging, the
-tolerant HTML parser, normalisation, the database writes and the views. They
-**cannot** prove Cisco's real field names match the ones this tool looks for,
-because the fixtures were written from the same reading of the documentation
-as the code. A fixture cannot disagree with the assumption that produced it.
-That is what `bin/cucm-probe.php` is for.
-
-See [docs/airgap-runbook.md](docs/airgap-runbook.md) for the
-build-here / verify-there workflow.
+The tests use a mock cluster, so they do not confirm the field names a real
+cluster or phone firmware uses; run `bin/cucm-probe.php` for that. See
+[docs/airgap-runbook.md](docs/airgap-runbook.md) and
+[docs/design.md](docs/design.md).

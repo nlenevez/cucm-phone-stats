@@ -2,11 +2,8 @@
 /**
  * config.php - configuration loading and shared CLI plumbing.
  *
- * Precedence, lowest to highest: built-in defaults, config file, environment,
- * command line. Passwords may be given inline, but preferably as
- * *_pass_file (a file the account can read) or *_pass_env (the name of an
- * environment variable) so a credential never has to sit in the repo or in
- * the process list of a shared box.
+ * Precedence: defaults < config file < environment < command line.
+ * Passwords: inline, *_pass_file or *_pass_env.
  */
 
 require_once __DIR__ . '/util.php';
@@ -28,59 +25,33 @@ const CPS_DEFAULTS = [
     'verify_tls'      => 0,
     'ca_bundle'       => '',
     'soap_timeout'    => 60,
-    // RisPort is rate limited per user per node. ris_rate_per_min is the real
-    // control - a sliding window, so the allowance is spent as fast as is
-    // safe and then waits. Keep it under the cluster's limit (commonly 15):
-    // the budget is shared with anything else querying realtime data as the
-    // same account. ris_gap_ms is an optional extra minimum spacing.
+    // RisPort sliding-window rate limit; keep under the cluster limit (often 15/min).
+    // ris_gap_ms adds an optional minimum spacing.
     'ris_rate_per_min' => 12,
     'ris_rate_retries' => 4,
     'ris_gap_ms'      => 0,
     'ris_max_devices' => 1000,
-    // How to enumerate an estate larger than one RisPort response:
-    //   auto (default) - one plain query, and if it returns fewer devices
-    //                    than TotalDevicesFound claims, re-run split by name
-    //   always         - always split, whatever the first query returned
-    //   off            - never split; accept whatever one query returns
-    //   <list>         - explicit patterns, e.g. "SEP0*,SEP1*,..."
+    // Re-query per node when a response is capped: auto | always | off.
     'ris_partitions'  => 'auto',
-    // Use AXL's list of device names to compute exact RisPort partitions
-    // when the cheaper strategies are unavailable. Needs no extra rights
-    // beyond those AXL already requires, and AXL is not subject to the
-    // RisPort throttle. Set to 0 only if listPhone is denied to the account.
-    'ris_use_axl_names' => 1,
 
     'phone_url_base'  => 'https://{ip}',
     'phone_user'      => '',
     'phone_pass'      => '',
     'phone_pass_file' => '',
     'phone_pass_env'  => '',
-    // Device-name prefixes worth polling. Defaults to SEP - hard handsets.
-    // Everything else CUCM registers (CSF/TCT/BOT/TAB Jabber clients, CIPC,
-    // ATA analog adapters) has no switch port and no PC port, so there are
-    // no port statistics to collect from it. It matters more than tidiness:
-    // a Jabber client's registered address is the USER'S WORKSTATION, so an
-    // unfiltered sweep fires an HTTPS request at every desk in the estate.
-    // Blank means poll everything; --all-devices overrides for one run.
+    // Device-name prefixes to poll (SEP = hardware phones). Blank = all.
     'poll_device_prefixes' => 'SEP',
+    'collect_phone_profiles' => 1,
 
-    // Subnets to leave alone, comma separated CIDR (e.g. "10.20.0.0/16,
-    // 10.30.4.0/24"). Applies to discovery and sweeps alike. An invalid
-    // entry is fatal rather than ignored - a silently dropped exclusion
-    // would let the tool poll a subnet you believe is off limits.
+    // Comma-separated CIDRs never to poll; an invalid entry is fatal.
     'exclude_subnets' => '',
 
-    // Schemes bin/cucm-probe.php tries when probing a handset. An estate
-    // that is entirely HTTPS should set this to "https": the http attempts
-    // do not fail fast, they time out, costing phone_timeout twice per run.
-    // This does NOT affect collection - sweeps only ever use phone_url_base.
+    // Schemes cucm-probe.php tries; sweeps use phone_url_base only.
     'phone_probe_schemes' => 'https,http',
     'phone_parallel'  => 10,
     'phone_timeout'   => 10,
     'phone_connect_timeout' => 5,
-    // 'config' is included so CDP/LLDP neighbour info is collected. Each
-    // adapter is one more request per phone, so trim this list if a sweep
-    // needs to be faster and the extra context is not wanted.
+    // One request per adapter per phone; 'config' supplies CDP/LLDP neighbours.
     'adapters'        => 'network,access,ethernet,device,config',
 
     'db_enabled'      => 1,
@@ -105,16 +76,7 @@ function cps_load_config(?string $file): array
     }
     if ($file !== null) {
         if (!is_readable($file)) { cps_die("config file not readable: $file"); }
-        // INI_SCANNER_RAW, deliberately.
-        //
-        // The TYPED and NORMAL scanners both reinterpret a value that merely
-        // LOOKS boolean: "off", "no", "false" and "none" come back as false
-        // or "". That silently turned `ris_partitions = off` into an empty
-        // pattern list, so discovery queried nothing and reported zero
-        // phones - a config file that reads correctly, produces no error,
-        // and disables the tool. RAW keeps every value as written; the few
-        // settings that are genuinely boolean or numeric are coerced
-        // explicitly at the point of use.
+        // INI_SCANNER_RAW: NORMAL turns 'off'/'no' into false; coerce at use.
         $ini = parse_ini_file($file, false, INI_SCANNER_RAW);
         if ($ini === false) { cps_die("config file is not valid INI: $file"); }
         foreach ($ini as $k => $v) {
@@ -147,13 +109,7 @@ function cps_load_config(?string $file): array
     return $cfg;
 }
 
-/**
- * Read a config value that is meant to be a boolean.
- *
- * Accepts 1/0, true/false, yes/no, on/off. Anything unrecognised falls back
- * to $default rather than to PHP's cast, under which the string "false"
- * is true.
- */
+/** Boolean config value (1/0, true/false, yes/no, on/off); else $default. */
 function cps_cfg_bool(array $cfg, string $key, bool $default = false): bool
 {
     $v = $cfg[$key] ?? null;
@@ -247,9 +203,7 @@ function cps_phone_fetcher(array $cfg, ?array $adapters = null): CpsPhoneFetcher
 }
 
 /**
- * Minimal long-option parser: --key=value, --key value, --flag, and
- * positionals. Kept deliberately small - this has to be readable by whoever
- * inherits it on a box with no internet to look anything up.
+ * Minimal long-option parser: --key=value, --key value, --flag, positionals.
  *
  * @return array{opts: array<string,string|bool>, args: string[]}
  */

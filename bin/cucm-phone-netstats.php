@@ -1,12 +1,7 @@
 #!/usr/bin/env php
 <?php
 /**
- * cucm-phone-netstats.php - statistics from a single phone, by IP address.
- *
- * The direct successor to patching-tools/cisco-phone-netstats.php: same
- * tolerant table parser, but it fetches the access port as well as the
- * network port, and can show the normalised view (link speed, duplex, error
- * rollup) beside the raw labels.
+ * cucm-phone-netstats.php - port statistics from a single phone, by IP address.
  *
  * Usage:
  *   php bin/cucm-phone-netstats.php <phone-ip> [--adapters network,access]
@@ -37,8 +32,7 @@ $adapters = is_string($opts['adapters'] ?? null)
 $fetcher = cps_phone_fetcher($cfg, $adapters);
 $showNorm = !empty($opts['normalised']) || !empty($opts['normalized']);
 
-// --raw dumps the page bodies untouched, for working out how an unfamiliar
-// firmware lays its table out. It bypasses the parser entirely on purpose.
+// --raw: page bodies untouched, no parsing.
 if (!empty($opts['raw'])) {
     foreach ($adapters as $a) {
         $url = cps_phone_url($ip, CPS_ADAPTERS[$a], (string)$cfg['phone_url_base']);

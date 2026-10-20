@@ -1,30 +1,21 @@
 #!/usr/bin/env php
 <?php
 /**
- * cucm-sweep.php - the whole job: discover registered phones from CUCM,
- * pull each phone's port statistics, and store the lot in MySQL.
+ * cucm-sweep.php - discover phones from CUCM, poll their port statistics, store them in MySQL.
  *
  * Usage:
  *   php bin/cucm-sweep.php [--config FILE] [--status Registered] [--source risport|axl-sql]
  *                          [--adapters network,access,ethernet,device]
  *                          [--sample N] [--limit N] [--match TEXT] [--exclude-subnet CIDR]
+ *                          [--phones-from FILE] [--only-problems [SWEEP]]
  *                          [--no-db] [--json] [--skip-no-http] [--verbose]
  *
  * Examples:
  *   php bin/cucm-sweep.php                            # full sweep into the database
  *   php bin/cucm-sweep.php --sample 20 --no-db        # 20 random phones, nothing stored
- *   php bin/cucm-sweep.php --match Warehouse --sample 5     # by description
- *   php bin/cucm-sweep.php --match name:SEP0011            # scoped to one field
- *   php bin/cucm-sweep.php --limit 5 --no-db --json   # the FIRST five (one node, one site)
+ *   php bin/cucm-sweep.php --match name:SEP0011 --sample 5
  *   php bin/cucm-sweep.php --phones-from phones.csv   # poll a list, skip CUCM
  *   php bin/cucm-sweep.php --only-problems            # re-check what the last sweep flagged
- *
- * On a large estate reach for --sample, not --limit: RisPort returns devices
- * grouped by node, so the first N are usually all from one subscriber.
- *
- * --phones-from exists for the airgapped case where discovery and polling
- * may not happen from the same host or at the same time: cucm-phones.php
- * --csv on one box, this on another.
  */
 
 require_once dirname(__DIR__) . '/lib/config.php';
@@ -35,20 +26,26 @@ $p    = cps_parse_args($argv, ['json', 'no-db', 'verbose', 'quiet', 'debug', 'sk
 $opts = $p['opts'];
 
 if (!empty($opts['help'])) {
-    fwrite(STDERR, "Usage: php bin/cucm-sweep.php [--config FILE] [--status S] [--source risport|axl-sql]\n"
-                 . "       [--adapters a,b,c] [--sample N] [--limit N] [--match TEXT]\n"
-                 . "       [--phones-from FILE] [--no-db] [--json] [--skip-no-http] [--verbose]\n"
-                 . "\n  --sample N   N random phones (use this on a large estate)\n"
-                 . "  --limit N    the first N discovered (usually all one node)\n"
-                 . "  --match TEXT substring on name/description/model/ip; 'field:value' scopes it\n"
-                 . "               (for device TYPES use --device-prefixes: --match SEP also\n"
-                 . "                hits CSFJOSEPH, since JO-SEP-H contains it)\n"
-                 . "  --exclude-subnet CIDR[,CIDR]  leave these subnets alone\n"
-                 . "  --device-prefixes SEP[,CSF]   device types to poll (default SEP)\n"
-                 . "  --all-devices                 poll every registered device, soft clients included\n"
+    fwrite(STDERR, "Usage: php bin/cucm-sweep.php [options]\n"
+                 . "  --config FILE                 config file\n"
+                 . "  --status S                    registration status to discover (default Registered)\n"
+                 . "  --source risport|axl-sql      discovery source (default risport)\n"
+                 . "  --adapters a,b,c              pages to fetch: network,access,ethernet,device\n"
+                 . "  --sample N                    N random phones\n"
+                 . "  --limit N                     the first N phones\n"
+                 . "  --match TEXT                  substring on name/description/model/ip; field:value for one\n"
+                 . "  --exclude-subnet CIDR[,CIDR]  leave these subnets out\n"
+                 . "  --device-prefixes SEP[,CSF]   device name prefixes (default SEP)\n"
+                 . "  --all-devices                 every device type, soft clients included\n"
                  . "  --parallel N                  phones in flight at once (default 10)\n"
-                 . "  --only-problems [SWEEP]       only phones the last (or given) sweep flagged:\n"
-                 . "                                speed mismatch, errors, switch mismatch\n");
+                 . "  --phones-from FILE            poll phones from a cucm-phones CSV/JSON\n"
+                 . "  --only-problems [SWEEP]       only phones the last (or given) sweep flagged\n"
+                 . "  --problems LIST               mismatch,errors,growing,switch (default mismatch,errors,switch)\n"
+                 . "  --min-errors N                with 'errors': ports with >= N errors\n"
+                 . "  --skip-no-http                skip phones CUCM says have no web server\n"
+                 . "  --no-db                       do not store results\n"
+                 . "  --json                        JSON output\n"
+                 . "  --verbose / --quiet           more / less on stderr\n");
     exit(0);
 }
 
@@ -63,15 +60,29 @@ $adapters = is_string($opts['adapters'] ?? null)
     ? preg_split('/[\s,]+/', $opts['adapters'], -1, PREG_SPLIT_NO_EMPTY)
     : preg_split('/[\s,]+/', (string)$cfg['adapters'], -1, PREG_SPLIT_NO_EMPTY);
 
-// --only-problems [N]: re-poll just the phones sweep N (default: the latest
-// completed one) flagged - mismatch, errors, or switch mismatch.
 $problemNames = null;
+if (!isset($opts['only-problems']) && (isset($opts['problems']) || isset($opts['min-errors']))) {
+    cps_die('--problems and --min-errors only apply with --only-problems');
+}
 if (isset($opts['only-problems'])) {
     $pdb  = new CpsDb($cfg);
+    if (is_string($opts['only-problems']) && !ctype_digit($opts['only-problems'])) {
+        cps_die("--only-problems takes a sweep number, got '{$opts['only-problems']}'");
+    }
     $from = is_string($opts['only-problems']) ? (int)$opts['only-problems'] : $pdb->latestSweepId();
     if (!$from) { cps_die('--only-problems needs a completed sweep to start from'); }
+    if (!$pdb->query('SELECT 1 FROM sweeps WHERE id = ? AND finished_at IS NOT NULL', [$from])) {
+        cps_die("sweep #$from does not exist or did not complete");
+    }
     $why = [];
-    $problemNames = array_map('strval', $pdb->problemPhones($from, $why));
+    $reasons = is_string($opts['problems'] ?? null)
+        ? preg_split('/[\s,]+/', strtolower($opts['problems']), -1, PREG_SPLIT_NO_EMPTY) : null;
+    $minErr  = isset($opts['min-errors']) && is_string($opts['min-errors']) ? max(1, (int)$opts['min-errors']) : 1;
+    try {
+        $problemNames = array_map('strval', $pdb->problemPhones($from, $why, $reasons, $minErr));
+    } catch (InvalidArgumentException $e) {
+        cps_die($e->getMessage());
+    }
     cps_log(sprintf('%d phones flagged in sweep #%d (%s)', count($problemNames), $from,
         implode(', ', array_map(fn($k, $v) => "$k $v", array_keys($why), $why))));
     if (!$problemNames) {
@@ -85,23 +96,22 @@ $t0 = microtime(true);
 if (isset($opts['phones-from']) && is_string($opts['phones-from'])) {
     $phones = cps_phones_from_file($opts['phones-from']);
     $source = 'file:' . basename($opts['phones-from']);
-    cps_log(count($phones) . ' phones loaded from ' . $opts['phones-from']);
+    cps_log(count($phones) . ' phones loaded from ' . $opts['phones-from'], 2);
     if ($problemNames !== null) {
         $want   = array_flip($problemNames);
         $phones = array_values(array_filter($phones, fn($r) => isset($want[$r['name']])));
         $source = "problems:#$from";
     }
 } elseif ($problemNames !== null) {
-    // Ask RisPort for these names only: the estate-wide enumeration is the
-    // slow, rate-limited part of a sweep, and polling is already parallel.
+    // Ask RisPort for these names only.
     if (!cps_server_urls($cfg)) { cps_die('no cucm_servers configured (see cucm.conf.example)'); }
     $phones = cps_discover_named_phones($cfg, $problemNames, $status);
     $source = "problems:#$from";
-    cps_log(sprintf('%d of %d flagged phones are currently %s', count($phones), count($problemNames), $status));
+    cps_log(sprintf('%d of %d flagged phones are currently %s', count($phones), count($problemNames), $status), 2);
 } else {
     if (!cps_server_urls($cfg)) { cps_die('no cucm_servers configured (see cucm.conf.example)'); }
     $phones = cps_discover_phones($cfg, $source, $status, $opts);
-    cps_log(count($phones) . " phones discovered from CUCM (status=$status, source=$source)");
+    cps_log(count($phones) . " phones discovered from CUCM (status=$status, source=$source)", 2);
 }
 $phones     = cps_apply_device_prefixes($phones, $cfg, $opts);
 $phones     = cps_apply_subnet_exclusions($phones, $cfg, $opts);
@@ -109,24 +119,11 @@ $discovered = count($phones);
 
 $pollable = array_values(array_filter($phones, function ($r) use ($opts) {
     if (empty($r['ip'])) { return false; }
-    // HttpSupported=0 means CUCM believes the phone has no web server; with
-    // --skip-no-http we take its word for it rather than spending a timeout
-    // per handset finding out. Off by default: CUCM is sometimes wrong, and
-    // a wrong skip is invisible in the results.
     if (!empty($opts['skip-no-http']) && cps_tri_bool($r['http_supported'] ?? '') === 0) { return false; }
     return true;
 }));
-// --match narrows to a site or a model before any sampling, so
-// "--match SEP0011 --sample 20" means twenty of THAT set, not twenty of the
-// estate that happen to match.
+// --match filters before --sample/--limit.
 if ($match !== null && $match !== '') {
-    // --match is a SUBSTRING search, and across several fields. That is
-    // useful for "everything at the Warehouse" and a trap for device types:
-    // "--match SEP" also matches CSFJOSEPH, because JO-SEP-H contains it.
-    // Use --device-prefixes for device types; it anchors to the name.
-    //
-    // "field:value" scopes the search to one field for the cases where the
-    // broad form is too broad.
     $fields = ['name', 'description', 'model', 'ip'];
     $needle = mb_strtolower($match);
     $scope  = $fields;
@@ -144,41 +141,35 @@ if ($match !== null && $match !== '') {
         return false;
     }));
     cps_log(sprintf("%d phones match '%s' (%s)", count($pollable), $match,
-        count($scope) === 1 ? $scope[0] . ' only' : 'substring across ' . implode('/', $fields)));
+        count($scope) === 1 ? $scope[0] . ' only' : 'substring across ' . implode('/', $fields)), 2);
 }
 
-// --sample takes a random spread; --limit takes the first N.
-//
-// They are not the same test. RisPort returns devices grouped by node, so
-// the first N are typically all from one subscriber, one site and often one
-// switch - exactly the population least likely to expose a problem that only
-// some of the estate has. For a smoke test across thousands of handsets,
-// --sample is the honest one.
 if ($sample > 0 && $sample < count($pollable)) {
     $keys = array_rand($pollable, $sample);
     $picked = [];
     foreach ((array)$keys as $k) { $picked[] = $pollable[$k]; }
     $pollable = $picked;
-    cps_log("randomly sampled $sample phones from the pollable set");
+    cps_log("randomly sampled $sample phones from the pollable set", 2);
 }
 if ($limit > 0) { $pollable = array_slice($pollable, 0, $limit); }
 
 cps_log(sprintf('%d of %d phones are pollable%s', count($pollable), $discovered,
-    $sample > 0 ? " (random sample of $sample)" : ($limit > 0 ? " (first $limit)" : '')));
+    $sample > 0 ? " (random sample of $sample)" : ($limit > 0 ? " (first $limit)" : '')), 2);
 if (!$pollable) { cps_die('no phones with an IP address to poll'); }
 
 // ------------------------------------------------------------------ polling
 $db      = null;
 $sweepId = null;
+if (isset($opts['parallel']) && is_string($opts['parallel'])) {
+    $cfg['phone_parallel'] = max(1, (int)$opts['parallel']);
+}
+$fetcher = cps_phone_fetcher($cfg, $adapters);   // validates adapters before a sweep row exists
 if ($useDb) {
     $db      = new CpsDb($cfg);
     $sweepId = $db->startSweep($source, cps_server_urls($cfg), CPS_VERSION);
-    cps_log("sweep #$sweepId opened");
+    cps_log("sweep #$sweepId opened", 2);
 
-    // If the run dies anyway, say so on the sweep row. finished_at stays
-    // NULL so the reporting views keep excluding a partial run, but the
-    // reason is recorded rather than the sweep just sitting there open with
-    // no explanation months later.
+    // Record why an unfinished sweep stopped; finished_at stays NULL.
     register_shutdown_function(function () use ($db, $sweepId) {
         if (!isset($GLOBALS['CPS_SWEEP_FINISHED'])) {
             $e = error_get_last();
@@ -194,23 +185,18 @@ if ($useDb) {
     });
 }
 
-if (isset($opts['parallel']) && is_string($opts['parallel'])) {
-    $cfg['phone_parallel'] = max(1, (int)$opts['parallel']);
-}
-// Mirror the model-enum table so past sweeps can be made readable too.
 if ($db && !empty($GLOBALS['CPS_MODEL_NAMES'])) {
     try {
         $db->upsertDeviceModels($GLOBALS['CPS_MODEL_NAMES']);
         $fixed = $db->backfillModelNames();
-        if ($fixed > 0) { cps_log("resolved $fixed stored model enum(s) to names"); }
+        if ($fixed > 0) { cps_log("resolved $fixed stored model enum(s) to names", 2); }
     } catch (Throwable $e) {
         cps_warn('could not store model names: ' . $e->getMessage());
     }
 }
 
-$fetcher = cps_phone_fetcher($cfg, $adapters);
 $results = $fetcher->fetchMany(array_map(fn($r) => ['name' => $r['name'], 'ip' => $r['ip']], $pollable));
-cps_log(sprintf('polled %d phones in %.1fs', count($results), microtime(true) - $t0));
+cps_log(sprintf('polled %d phones in %.1fs', count($results), microtime(true) - $t0), 2);
 
 // ------------------------------------------------------------------ storing
 $byName  = [];
@@ -221,16 +207,12 @@ $dbErrors = 0;
 $phoneErrors = 0;
 $summary = [];
 foreach ($results as $name => $res) {
-  // Everything for one phone is contained. A sweep of thousands must never
-  // be brought down by one handset: an unhandled throw here previously took
-  // the whole run with it, losing every phone after the bad one.
+  // One bad phone must not end the sweep.
   try {
     $disc  = $byName[$name] ?? ['name' => $name];
     $pages = $res['pages'] ?? [];
 
-    // A phone counts as OK when at least one port page parsed. Requiring
-    // every adapter would mark a perfectly healthy phone failed just because
-    // it does not serve, say, the ethernet page on its firmware.
+    // OK = at least one port page parsed.
     $gotPort = false;
     foreach (CPS_PORT_ADAPTERS as $a) {
         if (!empty($pages[$a]['ok'])) { $gotPort = true; break; }
@@ -244,10 +226,7 @@ foreach ($results as $name => $res) {
         }
     }
 
-    // Neighbour info is harvested from EVERY page, not just the config one.
-    // Firmware disagrees about where CDP/LLDP appears - some builds put it on
-    // the network port page - and looking in only one place means the field
-    // is there, visible in the raw pairs, and silently not collected.
+    // CDP/LLDP can appear on any page depending on firmware.
     $neighbour = [];
     foreach ($pages as $page) {
         if (!empty($page['ok'])) { $neighbour += cps_normalise_neighbour($page['pairs']); }
@@ -285,8 +264,7 @@ foreach ($results as $name => $res) {
 
     if (!$db) { continue; }
 
-    // One transaction per phone: a failure part-way through a long sweep
-    // leaves every phone before it intact and committed.
+    // One transaction per phone.
     try {
         $db->begin();
         $phoneId = $db->upsertPhone([
@@ -327,27 +305,26 @@ foreach ($results as $name => $res) {
   }
 }
 
-// Common Phone Profile per phone: one AXL SQL query per server, joined to
-// the inventory by name. Context only - a failure warns and the sweep stands.
+// Common Phone Profile per phone; a failure only warns.
 if ($db && (string)($cfg['axl_user'] ?? '') !== '' && cps_cfg_bool($cfg, 'collect_phone_profiles', true)) {
     try {
         $profiles = cps_common_phone_profiles($cfg);
         $stored   = $profiles ? $db->upsertPhoneConfig($profiles) : 0;
-        cps_log(sprintf('common phone profile: %d known to AXL, %d stored', count($profiles), $stored));
+        cps_log(sprintf('common phone profile: %d known to AXL, %d stored', count($profiles), $stored), 2);
     } catch (Throwable $e) {
         cps_warn('could not store common phone profiles: ' . $e->getMessage());
     }
 }
 
-$GLOBALS['CPS_SWEEP_FINISHED'] = true;
 if ($db) {
     $db->finishSweep($sweepId, [
         'discovered' => $discovered, 'polled' => count($results),
         'ok' => $ok, 'failed' => $failed,
     ], cps_sweep_notes($dbErrors, $phoneErrors));
-    cps_log("sweep #$sweepId closed");
-    // A sweep that reached every phone but stored none of it must not look
-    // like a success: the polling worked and the run is still worthless.
+}
+$GLOBALS['CPS_SWEEP_FINISHED'] = true;
+if ($db) {
+    cps_log("sweep #$sweepId closed", 2);
     if ($dbErrors > 0) {
         cps_warn("$dbErrors of " . count($results) . ' phones could not be stored');
     }
@@ -385,8 +362,7 @@ if (!empty($opts['json'])) {
         $discovered, count($results), $ok, $failed, microtime(true) - $t0,
         $sweepId ? " (sweep #$sweepId)" : ' (not stored)');
 }
-// Exit 2 when nothing usable came out of the run: no phone answered, or the
-// database rejected every write.
+// Exit 2: no phone answered, or every database write failed.
 exit((($failed > 0 && $ok === 0) || ($db && $dbErrors > 0 && $dbErrors === count($results))) ? 2 : 0);
 
 function cps_sweep_notes(int $dbErrors, int $phoneErrors): ?string
@@ -405,11 +381,7 @@ function cps_fmt_link(?array $p): string
     return ($p['speed_mbps'] ?? '?') . '/' . ($p['duplex'] ?? '?');
 }
 
-/**
- * Read a phone list produced by cucm-phones.php (--csv or --json).
- * Accepts either, sniffed by first character, so whichever the operator
- * carried across the airgap works without a flag.
- */
+/** Read a phone list from cucm-phones.php --csv or --json (sniffed). */
 function cps_phones_from_file(string $file): array
 {
     if (!is_readable($file)) { cps_die("phones file not readable: $file"); }

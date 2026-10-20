@@ -26,6 +26,12 @@ foreach (['db_host', 'db_port', 'db_name', 'db_user', 'db_pass'] as $k) {
     $env = getenv('CPS_' . strtoupper($k));
     if ($env !== false && $env !== '') { $CONFIG[$k] = $env; }
 }
+if ($CONFIG['db_pass'] === '' && ($ini['db_pass_file'] ?? '') !== '' && is_readable(trim($ini['db_pass_file'], " \t\"'"))) {
+    $CONFIG['db_pass'] = trim((string)file_get_contents(trim($ini['db_pass_file'], " \t\"'")));
+}
+if ($CONFIG['db_pass'] === '' && ($ini['db_pass_env'] ?? '') !== '') {
+    $CONFIG['db_pass'] = (string)getenv(trim($ini['db_pass_env'], " \t\"'"));
+}
 
 $PARAMS = $_GET;
 $QUERY_STRING_LOST = false;   
@@ -46,7 +52,7 @@ if (!$PARAMS) {
 const REPORTS = [
     'speed-mismatch' => [
         'title' => 'Speed mismatch',
-        'blurb' => 'Phones whose access (PC) port is running at a different speed or duplex from the network (switch) port. Only phones with both ports up are compared.',
+        'blurb' => 'Phones whose PC port speed or duplex differs from the network port (both ports up).',
         'view'  => 'v_port_speed_mismatch',
         'sweep_scoped' => true,
         'columns' => [
@@ -65,7 +71,7 @@ const REPORTS = [
     ],
     'errors' => [
         'title' => 'Errors',
-        'blurb' => 'Ports reporting a non-zero error counter. Traffic counters (broadcast, multicast, unicast) are not errors and are excluded.',
+        'blurb' => 'Ports with a non-zero error counter.',
         'view'  => 'v_port_errors',
         'sweep_scoped' => true,
         'columns' => [
@@ -86,7 +92,7 @@ const REPORTS = [
     ],
     'error-trend' => [
         'title' => 'Increasing errors',
-        'blurb' => 'Ports whose error counters grew between sweeps. One row per phone and port - the most recent growth - with how many sweeps it grew in and the total across them. A counter that drops is a handset reboot, not an improvement, and is excluded.',
+        'blurb' => 'Ports whose error counters grew between sweeps, one row per phone and port.',
         'view'  => 'v_port_error_deltas',
         'sweep_scoped' => false,
         'columns' => [
@@ -113,7 +119,7 @@ const REPORTS = [
     ],
     'switch-mismatch' => [
         'title' => 'Switch mismatch',
-        'blurb' => 'Phones whose network port speed or duplex differs from the switch port, per the newest imported show interface status of that switch.',
+        'blurb' => 'Phones whose network port speed or duplex differs from the switch port.',
         'view'  => 'v_switch_port_mismatch',
         'sweep_scoped' => true,
         'columns' => [
@@ -133,8 +139,9 @@ const REPORTS = [
     ],
 ];
 
-const ROW_CAP = 20000;   
+const ROW_CAP = 20000;
 
+$PARAMS = array_filter($PARAMS, 'is_string');
 $report = $PARAMS['r'] ?? 'speed-mismatch';
 if (!isset(REPORTS[$report])) { $report = 'speed-mismatch'; }
 $spec = REPORTS[$report];
@@ -201,6 +208,7 @@ try {
     }
 } catch (Throwable $e) {
     $error = $e->getMessage();
+    if (preg_match("/doesn't exist|1146|1356/", $error)) { $error .= ' - re-run bin/cucm-initdb.php'; }
 }
 
 $capped = count($rows) > ROW_CAP;
@@ -234,13 +242,22 @@ function qs(array $over = []): string {
 }
 
 if (isset($PARAMS['csv'])) {
+    if ($error !== null) {
+        http_response_code(500);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Cannot export: ', $error, "\n";
+        exit;
+    }
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="' . $report . '-sweep' . (int)$sweepId . '.csv"');
     $out = fopen('php://output', 'w');
     fputcsv($out, array_values($visible), ',', '"', '\\');
     foreach ($rows as $r) {
         $line = [];
-        foreach (array_keys($visible) as $c) { $line[] = (string)($r[$c] ?? ''); }
+        foreach (array_keys($visible) as $c) {
+            $v = (string)($r[$c] ?? '');
+            $line[] = preg_match('/^[=+\-@\t\r]/', $v) && !is_numeric($v) ? "'" . $v : $v;
+        }
         fputcsv($out, $line, ',', '"', '\\');
     }
     exit;
@@ -363,10 +380,8 @@ try {
   <div class="err" style="margin-bottom:16px">
     <strong>This web server is not passing the CGI environment to PHP, so the tabs cannot work.</strong>
     <p style="margin:8px 0 0">
-      <code>REQUEST_URI</code> and <code>QUERY_STRING</code> are both absent, which means the
-      <code>location ~ \.php$</code> block is missing <code>include fastcgi_params;</code>
-      (or <code>include fastcgi.conf;</code>). Every tab will render the default report until
-      that is added. See <code>docs/web-deployment.md</code>.
+      Add <code>include fastcgi_params;</code> to the <code>location ~ \.php$</code> block.
+      See <code>docs/web-deployment.md</code>.
     </p>
   </div>
 <?php endif; ?>
@@ -415,7 +430,7 @@ try {
   <?php endif; ?>
 
   <?php if (count($visible) > 12): ?>
-    <div class="hint">This table is wider than the window &mdash; scroll it sideways to see the remaining counters.</div>
+    <div class="hint">Scroll sideways for more columns.</div>
   <?php endif; ?>
   <div class="wrap">
     <?php if (!$rows): ?>
@@ -474,10 +489,7 @@ try {
   <?php if ($QUERY_STRING_LOST): ?>
     <div class="err" style="margin-bottom:12px">
       <strong>This web server is not passing the query string to PHP.</strong>
-      The tabs are working here only because the parameters were recovered from
-      <code>REQUEST_URI</code>. In nginx this is usually a <code>try_files</code>
-      missing <code>?$query_string</code>, or a <code>location ~ \.php$</code>
-      block that does not <code>include fastcgi_params</code>. See
+      Check <code>try_files</code> has <code>?$query_string</code>. See
       <code>docs/web-deployment.md</code>.
     </div>
   <?php endif; ?>

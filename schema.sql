@@ -1,25 +1,11 @@
 -- cucm-phone-stats schema (MySQL 8.0+ / MariaDB 10.3+)
---
--- Shape of the data:
---   sweeps        one collection run
---   phones        stable inventory, one row per device name, updated in place
---   registrations per sweep: where the phone was and what CUCM thought of it
---   port_stats    per sweep, per port: normalised link state + counters
---   page_fetches  per sweep, per adapter: the verbatim label/value pairs and
---                 every failure, including the ones that produced no stats
---   uplinks       per sweep: the switch and port the phone reports (CDP/LLDP)
---   switch_captures / switch_ports
---                 imported "show interface status" output, raw and parsed
---
--- The trend views use window functions (LAG, and a named WINDOW clause), so
--- the floor is MySQL 8.0 or MariaDB 10.2. Verified on MySQL 8.0.46 and
--- 8.4.11 (the deployment target), and on MariaDB 10.3.
---
--- Nothing here deletes rows. The runtime account therefore needs only
--- SELECT, INSERT and UPDATE; see "Database setup" in the README.
+-- Idempotent: safe to re-apply with bin/cucm-initdb.php.
+-- Views use window functions (LAG, named WINDOW).
+-- The runtime account needs only SELECT, INSERT and UPDATE.
 
 SET NAMES utf8mb4;
 
+-- One collection run.
 CREATE TABLE IF NOT EXISTS sweeps (
   id                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   started_at        DATETIME        NOT NULL,
@@ -36,6 +22,7 @@ CREATE TABLE IF NOT EXISTS sweeps (
   KEY idx_sweeps_started (started_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Phone inventory, one row per device name.
 CREATE TABLE IF NOT EXISTS phones (
   id                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   device_name       VARCHAR(64)     NOT NULL,
@@ -44,9 +31,7 @@ CREATE TABLE IF NOT EXISTS phones (
   model             VARCHAR(64)     NULL,
   product           VARCHAR(64)     NULL,
   device_class      VARCHAR(32)     NULL,
-  -- RisPort returns DirNumber as a comma-separated list of EVERY line
-  -- appearance, so a phone with a handful of lines runs past 64 characters
-  -- easily. Widened, and clipped defensively on write.
+  -- comma-separated list of every line appearance
   dir_number        VARCHAR(512)    NULL,
   serial_number     VARCHAR(64)     NULL,
   model_number      VARCHAR(64)     NULL,
@@ -59,6 +44,7 @@ CREATE TABLE IF NOT EXISTS phones (
   KEY idx_phones_mac (mac_address)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Per sweep: CUCM registration state.
 CREATE TABLE IF NOT EXISTS registrations (
   id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   sweep_id       BIGINT UNSIGNED NOT NULL,
@@ -82,6 +68,7 @@ CREATE TABLE IF NOT EXISTS registrations (
   CONSTRAINT fk_reg_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Per sweep, per port: link state and counters.
 CREATE TABLE IF NOT EXISTS port_stats (
   id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   sweep_id            BIGINT UNSIGNED NOT NULL,
@@ -115,7 +102,7 @@ CREATE TABLE IF NOT EXISTS port_stats (
   tx_multicast        BIGINT UNSIGNED NULL,
   tx_broadcast        BIGINT UNSIGNED NULL,
   tx_unicast          BIGINT UNSIGNED NULL,
-  -- rollup of the CPS_ERROR_COLUMNS counters, computed at collection time
+  -- sum of CPS_ERROR_COLUMNS
   errors_total        BIGINT UNSIGNED NULL,
   unmapped_labels     INT UNSIGNED    NOT NULL DEFAULT 0,
   PRIMARY KEY (id),
@@ -126,9 +113,7 @@ CREATE TABLE IF NOT EXISTS port_stats (
   CONSTRAINT fk_ps_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Every adapter fetched, successful or not, with the verbatim pairs. This is
--- the safety net for label drift: a counter the normaliser does not know is
--- still here afterwards, so a new firmware does not cost a second sweep.
+-- Per sweep, per adapter: verbatim label/value pairs or the failure.
 CREATE TABLE IF NOT EXISTS page_fetches (
   id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   sweep_id    BIGINT UNSIGNED NOT NULL,
@@ -147,16 +132,7 @@ CREATE TABLE IF NOT EXISTS page_fetches (
   CONSTRAINT fk_pf_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- What the phone itself says it is plugged into, per sweep.
---
--- A separate table rather than columns on `phones` or `registrations`: this
--- is the phone's own view via CDP/LLDP, not CUCM's, and a phone moves desks.
--- Keeping it per-sweep means the reports can say which switch port a fault
--- was seen on at the time, not merely where the handset is today.
---
--- Being a new table also means an existing database picks it up from
--- CREATE TABLE IF NOT EXISTS with no migration; adding columns to a table
--- that already exists would silently do nothing.
+-- Per sweep: the switch and port the phone reports via CDP/LLDP.
 CREATE TABLE IF NOT EXISTS uplinks (
   id                     BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   sweep_id               BIGINT UNSIGNED NOT NULL,
@@ -168,8 +144,7 @@ CREATE TABLE IF NOT EXISTS uplinks (
   lldp_neighbour         VARCHAR(255) NULL,
   lldp_neighbour_port    VARCHAR(128) NULL,
   lldp_neighbour_ip      VARCHAR(45)  NULL,
-  -- Collapsed answer: CDP preferred, LLDP as fallback. Stored rather than
-  -- derived so every report and any external query agree on the choice.
+  -- collapsed answer: CDP preferred, LLDP fallback
   switch_name            VARCHAR(255) NULL,
   switch_port            VARCHAR(128) NULL,
   switch_ip              VARCHAR(45)  NULL,
@@ -183,18 +158,11 @@ CREATE TABLE IF NOT EXISTS uplinks (
   CONSTRAINT fk_up_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- "show interface status" captures, one row per switch per distinct output.
---
--- The raw text is kept beside the parsed rows for the same reason
--- page_fetches keeps raw pairs: a column the parser misreads can be
--- re-read later without going back to the switches. Re-importing identical
--- output only moves captured_at forward (unique on switch + content hash).
+-- Imported "show interface status" output, one row per switch per distinct output.
 CREATE TABLE IF NOT EXISTS switch_captures (
   id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   switch_name    VARCHAR(255)    NOT NULL,
-  -- lowercased, domain and "(serial)" stripped; matched against
-  -- v_uplink_keys.switch_key. An IPv4 name is kept whole and also set as
-  -- switch_ip, for inventories that name switches by address.
+  -- cps_switch_key(), matched against v_uplink_keys.switch_key
   switch_key     VARCHAR(255)    NOT NULL,
   switch_ip      VARCHAR(45)     NULL,
   source_file    VARCHAR(512)    NULL,
@@ -210,12 +178,12 @@ CREATE TABLE IF NOT EXISTS switch_captures (
   KEY idx_sc_ip (switch_ip)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Parsed ports of a switch capture.
 CREATE TABLE IF NOT EXISTS switch_ports (
   id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   capture_id   BIGINT UNSIGNED NOT NULL,
   port         VARCHAR(64)     NOT NULL,
-  -- "Gi1/0/12" -> "gi1/0/12"; CDP's "GigabitEthernet1/0/12" reduces to the
-  -- same key in v_uplink_keys.
+  -- cps_if_key(), e.g. "Gi1/0/12" -> "gi1/0/12"
   port_key     VARCHAR(64)     NOT NULL,
   name         VARCHAR(64)     NULL,
   status       VARCHAR(32)     NULL,
@@ -232,9 +200,7 @@ CREATE TABLE IF NOT EXISTS switch_ports (
   CONSTRAINT fk_sp_capture FOREIGN KEY (capture_id) REFERENCES switch_captures (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Per-phone CUCM configuration read over AXL. One row per phone, updated in
--- place each sweep. The uuid is device.fkcommonphoneconfig (= AXL's uuid
--- attribute), uppercase, no braces.
+-- Per-phone CUCM configuration from AXL (uuid uppercase, no braces).
 CREATE TABLE IF NOT EXISTS phone_config (
   phone_id                  BIGINT UNSIGNED NOT NULL,
   common_phone_profile_uuid CHAR(36)        NULL,
@@ -246,8 +212,7 @@ CREATE TABLE IF NOT EXISTS phone_config (
   CONSTRAINT fk_pc_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Every Common Phone Profile change bin/cucm-set-profile.php made or tried,
--- by batch, so a batch can be reviewed and undone (--undo BATCH).
+-- Common Phone Profile changes by batch, for review and --undo.
 CREATE TABLE IF NOT EXISTS profile_changes (
   id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   batch        VARCHAR(32)     NOT NULL,
@@ -267,10 +232,7 @@ CREATE TABLE IF NOT EXISTS profile_changes (
   CONSTRAINT fk_pch_phone FOREIGN KEY (phone_id) REFERENCES phones (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- CUCM's model enum to its name, mirrored from the cluster's typemodel
--- table. RisPort reports a model as a number; the mapping is version
--- specific and hundreds of rows, so it is read from the cluster rather than
--- hard-coded. Kept so historical rows can be backfilled without re-sweeping.
+-- CUCM model enum => name, mirrored from the cluster's typemodel table.
 CREATE TABLE IF NOT EXISTS device_models (
   enum        INT UNSIGNED NOT NULL,
   name        VARCHAR(128) NOT NULL,
@@ -282,18 +244,12 @@ CREATE TABLE IF NOT EXISTS device_models (
 -- Reporting views
 -- ---------------------------------------------------------------------------
 
--- started_at is second-resolution, so two sweeps started in the same second
--- tie. Every ordering over sweeps therefore breaks the tie on the
--- auto-increment id, which is monotonic in creation order. Without it, both
--- "the latest sweep" and the LAG() below pick arbitrarily among tied rows.
-CREATE OR REPLACE VIEW v_latest_sweep AS
+-- Latest finished sweep (ties on started_at broken by id).
+CREATE OR REPLACE SQL SECURITY INVOKER VIEW v_latest_sweep AS
 SELECT * FROM sweeps WHERE finished_at IS NOT NULL ORDER BY started_at DESC, id DESC LIMIT 1;
 
--- REPORT 1: access port speed/duplex does not match the network port.
--- Only phones where BOTH ports are up are compared - an access port with
--- nothing plugged into it is not a mismatch, and counting it as one would
--- bury the real findings under every unused PC port in the estate.
-CREATE OR REPLACE VIEW v_port_speed_mismatch AS
+-- Access port speed/duplex differs from the network port (both ports up).
+CREATE OR REPLACE SQL SECURITY INVOKER VIEW v_port_speed_mismatch AS
 SELECT
   n.sweep_id,
   s.started_at,
@@ -325,8 +281,8 @@ WHERE n.port = 'network'
   AND n.link_up = 1 AND a.link_up = 1
   AND (NOT (n.speed_mbps <=> a.speed_mbps) OR NOT (n.duplex <=> a.duplex));
 
--- REPORT 2: any port carrying a non-zero error counter.
-CREATE OR REPLACE VIEW v_port_errors AS
+-- Ports with a non-zero error counter.
+CREATE OR REPLACE SQL SECURITY INVOKER VIEW v_port_errors AS
 SELECT
   ps.sweep_id,
   s.started_at,
@@ -355,14 +311,8 @@ LEFT JOIN registrations r ON r.sweep_id = ps.sweep_id AND r.phone_id = ps.phone_
 LEFT JOIN uplinks       u ON u.sweep_id = ps.sweep_id AND u.phone_id = ps.phone_id
 WHERE ps.errors_total > 0;
 
--- REPORT 3 (base): consecutive-sweep deltas per phone and port.
---
--- Phone counters are free-running and reset when the handset reboots, so a
--- delta computed blind goes sharply negative on every reboot and, worse,
--- undercounts the sweep the reboot happened in. A drop in the total is
--- treated as a reset and reported as such rather than as a negative delta,
--- so a rebooting phone shows up as "reset", never as "improving".
-CREATE OR REPLACE VIEW v_port_error_deltas AS
+-- Error deltas between consecutive sweeps; a drop is a counter reset, not a negative delta.
+CREATE OR REPLACE SQL SECURITY INVOKER VIEW v_port_error_deltas AS
 SELECT
   ps.sweep_id,
   s.started_at,
@@ -392,18 +342,16 @@ LEFT JOIN uplinks u ON u.sweep_id = ps.sweep_id AND u.phone_id = ps.phone_id
 WHERE s.finished_at IS NOT NULL
 WINDOW w AS (PARTITION BY ps.phone_id, ps.port ORDER BY s.started_at, s.id);
 
--- REPORT 3: ports whose error counters actually grew between two sweeps.
-CREATE OR REPLACE VIEW v_port_errors_increasing AS
+-- Ports whose error counters grew since the previous sweep.
+CREATE OR REPLACE SQL SECURITY INVOKER VIEW v_port_errors_increasing AS
 SELECT * FROM v_port_error_deltas WHERE errors_delta > 0;
 
 -- ---------------------------------------------------------------------------
 -- Switch-side comparison
 -- ---------------------------------------------------------------------------
 
--- uplinks with the keys it is matched on. MUST agree with cps_switch_key()
--- and cps_if_key() in lib/switch.php: CDP reports "sw01.corp.local" /
--- "GigabitEthernet1/0/12" where the switch prints "SW01" / "Gi1/0/12".
-CREATE OR REPLACE VIEW v_uplink_keys AS
+-- uplinks with match keys. MUST match cps_switch_key()/cps_if_key() in lib/switch.php.
+CREATE OR REPLACE SQL SECURITY INVOKER VIEW v_uplink_keys AS
 SELECT
   k.id, k.sweep_id, k.phone_id, k.switch_name, k.switch_port, k.switch_ip,
   k.neighbour_source, k.switch_key,
@@ -438,26 +386,18 @@ FROM (
 ) k;
 
 -- The newest capture of each switch.
-CREATE OR REPLACE VIEW v_switch_latest_capture AS
+CREATE OR REPLACE SQL SECURITY INVOKER VIEW v_switch_latest_capture AS
 SELECT id, switch_name, switch_key, switch_ip, source_file, captured_at, ports_parsed
 FROM (
-  SELECT c.*, ROW_NUMBER() OVER (PARTITION BY c.switch_key ORDER BY c.captured_at DESC, c.id DESC) AS rn
+  SELECT c.id, c.switch_name, c.switch_key, c.switch_ip, c.source_file, c.captured_at, c.ports_parsed,
+         ROW_NUMBER() OVER (PARTITION BY c.switch_key ORDER BY c.captured_at DESC, c.id DESC) AS rn
   FROM switch_captures c
 ) x
 WHERE x.rn = 1;
 
--- REPORT 4 (base): every phone uplink against the switch's own view of the
--- port, from the newest capture of that switch.
---
--- The phone's NETWORK port is the switch-facing side (ethernet as fallback
--- for handsets that only expose that page). result is one of:
---   match | speed | duplex | speed+duplex      the comparison itself
---   no-capture            switch not imported (matched by name, then by IP)
---   no-port               switch imported, but the port is not in its output
---   switch-not-connected  switch says the port is not up
---   phone-link-down       phone does not report its network port up
---   unknown               a side gave no usable speed or duplex
-CREATE OR REPLACE VIEW v_switch_port_compare AS
+-- Phone uplink vs the switch's newest capture of that port. result: match, speed,
+-- duplex, speed+duplex, no-capture, no-port, switch-not-connected, phone-link-down, unknown.
+CREATE OR REPLACE SQL SECURITY INVOKER VIEW v_switch_port_compare AS
 SELECT
   u.sweep_id,
   s.started_at,
@@ -476,29 +416,31 @@ SELECT
   COALESCE(n.duplex, e.duplex)         AS phone_duplex,
   COALESCE(cn.id, ci.id)               AS capture_id,
   COALESCE(cn.captured_at, ci.captured_at) AS captured_at,
-  sp.port             AS switch_if,
+  COALESCE(spn.port, spi.port)             AS switch_if,
   -- first word only; the full description is in switch_ports.name
-  SUBSTRING_INDEX(TRIM(sp.name), ' ', 1) AS switch_if_name,
-  sp.status           AS switch_status,
-  sp.vlan             AS switch_vlan,
-  sp.speed_raw        AS switch_speed,
-  sp.duplex_raw       AS switch_duplex,
-  sp.speed_mbps       AS switch_speed_mbps,
-  sp.duplex           AS switch_duplex_norm,
-  sp.speed_auto       AS switch_speed_auto,
-  sp.duplex_auto      AS switch_duplex_auto,
+  SUBSTRING_INDEX(TRIM(COALESCE(spn.name, spi.name)), ' ', 1) AS switch_if_name,
+  COALESCE(spn.status, spi.status)           AS switch_status,
+  COALESCE(spn.vlan, spi.vlan)             AS switch_vlan,
+  COALESCE(spn.speed_raw, spi.speed_raw)        AS switch_speed,
+  COALESCE(spn.duplex_raw, spi.duplex_raw)       AS switch_duplex,
+  COALESCE(spn.speed_mbps, spi.speed_mbps)       AS switch_speed_mbps,
+  COALESCE(spn.duplex, spi.duplex)           AS switch_duplex_norm,
+  COALESCE(spn.speed_auto, spi.speed_auto)       AS switch_speed_auto,
+  COALESCE(spn.duplex_auto, spi.duplex_auto)      AS switch_duplex_auto,
   CASE
     WHEN cn.id IS NULL AND ci.id IS NULL THEN 'no-capture'
-    WHEN sp.id IS NULL                   THEN 'no-port'
-    WHEN sp.status <> 'connected'        THEN 'switch-not-connected'
-    WHEN NOT (COALESCE(n.link_up, e.link_up) <=> 1) THEN 'phone-link-down'
-    WHEN sp.speed_mbps IS NULL OR sp.duplex IS NULL
+    WHEN spn.id IS NULL AND spi.id IS NULL THEN 'no-port'
+    WHEN COALESCE(spn.status, spi.status) IS NULL THEN 'unknown'
+    WHEN COALESCE(spn.status, spi.status) <> 'connected' THEN 'switch-not-connected'
+    WHEN COALESCE(n.link_up, e.link_up) IS NULL THEN 'unknown'
+    WHEN COALESCE(n.link_up, e.link_up) <> 1 THEN 'phone-link-down'
+    WHEN COALESCE(spn.speed_mbps, spi.speed_mbps) IS NULL OR COALESCE(spn.duplex, spi.duplex) IS NULL
       OR COALESCE(n.speed_mbps, e.speed_mbps) IS NULL
       OR COALESCE(n.duplex, e.duplex) IS NULL THEN 'unknown'
-    WHEN sp.speed_mbps <> COALESCE(n.speed_mbps, e.speed_mbps)
-     AND sp.duplex     <> COALESCE(n.duplex, e.duplex)      THEN 'speed+duplex'
-    WHEN sp.speed_mbps <> COALESCE(n.speed_mbps, e.speed_mbps) THEN 'speed'
-    WHEN sp.duplex     <> COALESCE(n.duplex, e.duplex)      THEN 'duplex'
+    WHEN COALESCE(spn.speed_mbps, spi.speed_mbps) <> COALESCE(n.speed_mbps, e.speed_mbps)
+     AND COALESCE(spn.duplex, spi.duplex)     <> COALESCE(n.duplex, e.duplex)      THEN 'speed+duplex'
+    WHEN COALESCE(spn.speed_mbps, spi.speed_mbps) <> COALESCE(n.speed_mbps, e.speed_mbps) THEN 'speed'
+    WHEN COALESCE(spn.duplex, spi.duplex)     <> COALESCE(n.duplex, e.duplex)      THEN 'duplex'
     ELSE 'match'
   END AS result
 FROM v_uplink_keys u
@@ -509,8 +451,9 @@ LEFT JOIN port_stats n ON n.sweep_id = u.sweep_id AND n.phone_id = u.phone_id AN
 LEFT JOIN port_stats e ON e.sweep_id = u.sweep_id AND e.phone_id = u.phone_id AND e.port = 'ethernet'
 LEFT JOIN v_switch_latest_capture cn ON cn.switch_key = u.switch_key
 LEFT JOIN v_switch_latest_capture ci ON cn.id IS NULL AND ci.switch_ip IS NOT NULL AND ci.switch_ip = u.switch_ip
-LEFT JOIN switch_ports sp ON sp.capture_id = COALESCE(cn.id, ci.id) AND sp.port_key = u.port_key;
+LEFT JOIN switch_ports spn ON spn.capture_id = cn.id AND spn.port_key = u.port_key
+LEFT JOIN switch_ports spi ON spi.capture_id = ci.id AND spi.port_key = u.port_key;
 
--- REPORT 4: the switch and the phone disagree on speed or duplex.
-CREATE OR REPLACE VIEW v_switch_port_mismatch AS
+-- Switch and phone disagree on speed or duplex.
+CREATE OR REPLACE SQL SECURITY INVOKER VIEW v_switch_port_mismatch AS
 SELECT * FROM v_switch_port_compare WHERE result IN ('speed', 'duplex', 'speed+duplex');

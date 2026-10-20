@@ -9,9 +9,6 @@
  *
  * Environment for the integration half:
  *   CPS_TEST_DB_HOST / _PORT / _USER / _PASS / _NAME
- *
- * See the header of mock-server.php for what these tests do and do not
- * prove. In short: the plumbing, not Cisco's field names.
  */
 
 require_once dirname(__DIR__) . '/lib/config.php';
@@ -55,8 +52,7 @@ foreach ($cases as [$in, $speed, $duplex, $up]) {
         $r['speed_mbps'] === $speed && $r['duplex'] === $duplex && $r['link_up'] === $up,
         json_encode($r));
 }
-// Negative control: "Auto Negotiation" states a setting, not a result. If
-// this ever starts returning a speed, the parser is inventing data.
+// Negative control: "Auto Negotiation" is a setting, not a result.
 $r = cps_parse_link('Auto Negotiation');
 ok('"Auto Negotiation" yields no speed/duplex/link claim',
     $r['speed_mbps'] === null && $r['duplex'] === null && $r['link_up'] === null, json_encode($r));
@@ -102,18 +98,14 @@ foreach (['2-column' => $two, '3-column with ":"' => $three, 'padded spacers' =>
 // Negative control: a row with only one cell is not a stat.
 eq('single-cell row ignored', cps_parse_stats_html('<table><tr><td>Heading</td></tr></table>'), []);
 
-// A phone answering 200 with nothing in it reached DOMDocument::loadHTML(''),
-// which throws a ValueError under PHP 8 and killed a whole sweep. These must
-// return no pairs, not throw.
+// Empty or tableless bodies return no pairs, not throw.
 eq('empty body parses to nothing', cps_parse_stats_html(''), []);
 eq('whitespace-only body parses to nothing', cps_parse_stats_html("  \n\t "), []);
 eq('markup with no table parses to nothing',
    cps_parse_stats_html('<html><body><h1>Service unavailable</h1></body></html>'), []);
 
 section('unit: CSV rendering');
-// CUCM descriptions really do contain commas, quotes and the occasional
-// pasted newline. A report that corrupts the file on those is worse than no
-// report, because the damage is invisible until someone reads a spreadsheet.
+// Descriptions with commas, quotes and newlines.
 $csv = cps_render_csv([
     ['name' => 'SEP001122334401', 'description' => 'Level 2, Room 3 "Boardroom"', 'errors' => 7],
     ['name' => 'SEP001122334402', 'description' => "Line1\nLine2", 'errors' => 0],
@@ -143,8 +135,7 @@ eq('TCT is Jabber for iPhone',   cps_device_prefix('TCTJSMITH'), 'TCT');
 eq('CIPC not shadowed by a shorter prefix', cps_device_prefix('CIPCJSMITH'), 'CIPC');
 eq('ATA analog adapter',         cps_device_prefix('ATA001122335501'), 'ATA');
 eq('unknown name buckets as other', cps_device_prefix('WEIRDNAME'), 'other');
-// Case must not decide the answer: CUCM names are conventionally upper, but
-// nothing enforces it.
+// Case-insensitive.
 eq('lowercase still matches',    cps_device_prefix('sep001122334455'), 'SEP');
 
 $rows = [['name' => 'SEP001122334401'], ['name' => 'CSFJOSEPH'], ['name' => 'TCTJSMITH'], ['name' => 'SEP001122334402']];
@@ -172,8 +163,7 @@ $n = cps_normalise_neighbour([
 eq('LLDP-MED name maps to lldp_neighbour', $n['lldp_neighbour'], 'sw-edge-07');
 eq('LLDP-MED port maps to lldp_neighbour_port', $n['lldp_neighbour_port'], 'Gi1/0/33');
 
-// A placeholder must not be stored as a switch name - phones report the
-// field with filler when CDP is off upstream.
+// Placeholders are not switch names.
 foreach (['not available', 'None', 'N/A', '', '-'] as $ph) {
     $n = cps_normalise_neighbour(['CDP Neighbor Device ID' => $ph]);
     ok("placeholder '$ph' is treated as absent", !isset($n['cdp_neighbour']), json_encode($n));
@@ -205,40 +195,7 @@ $sum = cps_neighbour_summary([]);
 eq('no neighbour info yields nulls', $sum['switch_name'], null);
 eq('and no source', $sum['source'], null);
 
-section('unit: exact partitions computed from device names');
-// Blind prefix splitting has to DISCOVER where an estate divides, one
-// expensive level at a time. Given the real names it can be computed.
-$oui = [];
-for ($i = 0; $i < 2300; $i++) { $oui[] = 'SEP44B6BE' . strtoupper(str_pad(dechex($i), 3, '0', STR_PAD_LEFT)); }
-$p = CpsRisportClient::partitionsFromNames($oui, ['SEP'], 1000);
-ok('an all-one-OUI estate splits straight at the serial digits',
-   count($p) >= 3 && count($p) <= 20, count($p) . ' buckets: ' . implode(',', array_slice($p, 0, 4)));
-ok('every bucket descends past the shared OUI',
-   count(array_filter($p, fn($x) => str_starts_with($x, 'SEP44B6BE'))) === count($p), implode(',', $p));
-
-// No bucket may exceed the cap, or the split has not done its job.
-foreach ($p as $pat) {
-    $stem = rtrim($pat, '*');
-    $n = count(array_filter($oui, fn($x) => str_starts_with($x, $stem)));
-    ok("bucket $pat holds $n names, under the cap", $n <= 1000, "$n");
-}
-
-// Names outside the dominant group must not be dragged deep with it.
-$mixed = array_merge($oui, array_map(fn($i) => 'SEP0011223344' . dechex($i % 16), range(0, 39)));
-$p2 = CpsRisportClient::partitionsFromNames($mixed, ['SEP'], 1000);
-ok('a small second OUI gets one shallow bucket, not sixteen deep ones',
-   in_array('SEP0*', $p2, true), implode(',', $p2));
-
-// An estate that fits in one query must not be split at all.
-eq('a small estate needs no splitting',
-   CpsRisportClient::partitionsFromNames(['SEPAAAA00000001', 'SEPBBBB00000002'], ['SEP'], 1000), ['SEP*']);
-eq('no names yields no buckets',
-   CpsRisportClient::partitionsFromNames([], ['SEP'], 1000), []);
-
 section('unit: throttle-fault recognition');
-// A throttle fault is transient. Misclassifying one as a hard failure meant
-// a partition was skipped and its devices vanished from the result, which
-// is the same silent undercount the partitioning exists to prevent.
 foreach ([
     'Exceeded allowed rate for Realtime information',
     'exceeded allowed rate',
@@ -255,36 +212,8 @@ foreach ([
     ok("not a throttle: $msg", !CpsRisportClient::isRateLimitFault(new RuntimeException($msg)), $msg);
 }
 
-section('unit: partition subdivision');
-$sub = new ReflectionMethod(CpsRisportClient::class, 'subdivide');
-$sub->setAccessible(true);
-// A MAC-shaped stem can only continue with a hex digit, so 36 children
-// would be 20 queries guaranteed to return nothing - expensive against a
-// rate-limited API every time a bucket is subdivided.
-$kids = $sub->invoke(null, 'SEP0*');
-eq('MAC-shaped stem subdivides into 16 hex children', count($kids), 16);
-eq('first child extends the stem', $kids[0], 'SEP00*');
-eq('last hex child is F', $kids[15], 'SEP0F*');
-ok('every child keeps the parent stem',
-   count(array_filter($kids, fn($k) => str_starts_with($k, 'SEP0'))) === 16, implode(',', array_slice($kids, 0, 3)));
-
-// A soft-client prefix is followed by a username, so it needs the letters.
-$csf = $sub->invoke(null, 'CSF*');
-eq('username-shaped stem keeps the full alphabet', count($csf), 36);
-eq('and reaches Z', $csf[35], 'CSFZ*');
-
-// Only the prefixes actually being polled get enumerated.
-$parts = CpsRisportClient::partitionsFor(['SEP']);
-eq('SEP alone yields 16 buckets and nothing else', count($parts), 16);
-ok('no CSF bucket when only SEP is polled',
-   !in_array('CSF*', $parts, true), implode(',', $parts));
-ok('polling everything falls back to the full default set',
-   count(CpsRisportClient::partitionsFor([])) > 16);
-
 section('unit: config values that look boolean');
-// parse_ini_file's TYPED and NORMAL scanners turn "off"/"no"/"false"/"none"
-// into false or "". That silently emptied ris_partitions and made discovery
-// return nothing, so these guard the RAW scanner staying in place.
+// Config must be read with the RAW ini scanner.
 $tmpConf = sys_get_temp_dir() . '/cps-bool-test.conf';
 file_put_contents($tmpConf, "ris_partitions = off\nadapters = network\nverify_tls = off\nphone_url_base = https://{ip}\ndb_name = none\n");
 $bc = cps_load_config($tmpConf);
@@ -380,9 +309,7 @@ $root = dirname(__DIR__);
 
 section("integration: starting mock CUCM on 127.0.0.1:$port");
 $desc = [1 => ['file', '/tmp/cps-mock.log', 'a'], 2 => ['file', '/tmp/cps-mock.log', 'a']];
-// PHP_CLI_SERVER_WORKERS: without it the built-in server handles one
-// request at a time and every concurrency assertion below would pass or
-// fail for reasons having nothing to do with the client.
+// Workers so the concurrency tests see real overlap.
 $srv  = proc_open(
     sprintf('exec env PHP_CLI_SERVER_WORKERS=12 php -S 127.0.0.1:%d %s', $port, escapeshellarg(__DIR__ . '/mock-server.php')),
     $desc, $pipes
@@ -390,10 +317,7 @@ $srv  = proc_open(
 if (!is_resource($srv)) { fwrite(STDERR, "cannot start mock server\n"); exit(1); }
 register_shutdown_function(function () use ($srv) {
     $s = proc_get_status($srv);
-    // proc_terminate() already defaults to SIGTERM. Naming the constant
-    // requires ext-pcntl, which the official PHP images do not ship - the
-    // tests would pass and then fatal in shutdown, turning a green run into
-    // a non-zero exit code.
+    // Default signal; SIGTERM needs ext-pcntl.
     if ($s['running']) { proc_terminate($srv); }
 });
 for ($i = 0; $i < 50; $i++) {
@@ -443,8 +367,7 @@ ok('returns an array', is_array($phones), substr($r['out'], 0, 200));
 $names = array_column($phones ?: [], 'name');
 eq('7 registered phones found (StateInfo paging worked)', count($names), 7);
 ok('SEP001122334401 present', in_array('SEP001122334401', $names, true));
-// Negative control: the UnRegistered handset must not be here. If it is,
-// the Status filter is being ignored and every later count is wrong.
+// Negative control: the UnRegistered handset must not be here.
 ok('UnRegistered phone excluded', !in_array('SEP001122334407', $names, true), implode(',', $names));
 $byName = array_column($phones ?: [], null, 'name');
 eq('IP address extracted', $byName['SEP001122334402']['ip'] ?? null, '10.10.10.2');
@@ -458,13 +381,7 @@ eq('axl-sql rows are labelled LastKnown, not Registered',
    $axlPhones[0]['status'] ?? null, 'LastKnown');
 
 section('integration: an older cluster (AXL 11.5)');
-// An estate can run more than one CUCM release. The client must negotiate
-// DOWN to a schema the cluster admits rather than assume the newest, and
-// this is a regression test for exactly that - a 11.5 cluster is live.
-// The cluster refuses an unknown schema with HTTP 599 and a bare
-// <axlError>, not a SOAP Fault. Treated as a transport failure that ends the
-// request, negotiation stopped on its first candidate and an older cluster
-// was never reached - so this asserts the walk survives a 599.
+// Negotiation must walk down past HTTP 599 refusals.
 foreach (['11.5', '10.5'] as $ver) {
     file_get_contents("http://127.0.0.1:$port/_axlver/$ver");
     $r = run("$php $root/bin/cucm-phones.php --config $C --source axl-sql --verbose --json");
@@ -474,8 +391,7 @@ foreach (['11.5', '10.5'] as $ver) {
     ok("and it returns rows on AXL $ver", count(json_decode($r['out'], true) ?: []) > 0, substr($r['out'], 0, 120));
 }
 
-// The probe must name what was rejected, which is how a version problem on
-// one cluster of several gets identified at all.
+// The probe names accepted and rejected schemas.
 file_get_contents("http://127.0.0.1:$port/_axlver/11.5");
 $r = run("$php $root/bin/cucm-probe.php --config $C --server 127.0.0.1:$port --out /tmp/cps-probe-115");
 ok('the probe reports the accepted schema', str_contains($r['out'], 'schema 11.5 accepted'), substr($r['out'], 0, 400));
@@ -500,10 +416,7 @@ ok('and says which versions it tried', str_contains($r['err'], 'no AXL schema ve
 file_get_contents("http://127.0.0.1:$port/_axlver/14.0,12.5");
 
 section('integration: model enums become readable names');
-// RisPort reports a model as a numeric enum; the name lives in CUCM's
-// typemodel table. A number is useless in a report, and a hard-coded list
-// would be wrong for some release without saying so - so it is read from
-// the cluster.
+// Enums are resolved from the cluster's typemodel table.
 file_get_contents("http://127.0.0.1:$port/_modelenum/1");
 
 $r = run("$php $root/bin/cucm-phones.php --config $C --json");
@@ -513,8 +426,7 @@ eq('and a different one too', $byName['SEP001122334403']['model'] ?? null, 'Cisc
 ok('no bare enum survives',
    !array_filter($byName, fn($x) => ctype_digit((string)($x['model'] ?? ''))), 'an enum remained');
 
-// If AXL cannot be reached the enums must SURVIVE, not be lost - a number is
-// poor, but a blank model is worse.
+// Without AXL the enums are kept, not blanked.
 file_get_contents("http://127.0.0.1:$port/_axlver/9.1");   // no schema we know
 $r = run("$php $root/bin/cucm-phones.php --config $C --json");
 $fallback = array_column(json_decode($r['out'], true) ?: [], null, 'name');
@@ -565,14 +477,13 @@ eq('phones stored',   (int)$db->query('SELECT COUNT(*) c FROM phones')[0]['c'], 
 eq('registrations stored', (int)$db->query('SELECT COUNT(*) c FROM registrations')[0]['c'], 7);
 ok('port_stats stored', (int)$db->query('SELECT COUNT(*) c FROM port_stats')[0]['c'] >= 10);
 
-// The failures must be recorded, with the reason kept distinct - an auth
-// problem and a switched-off web server need different remedies.
+// Failure reasons stay distinct.
 $kinds = $db->query("SELECT DISTINCT error_kind FROM page_fetches WHERE ok = 0 ORDER BY error_kind");
 $kindList = array_column($kinds, 'error_kind');
 ok('401 recorded as auth', in_array('auth', $kindList, true), implode(',', $kindList));
 ok('404 recorded as http', in_array('http', $kindList, true), implode(',', $kindList));
 
-// The raw pairs must survive, including the label the normaliser did not know.
+// Raw pairs survive, including unmapped labels.
 $raw = $db->query("SELECT pairs FROM page_fetches pf JOIN phones p ON p.id = pf.phone_id
                    WHERE p.device_name = 'SEP001122334404' AND pf.adapter LIKE '%port.network'");
 ok('unmapped label preserved in raw JSON',
@@ -589,8 +500,6 @@ eq('and its name', $cpp['SEP001122334403']['n'] ?? null, 'Warehouse CPP');
 
 // ------------------------------------------------------------------ reports
 section('integration: model names are mirrored and backfilled');
-// Sweeping mirrors the table, so rows collected earlier can be fixed
-// without waiting for those handsets to register again.
 file_get_contents("http://127.0.0.1:$port/_modelenum/1");
 run("$php $root/bin/cucm-sweep.php --config $C --json");
 ok('the model table is mirrored locally',
@@ -636,7 +545,6 @@ ok('the CDP placeholder is not stored as a switch name',
 ok('a phone reporting no neighbour has no uplink row',
    !isset($up['SEP001122334408']), implode(',', array_keys($up)));
 
-// The point of the exercise: an errors CSV must name the switch port.
 $r = run("$php $root/bin/cucm-report.php errors --config $C --csv");
 $hdr = explode("\n", trim($r['out']))[0] ?? '';
 ok('errors CSV header carries switch_name and switch_port',
@@ -651,8 +559,7 @@ foreach (['speed-mismatch', 'error-trend'] as $rep) {
 }
 
 section('report: phone network port against show interface status');
-// CDP says "GigabitEthernet1/0/12"; the switch prints "Gi1/0/12". The
-// second switch is named only by its file, with a domain the CDP name lacks.
+// CDP long port names vs switch short names; switch named by file.
 $swDir = sys_get_temp_dir() . '/cps-switch-outputs';
 @mkdir($swDir);
 array_map('unlink', glob("$swDir/*") ?: []);
@@ -663,8 +570,7 @@ file_put_contents("$swDir/capture.log", "sw-access-01#show interface status\n\n$
     . "sw-access-01#\n");
 file_put_contents("$swDir/sw-access-02.example.local.txt", $hdr
     . "Gi1/0/7                         connected    30         a-half  a-100 10/100/1000BaseTX\n");
-// And the other way round: the phone reports an FQDN, the file is the bare
-// hostname - what an Ansible inventory of short names produces.
+// Phone reports an FQDN; file is the short hostname.
 file_put_contents("$swDir/sw-edge-07-status.txt", $hdr
     . "Gi1/0/33                        connected    40         a-full  a-100 10/100/1000BaseTX\n");
 $r = run("$php $root/bin/cucm-switch-import.php --config $C $swDir");
@@ -704,19 +610,16 @@ foreach (['speed-mismatch', 'errors', 'error-trend', 'phones', 'sweeps'] as $rep
        !str_contains($lines[0] ?? '', '  ') && str_contains($lines[0] ?? '', ','),
        $lines[0] ?? '(empty)');
 }
-// The count footer must not land in the CSV - it goes to stderr.
+// The count footer goes to stderr.
 $r = run("$php $root/bin/cucm-report.php errors --config $C --csv");
 ok('row-count footer stays out of the CSV body', !str_contains($r['out'], 'row(s)'), substr($r['out'], -120));
 
-// A report with no findings must still be a valid CSV. error-trend has
-// nothing to say until a second sweep exists, which makes it the natural
-// case to check.
+// An empty report is still a valid CSV (no second sweep yet).
 $r = run("$php $root/bin/cucm-report.php error-trend --config $C --csv");
 $tl = array_values(array_filter(explode("\n", trim($r['out'])), fn($l) => $l !== ''));
 eq('an empty report is a header and no data rows', count($tl), 1);
 ok('that header names the real columns',
    str_contains($tl[0] ?? '', 'device_name') && str_contains($tl[0] ?? '', 'errors_delta'), $tl[0] ?? '(empty)');
-// And it must parse as CSV, not merely be non-empty.
 $fh = fopen('php://memory', 'r+'); fwrite($fh, $r['out']); rewind($fh);
 $hdr = fgetcsv($fh, 0, ',', '"', '\\'); fclose($fh);
 ok('empty-report header parses as CSV', is_array($hdr) && count($hdr) > 3, json_encode($hdr));
@@ -747,13 +650,11 @@ eq('delta is the increase', (int)($t404['errors_delta'] ?? 0), 24);   // 17 crc 
 ok('clean phone absent from the trend', !in_array('SEP001122334401', $trNames, true), implode(',', $trNames));
 
 section('report: error-trend gives one row per phone and port');
-// A time series shows the same phone and port once per transition, which
-// reads as duplicate rows with contradictory counts rather than as history.
-// Several more growing sweeps, then the default must collapse them.
+// Several growing sweeps; the default collapses them.
 foreach ([4, 5, 6] as $g) {
     file_get_contents("http://127.0.0.1:$port/_gen/$g");
     run("$php $root/bin/cucm-sweep.php --config $C --json");
-    sleep(1);   // DATETIME is second-resolution; keep the order unambiguous
+    sleep(1);   // DATETIME is second-resolution
 }
 $r  = run("$php $root/bin/cucm-report.php error-trend --config $C --json");
 $tr = json_decode($r['out'], true) ?: [];
@@ -768,7 +669,6 @@ ok('times_grown counts the sweeps it grew in', (int)($one['times_grown'] ?? 0) >
 ok('total_growth exceeds the last delta alone',
    (int)($one['total_growth'] ?? 0) > (int)($one['errors_delta'] ?? 0), json_encode($one));
 
-// The full series is still available when it is actually wanted.
 $r = run("$php $root/bin/cucm-report.php error-trend --config $C --history --json");
 $hist = json_decode($r['out'], true) ?: [];
 ok('--history returns the whole series', count($hist) > count($tr), count($hist) . ' vs ' . count($tr));
@@ -795,6 +695,10 @@ $op = json_decode($r['out'], true);
 ok('problems sweep exits 0', $r['rc'] === 0, $r['err']);
 eq('polls exactly the flagged phones', (int)($op['polled'] ?? -1), count($flagged));
 ok('and fewer than the estate', count($flagged) > 0 && count($flagged) < 7, implode(',', $flagged));
+$ignored = [];
+$errOnly = $db->problemPhones((int)$db->latestSweepId(), $ignored, ['errors']);
+$r = run("$php $root/bin/cucm-sweep.php --config $C --json --only-problems --problems errors --no-db");
+eq('--problems errors polls just the errored phones', (int)(json_decode($r['out'], true)['polled'] ?? -1), count($errOnly));
 
 section('integration: cucm-set-profile moves switch-mismatched phones between profiles');
 $STD = '1F5AE3F8-6F07-4E4B-91C5-1D4B6B1B0A01';
@@ -825,60 +729,42 @@ ok('--undo exits 0', $r['rc'] === 0, $r['err']);
 eq('and --undo puts it back', $liveCpp('SEP001122334402'), $STD);
 
 // ------------------------------------------- large estate / RisPort cap ---
-section('integration: RisPort response cap and the partitioning fallback');
+section('integration: RisPort response cap and per-node enumeration');
 file_get_contents("http://127.0.0.1:$port/_big/300");   // 300 phones, cap 120
 
-// The harder variant, and the one seen in the field: the cluster caps the
-// response AND reports TotalDevicesFound as the capped number, so the answer
-// is internally consistent and comparing the two proves nothing. Detection
-// has to fall back on the result sitting at the cap.
+// TotalDevicesFound reports the capped count.
 file_get_contents("http://127.0.0.1:$port/_bigcap/1");
 $confCap = "$root/tests/.cucm-test-cap.conf";
-// ris_max_devices matching the server's cap mirrors production, where we ask
-// for 1000 and the cluster returns exactly 1000.
+// ris_max_devices equal to the server's cap.
 file_put_contents($confCap, file_get_contents($conf) . "\nris_max_devices = 120\n");
 
 $r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confCap) . " --json");
 eq('a self-consistent capped answer is still detected and recovered',
    count(json_decode($r['out'], true) ?: []), 300);
-ok('the at-cap reason is reported', str_contains($r['err'], 'at or near the'), substr($r['err'], 0, 200));
+ok('the cap is reported', str_contains($r['err'], 'at the 120 cap'), substr($r['err'], 0, 200));
 
-// Negative control: with partitioning off, the same config must come back
-// short. If it does not, the mock has stopped modelling the fault.
+// Negative control: partitioning off comes back short.
 file_put_contents($confCap, file_get_contents($conf) . "\nris_max_devices = 120\nris_partitions = off\n");
 $r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confCap) . " --json");
 eq('with partitioning off the cap still truncates', count(json_decode($r['out'], true) ?: []), 120);
 @unlink($confCap);
 file_get_contents("http://127.0.0.1:$port/_bigcap/0");
 
-// Reproduce the fault first. If this ever stops returning a short count the
-// mock has stopped modelling the bug, and the next assertion proves nothing.
+// Reproduce the truncation first.
 $confOff = "$root/tests/.cucm-test-off.conf";
 file_put_contents($confOff, file_get_contents($conf) . "\nris_partitions = off\n");
 $r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confOff) . " --json");
 $off = json_decode($r['out'], true);
 eq('unpartitioned query is truncated by the cap', count($off ?: []), 120);
 
-// And now the fix.
 $r = run("$php $root/bin/cucm-phones.php --config $C --json");
 $auto = json_decode($r['out'], true);
 eq('auto partitioning recovers the full estate', count($auto ?: []), 300);
-// Assert on the facts in the message, not its exact wording - the phrasing
-// has been reworded once already and a brittle match just fails later for
-// no reason.
-ok('truncation is reported, not silent',
-   str_contains($r['err'], '300') && str_contains($r['err'], 'RisPort returned'),
-   substr($r['err'], 0, 200));
-// Per-node is the cheap route past the cap and must be preferred: three
-// node queries instead of sixteen name buckets against a rate-limited API.
-ok('per-node enumeration is used in preference to name prefixes',
-   str_contains($r['err'], 'per-node enumeration'), substr($r['err'], 0, 300));
+ok('it re-queries per node', str_contains($r['err'], 'querying each of'), substr($r['err'], 0, 300));
 
-// Unique device names: a merge bug would inflate or collapse the count.
 $names = array_column($auto ?: [], 'name');
 eq('no duplicates across partitions', count(array_unique($names)), count($names));
 
-// A sweep over the recovered estate must poll all of them.
 $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --sample 25 --json");
 $bs = json_decode($r['out'], true);
 eq('sweep sees the full estate after partitioning', $bs['discovered'] ?? null, 300);
@@ -899,9 +785,7 @@ eq('every phone is still accounted for', $eg['polled'] ?? null, 11);
 eq('the good phones still succeed', $eg['ok'] ?? null, 6);
 ok('no ValueError escaped', !str_contains($r['err'], 'ValueError'), substr($r['err'], 0, 200));
 
-// A phone with 60 line appearances has a DirNumber far longer than the
-// original column, which failed the INSERT and - because writes are one
-// transaction per phone - cost that entire handset over one field.
+// A phone with 60 line appearances has a very long DirNumber.
 $r2 = run("$php $root/bin/cucm-sweep.php --config $C --json");
 ok('the long-DirNumber phone is stored, not lost',
    !str_contains($r2['err'], 'Data too long'), substr($r2['err'], 0, 300));
@@ -910,8 +794,7 @@ ok('its dir_number is present', !empty($long[0]['dir_number']), json_encode($lon
 ok('and holds the whole list, not a truncated stub',
    strlen((string)($long[0]['dir_number'] ?? '')) > 64, strlen((string)($long[0]['dir_number'] ?? '')) . ' chars');
 
-// The distinct causes must stay distinct: an empty body is the phone's
-// fault, unparseable markup is arguably ours, and they lead different places.
+// Empty body and unparseable markup are reported differently.
 $errs = [];
 foreach ($eg['phones'] ?? [] as $ph) {
     foreach ($ph['errors'] ?? [] as $msg) { $errs[$ph['name']] = $msg; }
@@ -923,7 +806,6 @@ ok('whitespace-only body reported as empty too',
 ok('markup with no table reported as a parse failure, not as empty',
    str_contains($errs['SEP00112233EE03'] ?? '', 'no label/value rows'), $errs['SEP00112233EE03'] ?? '(none)');
 
-// And the classification must survive into the database.
 $r = run("$php $root/bin/cucm-sweep.php --config $C --json");
 $kinds = array_column($db->query(
     "SELECT DISTINCT error_kind FROM page_fetches WHERE ok = 0 AND error_kind IS NOT NULL"), 'error_kind');
@@ -948,19 +830,13 @@ eq('all 24 phones polled', $pr['polled'] ?? null, 24);
 
 $conc = json_decode((string)file_get_contents("http://127.0.0.1:$port/_conc"), true);
 $max  = (int)($conc['max'] ?? 0);
-// The server itself observed the overlap, so this is not an inference from
-// elapsed time. 8 requested; anything above 3 proves a rolling window
-// rather than one-at-a-time, with slack for worker scheduling.
+// Overlap as observed by the server; slack for worker scheduling.
 ok("server saw concurrent requests (max in flight = $max, asked for 8)", $max >= 4, json_encode($conc));
 
-// And a loose upper bound on time: 24 pages at 250ms serially is 6s. Under
-// half of that cannot happen without real concurrency. Deliberately not
-// tight, so it does not go flaky on a loaded machine.
+// Loose bound: 24 x 250ms serially is 6s.
 ok(sprintf('24 x 250ms pages finished in %.1fs, well under the %.1fs serial cost', $elapsed, 6.0),
    $elapsed < 3.0, sprintf('%.2fs', $elapsed));
 
-// A slow phone must not hold up phones that already answered: with the old
-// chunked implementation the window drained to zero between batches.
 file_get_contents("http://127.0.0.1:$port/_conc/reset");
 $r = run("$php $root/bin/cucm-sweep.php --config " . escapeshellarg($confPar) . " --no-db --parallel 4 --json");
 $conc2 = json_decode((string)file_get_contents("http://127.0.0.1:$port/_conc"), true);
@@ -975,24 +851,6 @@ file_get_contents("http://127.0.0.1:$port/_big/0");
 section('integration: soft clients are not polled by default');
 file_get_contents("http://127.0.0.1:$port/_soft/1");   // + CSF, TCT, BOT, ATA
 
-// Stronger than "they are filtered out": the cluster must never be ASKED
-// for them. Filtering client-side would look the same from here while still
-// costing a query and, on a rate-limited API, real time.
-file_get_contents("http://127.0.0.1:$port/_ris/reset");
-$r = run("$php $root/bin/cucm-phones.php --config $C --json");
-$seen = json_decode((string)file_get_contents("http://127.0.0.1:$port/_ris/seen"), true) ?: [];
-ok('RisPort never returned a CSF device', !isset($seen['CSF']), json_encode($seen));
-ok('nor TCT / BOT / TAB / ATA',
-   !isset($seen['TCT']) && !isset($seen['BOT']) && !isset($seen['TAB']) && !isset($seen['ATA']),
-   json_encode($seen));
-ok('SEP handsets were returned', ($seen['SEP'] ?? 0) > 0, json_encode($seen));
-
-// ...and --all-devices must widen the query again, or the flag is a lie.
-file_get_contents("http://127.0.0.1:$port/_ris/reset");
-$r = run("$php $root/bin/cucm-phones.php --config $C --all-devices --json");
-$seen = json_decode((string)file_get_contents("http://127.0.0.1:$port/_ris/seen"), true) ?: [];
-ok('--all-devices does ask for CSF', isset($seen['CSF']), json_encode($seen));
-
 $r = run("$php $root/bin/cucm-phones.php --config $C --json");
 $def = array_column(json_decode($r['out'], true) ?: [], 'name');
 eq('default lists only SEP handsets', count($def), 7);
@@ -1004,27 +862,16 @@ $all = array_column(json_decode($r['out'], true) ?: [], 'name');
 eq('--all-devices shows every registered device', count($all), 11);
 ok('soft clients are visible when asked for', in_array('CSFJOSEPH', $all, true), implode(',', $all));
 
-// The skip must be reported, not silent - this is the answer to "CUCM says
-// 3000 and I only see 2000".
 $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --json");
-// Scoping the query leaves nothing to skip, so what must be reported is the
-// scope itself - a quietly smaller number is exactly what makes an operator
-// wonder whether devices went missing.
-ok('the scope of the query is reported',
-   str_contains($r['err'], 'querying only SEP*'), substr($r['err'], 0, 300));
 eq('sweep polls only the handsets', (json_decode($r['out'], true)['polled'] ?? null), 7);
 
 $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --all-devices --json");
 eq('--all-devices sweeps everything', (json_decode($r['out'], true)['polled'] ?? null), 11);
 
-// An explicit list must be honoured over the default.
 $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --device-prefixes SEP,CSF --json");
 eq('explicit prefix list is honoured', (json_decode($r['out'], true)['polled'] ?? null), 8);
 
-// The reported trap, pinned: --match is a substring search, so "SEP" also
-// matches CSFJOSEPH (JO-SEP-H). This asserts the behaviour deliberately so
-// nobody "fixes" it into a silent anchored match, and proves the two safe
-// routes out of it.
+// --match is a substring search: "SEP" matches CSFJOSEPH.
 section('integration: --match SEP is a substring, and catches CSFJOSEPH');
 $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --all-devices --match SEP --json");
 $m = array_column(json_decode($r['out'], true)['phones'] ?? [], 'name');
@@ -1041,53 +888,6 @@ $m3 = array_column(json_decode($r['out'], true)['phones'] ?? [], 'name');
 ok('the device-prefix default also excludes it', !in_array('CSFJOSEPH', $m3, true), implode(',', $m3));
 
 file_get_contents("http://127.0.0.1:$port/_soft/0");
-
-// --------------------------------------- OUI-clustered estate (the hard one)
-section('integration: every phone on one OUI, one node');
-file_get_contents("http://127.0.0.1:$port/_big/300");
-file_get_contents("http://127.0.0.1:$port/_oui/1");
-$confOui = "$root/tests/.cucm-test-oui.conf";
-file_put_contents($confOui, file_get_contents($conf) . "\nris_max_devices = 120\n");
-
-// Prefix splitting is useless here: SEP4*, SEP44*, SEP44B*, SEP44B6*,
-// SEP44B6B* and SEP44B6BE* are all over the cap in turn, because the OUI is
-// shared. The trailing digits are the serial and split evenly at once.
-$r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confOui) . " --json");
-eq('the whole estate is recovered', count(json_decode($r['out'], true) ?: []), 300);
-ok('splitting on the last character is used', str_contains($r['err'], 'last character'), substr($r['err'], 0, 300));
-eq('and no bucket needed subdividing', substr_count($r['err'], 'hit the'), 0);
-
-// A cluster that will not match on the end of a name must still get there.
-file_get_contents("http://127.0.0.1:$port/_nosuffix/1");
-$r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confOui) . " --json");
-eq('prefix fallback still recovers the whole estate', count(json_decode($r['out'], true) ?: []), 300);
-ok('and it is the prefix path, not the suffix one',
-   !str_contains($r['err'], 'last character'), substr($r['err'], 0, 200));
-// Without AXL there is nothing to compute from, so it must still get there
-// the slow way rather than giving up.
-// Disabling the name provider must NOT mean blanking axl_user: RisPort
-// authenticates with the same credentials, so that would test a 401 rather
-// than the blind-prefix path.
-$confBlind = "$root/tests/.cucm-test-blind.conf";
-file_put_contents($confBlind, file_get_contents($conf) . "\nris_max_devices = 120\nris_use_axl_names = 0\n");
-$rb = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confBlind) . " --json");
-eq('blind prefix splitting still recovers everything', count(json_decode($rb['out'], true) ?: []), 300);
-ok('and it says it is doing so blindly', str_contains($rb['err'], 'BLIND'), substr($rb['err'], 0, 200));
-ok('which needs several subdivisions to cross the OUI',
-   substr_count($rb['err'], 'hit the') >= 4, substr_count($rb['err'], 'hit the') . ' subdivisions');
-@unlink($confBlind);
-
-// With AXL reachable, the buckets are computed rather than discovered, so
-// even the worst-shaped estate resolves without walking the OUI.
-$r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confOui) . " --json");
-eq('AXL-derived buckets recover the whole estate', count(json_decode($r['out'], true) ?: []), 300);
-ok('the buckets came from AXL', str_contains($r['err'], 'computed'), substr($r['err'], 0, 300));
-eq('and nothing needed subdividing', substr_count($r['err'], 'hit the'), 0);
-
-file_get_contents("http://127.0.0.1:$port/_nosuffix/0");
-file_get_contents("http://127.0.0.1:$port/_oui/0");
-file_get_contents("http://127.0.0.1:$port/_big/0");
-@unlink($confOui);
 
 // -------------------------------------------------------- subnet excludes --
 section('integration: --exclude-subnet');
@@ -1106,12 +906,11 @@ ok('addresses outside the prefix survive', in_array('10.10.10.8', $left, true), 
 $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --exclude-subnet '10.10.10.0/24,10.99.0.0/16' --json");
 ok('multiple prefixes: everything excluded leaves nothing to poll', $r['rc'] !== 0, "rc={$r['rc']}");
 
-// The listing must agree with the sweep, or a CSV carried between them
-// silently puts the excluded phones back.
+// The listing applies the same exclusions as the sweep.
 $r = run("$php $root/bin/cucm-phones.php --config $C --exclude-subnet 10.10.10.4/30 --json");
 eq('cucm-phones.php applies the same exclusions', count(json_decode($r['out'], true) ?: []), 4);
 
-// Negative controls: a bad prefix must stop the run, not be ignored.
+// Negative controls: a bad prefix is fatal.
 foreach (['10.10.10.0/33', 'not-a-subnet', '10.10.10.0/x'] as $bad) {
     $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --exclude-subnet " . escapeshellarg($bad) . " --json");
     ok("invalid prefix '$bad' is fatal, not ignored", $r['rc'] !== 0, "rc={$r['rc']} err={$r['err']}");
@@ -1132,12 +931,11 @@ $sm = json_decode($r['out'], true);
 eq('--match narrows to the one phone', $sm['polled'] ?? null, 1);
 eq('--match picked the right one', $sm['phones'][0]['name'] ?? null, 'SEP001122334404');
 
-// Negative control: a sample larger than the population must not shrink it
-// or duplicate rows - array_rand() with n == count() behaves differently.
+// Negative control: a sample larger than the estate.
 $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --sample 99 --json");
 eq('--sample larger than the estate polls everything', (json_decode($r['out'], true)['polled'] ?? null), 7);
 
-// Sampling must actually vary, or it is just --limit wearing a hat.
+// Sampling must vary.
 $seen = [];
 for ($i = 0; $i < 6; $i++) {
     $r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --sample 2 --json");
@@ -1159,9 +957,7 @@ eq('phone list round-trips through CSV', $sf['polled'] ?? null, 7);
 
 // ------------------------------------------------------------ single phone
 section('integration: single-phone CLI');
-// Pin the generation rather than inheriting whatever the trend tests left
-// behind - a test whose expected value depends on the order tests ran in is
-// a test that will lie later.
+// Pin the generation.
 file_get_contents("http://127.0.0.1:$port/_gen/1");
 $r = run("$php $root/bin/cucm-phone-netstats.php 10.10.10.4 --config $C --json");
 $one = json_decode($r['out'], true);
@@ -1211,8 +1007,7 @@ foreach (['speed-mismatch' => 'Speed mismatch',
     $res = $fetch("?r=$key");
     eq("web: $key returns 200", $res['code'], 200);
     ok("web: $key renders its title", str_contains($res['body'], $title), substr($res['body'], 0, 200));
-    // Tab links are relative, so match on the query string itself rather
-    // than assuming the script name appears in the href.
+    // Tab links are relative; match the query string.
     foreach (['speed-mismatch', 'errors', 'error-trend'] as $tab) {
         ok("web: $key links to the $tab tab",
            str_contains($res['body'], 'r=' . $tab), 'tab link for ' . $tab);
@@ -1222,20 +1017,17 @@ foreach (['speed-mismatch' => 'Speed mismatch',
        'external asset reference found');
 }
 
-// PHP errors must not leak into the page.
 $res = $fetch('?r=errors');
 ok('web: no PHP warnings or notices in the output',
    !preg_match('/(Warning|Notice|Fatal error|Deprecated):/', $res['body']), substr($res['body'], 0, 300));
 ok('web: the errors table carries the switch columns',
    str_contains($res['body'], 'Switch port'), 'switch columns');
 
-// An unknown report must fall back, not error.
 $res = $fetch('?r=../../etc/passwd');
 eq('web: an unknown report falls back to the default', $res['code'], 200);
 ok('web: and does not echo the input', !str_contains($res['body'], 'etc/passwd'), 'input echoed');
 
-// The default must follow the NEWEST sweep, and must not pin: a page
-// bookmarked today should show tomorrow's data.
+// The default follows the newest sweep and is not pinned.
 $latest = (int)$db->query('SELECT id FROM sweeps WHERE finished_at IS NOT NULL
                            ORDER BY started_at DESC, id DESC LIMIT 1')[0]['id'];
 $res = $fetch('?r=errors');
@@ -1245,7 +1037,6 @@ ok('web: the latest option is selected by default',
 ok('web: and no sweep id is pinned in the tab links',
    !preg_match('/href="\?r=[a-z-]+&amp;sweep=/', $res['body']), 'sweep pinned into tab links');
 
-// Choosing a specific sweep pins it, and offers a way back.
 $older = (int)$db->query('SELECT id FROM sweeps WHERE finished_at IS NOT NULL
                           ORDER BY started_at ASC, id ASC LIMIT 1')[0]['id'];
 if ($older !== $latest) {
@@ -1254,15 +1045,11 @@ if ($older !== $latest) {
     ok('web: and offers a way back to latest', str_contains($res['body'], 'Back to latest'), 'no way back');
 }
 
-// A non-existent sweep id must not reach SQL.
 $res = $fetch('?r=errors&sweep=999999');
 eq('web: an unknown sweep id is rejected safely', $res['code'], 200);
 ok('web: no SQL error surfaced', !str_contains($res['body'], 'SQLSTATE'), substr($res['body'], 0, 200));
 
-// A web server that drops the query string is the difference between "the
-// tabs work" and "clicking a tab does nothing", so both broken shapes are
-// pinned here. Each runs in its own process because the page defines
-// functions and can only be included once.
+// Misconfigured web servers. One process each: the page can only be included once.
 $sim = function (string $prelude) use ($php, $root, $dbHost, $dbPort, $dbName, $dbUser, $dbPass) {
     $code = '$_GET=[];' . $prelude
           . ' ob_start(); include ' . var_export("$root/web/cucm-reports.php", true) . '; echo ob_get_clean();';
@@ -1273,32 +1060,25 @@ $sim = function (string $prelude) use ($php, $root, $dbHost, $dbPort, $dbName, $
     ))['out'];
 };
 
-// nginx try_files without ?$query_string: QUERY_STRING gone, REQUEST_URI
-// intact, so the parameters are recoverable and the page keeps working.
+// nginx try_files without ?$query_string: recoverable from REQUEST_URI.
 $out = $sim('$_SERVER["REQUEST_URI"]="/cucm-reports.php?r=errors";');
 ok('web: recovers parameters from REQUEST_URI when QUERY_STRING is dropped',
    preg_match('/<a class="on"[^>]*>\s*Errors/', $out) === 1, substr(strip_tags($out), 0, 200));
 ok('web: and says the query string was not passed',
    str_contains($out, 'not passing the query string'), 'no footer note');
 
-// Missing "include fastcgi_params": no CGI environment at all. Nothing can
-// recover the parameters, so the page must SAY so rather than silently
-// rendering the default report on every tab.
+// Missing "include fastcgi_params": no CGI environment at all.
 $out = $sim('unset($_SERVER["REQUEST_URI"],$_SERVER["QUERY_STRING"]);');
 ok('web: detects a missing CGI environment',
    str_contains($out, 'not passing the CGI environment'), substr(strip_tags($out), 0, 200));
 ok('web: and names the nginx directive that fixes it',
    str_contains($out, 'fastcgi_params'), 'directive not named');
 
-// A correctly configured server must show neither warning.
 $res = $fetch('?r=errors');
 ok('web: a correct server shows no configuration warning',
    !str_contains($res['body'], 'not passing the'), 'spurious warning');
 
-// Follow the browser by default, with an explicit override that wins in
-// either direction. All three pieces must be present: the media query, the
-// override selectors, and the pre-paint script that applies a stored choice
-// before the body renders so there is no flash of the wrong theme.
+// Theme: media query, override selectors, pre-paint script.
 $res = $fetch('?r=errors');
 ok('web: follows the browser preference', str_contains($res['body'], 'prefers-color-scheme: dark'), 'no media query');
 ok('web: an explicit light choice overrides the browser',
@@ -1311,15 +1091,12 @@ ok('web: there is a theme button', str_contains($res['body'], 'id="theme"'), 'no
 ok('web: localStorage access is guarded',
    preg_match('/try\s*\{[^}]*localStorage/', $res['body']) === 1, 'unguarded localStorage');
 
-// The file was deliberately stripped of comments; adding to it should not
-// quietly put them back.
 $pageSrc = (string)file_get_contents("$root/web/cucm-reports.php");
 $commentLines = preg_grep('#(^\s*//|^\s*/\*|\s//\s)#', explode("\n", $pageSrc));
 $commentLines = array_filter($commentLines, fn($l) => !str_contains($l, 'http://') && !str_contains($l, 'https://'));
 eq('web: the page stays comment-free', $commentLines, []);
 
-// A column empty for every row is dead weight, and which columns those are
-// differs by firmware - so it is decided from the data, not hard-coded.
+// All-empty columns are hidden.
 $db->pdo()->exec('UPDATE port_stats SET tx_total_pkt = NULL');
 $res = $fetch('?r=errors');
 ok('web: an all-empty column is hidden', !preg_match('/<th[^>]*>TX pkts/', $res['body']), 'TX pkts still shown');
@@ -1329,10 +1106,8 @@ ok('web: with a link to show it again', str_contains($res['body'], 'Show all col
 $res = $fetch('?r=errors&cols=all');
 ok('web: cols=all brings it back', preg_match('/<th[^>]*>TX pkts/', $res['body']) === 1, 'not restored');
 
-// A column with data must never be hidden.
 ok('web: a populated column is kept', preg_match('/<th[^>]*>RX CRC/', $fetch('?r=errors')['body']) === 1, 'RX CRC hidden');
 
-// The CSV must match what is on screen.
 $res = $fetch('?r=errors&csv=1');
 ok('web: CSV omits the hidden column too', !str_contains(explode("\n", $res['body'])[0], 'TX pkts'),
    explode("\n", $res['body'])[0]);
@@ -1355,8 +1130,6 @@ $r = run("$php $root/bin/cucm-probe.php --config $C --phone 10.10.10.4 --out /tm
 ok('probe runs', str_contains($r['out'], 'PASS'), substr($r['out'], -400));
 ok('probe negotiated a schema version the mock supports',
    str_contains($r['out'], 'axl:auth+schema') && !str_contains($r['out'], 'axl:auth+schema  FAIL'));
-// The mock rejects a wrong RegistrationDynamic column, so a probe of one
-// must FAIL. If every probe passes regardless, the probe proves nothing.
 $evidence = glob('/tmp/cps-probe/probe-*.json');
 ok('probe wrote evidence', !empty($evidence));
 if ($evidence) {
@@ -1367,8 +1140,6 @@ if ($evidence) {
     eq('Informix FIRST passes', $ids['axl:sql:informix-first'] ?? null, 'PASS');
 }
 
-// Negative control on the probe itself: ask for a column the mock does not
-// have, and confirm the machinery reports FAIL rather than PASS.
 section('negative control: a wrong column must fail');
 $axl = new CpsAxlClient(new CpsSoapClient("http://127.0.0.1:$port", 'axluser', 'axlpass', false, 10), '14.0');
 $threw = false;

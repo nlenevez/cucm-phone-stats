@@ -1,33 +1,19 @@
 #!/usr/bin/env php
 <?php
 /**
- * cucm-report.php - reports over the collected sweeps.
+ * cucm-report.php - reports over the collected sweeps (default: latest completed sweep).
  *
  * Usage:
  *   php bin/cucm-report.php <report> [--sweep N|--all] [--json|--csv|--table] [--config FILE]
  *
- * Reports:
- *   speed-mismatch   phones whose access port speed/duplex differs from the
- *                    network port (both ports up)
- *   errors           ports with any non-zero error counter
- *   error-trend      ports whose error counters grew between sweeps
- *   switch-mismatch  phones whose network port speed/duplex differs from what
- *                    the switch's "show interface status" says (see
- *                    bin/cucm-switch-import.php)
- *   switch-compare   every uplink against the switch, with the reason a
- *                    comparison could not be made; --result R to filter
- *   switch-captures  the imported switch captures
- *   phones           current inventory
- *   sweeps           collection history
- *
- * By default each report covers the most recent completed sweep;
- * --all covers every sweep, --sweep N a specific one. error-trend ignores
- * --sweep, since a trend needs at least two.
+ * Reports: speed-mismatch, errors, error-trend, switch-mismatch, switch-compare,
+ *          switch-captures, phones, sweeps, uplinks, labels
  *
  * Examples:
  *   php bin/cucm-report.php speed-mismatch
  *   php bin/cucm-report.php errors --min 100 --csv > errors.csv
  *   php bin/cucm-report.php error-trend --since 2026-09-01
+ *   php bin/cucm-report.php labels --unmapped-only
  */
 
 require_once dirname(__DIR__) . '/lib/config.php';
@@ -41,16 +27,16 @@ $report = $p['args'][0] ?? null;
 $known = ['speed-mismatch', 'errors', 'error-trend', 'switch-mismatch', 'switch-compare', 'switch-captures',
           'phones', 'sweeps', 'uplinks', 'labels'];
 if (!empty($opts['help']) || $report === null) {
-    fwrite(STDERR, "Usage: php bin/cucm-report.php <" . implode('|', $known) . "> [--sweep N|--all]\n"
-                 . "       [--min N] [--since YYYY-MM-DD] [--json|--csv|--table]\n"
-                 . "\n  uplinks  what each phone reports being plugged into (CDP/LLDP)\n"
-                 . "  switch-mismatch  phone network port vs the switch's show interface status\n"
-                 . "  switch-compare   every uplink vs the switch; --result no-port|no-capture|match|...\n"
-                 . "  switch-captures  imported switch outputs\n"
-                 . "  labels   every label the phones returned and how it is interpreted;\n"
-                 . "           --grep TEXT to filter, --unmapped-only for the gaps\n"
-                 . "\n  error-trend gives one row per phone and port (the most recent growth,\n"
-                 . "  with times_grown / total_growth); --history for every transition\n");
+    fwrite(STDERR, "Usage: php bin/cucm-report.php <" . implode('|', $known) . "> [options]\n"
+                 . "  --sweep N | --all     one sweep, or every sweep (default latest)\n"
+                 . "  --json | --csv | --table\n"
+                 . "  --min N               errors: minimum error count\n"
+                 . "  --since YYYY-MM-DD    error-trend: start date\n"
+                 . "  --history             error-trend: every transition, not one row per port\n"
+                 . "  --include-resets      error-trend: include counter resets\n"
+                 . "  --result R            switch-compare: filter by result\n"
+                 . "  --grep TEXT           labels: filter by label\n"
+                 . "  --unmapped-only       labels: only labels not mapped\n");
     exit($report === null ? 1 : 0);
 }
 if (!in_array($report, $known, true)) {
@@ -60,8 +46,6 @@ if (!in_array($report, $known, true)) {
 $cfg = cps_load_config(cps_common_opts($opts));
 $db  = new CpsDb($cfg);
 
-// Resolve the sweep scope once, so every report answers "which run?" the
-// same way and a report can never quietly mix sweeps.
 $sweepId = null;
 if (!empty($opts['all'])) {
     $sweepId = null;
@@ -74,14 +58,7 @@ if (!empty($opts['all'])) {
     }
 }
 
-// 'labels' is not a SQL report: it decodes the stored raw label/value pairs
-// and says which labels the normaliser recognises and which it ignores.
-//
-// This is how a field name gets confirmed rather than guessed. Every label a
-// phone returned is kept verbatim in page_fetches.pairs, so the real
-// spellings on this estate's firmware - CDP neighbour fields included - can
-// be read straight out of sweeps already taken, with no new sweep and no
-// trip to site.
+// 'labels' decodes stored label/value pairs rather than querying a view.
 if ($report === 'labels') {
     cps_report_labels($db, $sweepId, $opts);
     exit(0);
@@ -93,8 +70,7 @@ $rows    = $res['rows'];
 $sqlCols = $res['columns'];
 
 if (!empty($opts['json']))      { echo cps_json($rows); }
-// CSV carries every selected column, and always emits the header - a report
-// with no findings is a header with no data rows, never an empty file.
+// CSV always has a header row, even with no data.
 elseif (!empty($opts['csv']))   { echo cps_render_csv($rows, $sqlCols); }
 else {
     echo cps_render_table($rows, $cols);
@@ -102,10 +78,7 @@ else {
         $sweepId !== null && !in_array($report, ['error-trend', 'sweeps', 'switch-captures'], true) ? " (sweep #$sweepId)" : ''));
 }
 
-/**
- * Histogram every label the phones actually returned, and say how each one
- * is being interpreted.
- */
+/** Every label the phones returned, with how each is mapped. */
 function cps_report_labels(CpsDb $db, ?int $sweepId, array $opts): void
 {
     $sql = 'SELECT adapter, pairs FROM page_fetches WHERE ok = 1 AND pairs IS NOT NULL';
@@ -191,10 +164,7 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
                 'port', 'speed_mbps', 'duplex', 'errors_total', 'rx_crc_err', 'tx_collisions']];
 
         case 'error-trend':
-            // Deliberately not scoped to one sweep: a delta is between two.
-            // --include-resets shows the reboot rows too, which is what you
-            // want when a phone's counters keep clearing and you are trying
-            // to work out why.
+            // Not sweep-scoped: a delta spans two sweeps.
             $where = ['1=1'];
             if (empty($opts['include-resets'])) { $where[] = 'errors_delta > 0'; }
             else { $where[] = '(errors_delta > 0 OR counter_reset = 1)'; }
@@ -208,21 +178,13 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
                       FROM v_port_error_deltas WHERE ' . implode(' AND ', $where);
 
             if (!empty($opts['history'])) {
-                // Every transition: the full time series for a port.
                 return [$inner . ' ORDER BY device_name, port, started_at DESC',
                     $params,
                     ['device_name', 'switch_name', 'switch_port', 'port', 'started_at',
                      'prev_errors_total', 'errors_total', 'errors_delta', 'counter_reset']];
             }
 
-            // Default: ONE row per phone and port - the most recent growth.
-            //
-            // This is a time series, so without collapsing it a port that has
-            // grown across five sweeps appears five times with five different
-            // counts, which reads as duplicate rows rather than as history.
-            // The question the report exists to answer is "which ports are
-            // getting worse", and that wants the current state plus how
-            // persistent the problem is, not every step that got there.
+            // Default: one row per phone and port, the most recent growth.
             $sql = 'SELECT device_name, description, switch_name, switch_port, port,
                            prev_started_at, started_at,
                            prev_errors_total, errors_total, errors_delta, counter_reset,
@@ -254,9 +216,6 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
                 $params[] = $opts['result'];
             }
             $sql .= ' ORDER BY result, switch_name, switch_port, device_name';
-            // switch_key / port_key are what the match is made on: a
-            // no-capture row is explained by comparing its switch_key with
-            // switch-captures' switch_key.
             return [$sql, $params, ['device_name', 'switch_name', 'switch_key', 'switch_port', 'switch_status',
                 'phone_speed_mbps', 'phone_duplex', 'switch_speed', 'switch_duplex', 'result']];
 

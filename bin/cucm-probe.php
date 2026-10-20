@@ -1,26 +1,18 @@
 #!/usr/bin/env php
 <?php
 /**
- * cucm-probe.php - verify, one assumption at a time, that this tool's
- * assumptions hold against a real cluster.
+ * cucm-probe.php - check each AXL/RisPort/phone assumption against a cluster, one request per check.
  *
  * Usage:
- *   php bin/cucm-probe.php [--config FILE] [--phone IP] [--out DIR] [--verbose]
+ *   php bin/cucm-probe.php [--config FILE] [--server HOST] [--phone IP]
+ *                          [--schemes https[,http]] [--out DIR] [--verbose]
  *
- * WHY THIS EXISTS
- * ---------------
- * The target cluster is on an airgapped network, so this code was written
- * against Cisco's documentation rather than against the instance - and
- * documentation is not the instance. The failure mode to avoid is a round
- * trip per wrong guess.
+ * Prints PASS/FAIL/SKIP per probe; JSON evidence goes to --out (default ./probe-evidence).
  *
- * So every assumption gets its OWN request, and each one states what it
- * expects before it runs. A single query selecting six columns fails as a
- * unit and never tells you which column name was wrong; six queries tell you
- * exactly which one. The cost is a few extra seconds, once.
- *
- * Output: a PASS/FAIL/SKIP summary on stdout, and JSON evidence per probe
- * under --out (default ./probe-evidence). Carry that directory back.
+ * Examples:
+ *   php bin/cucm-probe.php
+ *   php bin/cucm-probe.php --phone 10.0.0.50
+ *   php bin/cucm-probe.php --server cucm-sub1 --out /tmp/evidence
  */
 
 require_once dirname(__DIR__) . '/lib/config.php';
@@ -28,9 +20,12 @@ require_once dirname(__DIR__) . '/lib/config.php';
 $p    = cps_parse_args($argv, ['verbose', 'quiet', 'debug', 'help']);
 $opts = $p['opts'];
 if (!empty($opts['help'])) {
-    fwrite(STDERR, "Usage: php bin/cucm-probe.php [--config FILE] [--phone IP] [--out DIR]\n"
-                 . "       [--server HOST]            probe only this cluster\n"
-                 . "       [--schemes https[,http]]   schemes to try against the handset\n");
+    fwrite(STDERR, "Usage: php bin/cucm-probe.php [options]\n"
+                 . "  --config FILE             config file\n"
+                 . "  --server HOST             probe only this cluster\n"
+                 . "  --phone IP                also probe this phone's web pages\n"
+                 . "  --schemes https[,http]    schemes to try against the phone\n"
+                 . "  --out DIR                 evidence directory (default ./probe-evidence)\n");
     exit(0);
 }
 $cfg     = cps_load_config(cps_common_opts($opts));
@@ -42,10 +37,6 @@ if (!is_dir($outDir) && !@mkdir($outDir, 0700, true)) {
 }
 
 $servers = cps_server_urls($cfg);
-// --server narrows the probe to one cluster. With more than one CUCM in
-// cucm_servers - and especially when they are different releases - probing
-// the failing one on its own is the difference between a clear answer and a
-// wall of output about the cluster that already works.
 if (is_string($opts['server'] ?? null)) {
     $want = $opts['server'];
     $only = array_values(array_filter($servers, fn($u) => str_contains($u, $want)));
@@ -60,10 +51,7 @@ cps_log('probing: ' . implode(', ', $servers));
 
 $probes = [];
 
-/**
- * Run one probe. $expect is printed BEFORE $fn runs, so the record shows
- * what was predicted rather than a rationalisation of whatever came back.
- */
+/** Run one probe; $expect is printed before $fn runs. */
 function probe(array &$probes, string $id, string $expect, callable $fn): array
 {
     fwrite(STDOUT, sprintf("%-38s expect: %s\n", $id, $expect));
@@ -98,14 +86,12 @@ foreach ($servers as $srv) {
         $code  = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
         if ($errno !== 0) {
-            // timeout vs refused is the discriminator: a silent drop in the
-            // path times out, a host that is not listening refuses.
-            $kind = $errno === CURLE_OPERATION_TIMEDOUT ? 'timeout (silent drop in the path - firewall/ACL)'
-                  : ($errno === CURLE_COULDNT_CONNECT ? 'refused (nothing listening, or host firewall rejecting)'
+            $kind = $errno === CURLE_OPERATION_TIMEDOUT ? 'timeout (dropped in the path?)'
+                  : ($errno === CURLE_COULDNT_CONNECT ? 'refused (nothing listening?)'
                   : "curl $errno");
             return ['status' => 'FAIL', 'error' => "$kind: $err"];
         }
-        return ['status' => 'PASS', 'note' => "HTTP $code (any code proves the path and TLS)", 'http_code' => $code];
+        return ['status' => 'PASS', 'note' => "HTTP $code", 'http_code' => $code];
     });
 }
 
@@ -133,8 +119,7 @@ probe($probes, 'axl:auth+schema', 'getCCMVersion accepted on one candidate schem
             } catch (CpsSoapFault $e) {
                 $tried[$v] = $e->getMessage();
             } catch (CpsHttpError $e) {
-                // 599 is AXL refusing the schema, so keep walking; 401/403
-                // and connection failures will not improve with another one.
+                // 599 = schema refused; try the next one.
                 if ($e->httpCode === 599) { $tried[$v] = $e->getMessage(); continue; }
                 return ['status' => 'FAIL', 'error' => $e->getMessage(),
                         'http_code' => $e->httpCode, 'tried' => $tried];
@@ -164,8 +149,6 @@ $sqlProbe('axl:sql:informix-first', 'Informix "SELECT FIRST n" works (there is n
     'SELECT FIRST 1 name FROM device');
 
 // -------------------- E. RegistrationDynamic, one column per request ------
-// These column names are the least certain thing in the tool. Probed
-// separately so the answer names the wrong column instead of just failing.
 foreach ([
     'fkdevice'           => 'RegistrationDynamic.fkdevice exists',
     'lastknownipaddress' => 'RegistrationDynamic.lastknownipaddress exists (the phone IP)',
@@ -183,9 +166,7 @@ $sqlProbe('axl:sql:regdyn-join', 'the full registration query runs as one statem
   . 'LEFT JOIN typemodel tm ON tm.enum = d.tkmodel');
 
 // ---------------------------------------------------------- F. listPhone --
-// Two pages of two, then stop: enough to prove skip/first paging works
-// without walking the entire configured estate. A probe should cost one
-// short conversation, not thousands of round trips.
+// Two pages of two: proves paging without walking the estate.
 probe($probes, 'axl:listPhone', 'listPhone returns rows, and skip/first paging advances',
     function () use ($axl, $axlUsable) {
         if (!$axlUsable) { return ['status' => 'SKIP', 'note' => 'AXL not usable']; }
@@ -211,9 +192,7 @@ foreach ($servers as $srv) {
             $withIp   = count(array_filter($rows, fn($r) => !empty($r['ip'])));
             $withHttp = count(array_filter($rows, fn($r) => cps_tri_bool($r['http_supported']) !== null));
             $risCounts[$srv]['registered'] = count($rows);
-            // TotalDevicesFound is what the node believes exists; a returned
-            // count below it means paging stopped early, which is a very
-            // different fault from the node simply knowing fewer devices.
+            // Fewer rows than TotalDevicesFound means paging stopped early.
             $totals = array_values(array_filter(array_column($diag['rounds'], 'total_devices_found')));
             $claimed = $totals ? max(array_map('intval', $totals)) : null;
             $short   = $claimed !== null && count($rows) < $claimed;
@@ -235,12 +214,7 @@ foreach ($servers as $srv) {
                         $diag['nodes'] ? json_encode($diag['nodes']) : 'none reported')];
         });
 
-    // Same query with Status=Any. This one comparison separates the two
-    // reasons a cluster-wide count can come back short: if Any returns about
-    // the same number, this node only knows that many devices at all (so the
-    // rest live on other subscribers and every subscriber must be queried);
-    // if Any returns far more, the devices are here and the Status filter is
-    // what is excluding them.
+    // Status=Any vs Registered: is the filter hiding devices, or are they on other nodes?
     probe($probes, "ris:selectCmDevice:$srv:Any", 'Status=Any reveals whether the node knows more devices than it reports as Registered',
         function () use ($cfg, $srv, &$risCounts) {
             $ris  = new CpsRisportClient(cps_soap_for($cfg, $srv), 1000, 0,
@@ -251,8 +225,8 @@ foreach ($servers as $srv) {
             $hist = $diag['status_histogram'] ?? [];
             arsort($hist);
             $verdict = ($reg !== null && count($rows) > $reg * 1.2)
-                ? 'this node HOLDS more devices than it reports Registered - investigate the Status values'
-                : 'this node knows about this many devices in total - the rest of the estate is on OTHER subscribers, list them all in cucm_servers';
+                ? 'node holds more devices than it reports Registered - check Status values'
+                : 'node knows only these devices - list every subscriber in cucm_servers';
             return ['status' => 'PASS',
                     'device_count' => count($rows),
                     'registered_count' => $reg,
@@ -265,12 +239,7 @@ foreach ($servers as $srv) {
 
 // ------------------------------------------------------------- H. a phone --
 if ($phoneIp !== null) {
-    // Probe the CONFIGURED base first, then the two defaults. The probe used
-    // to try only https://{ip} and http://{ip}, which meant an estate serving
-    // the phone pages on a non-standard base saw every phone probe fail while
-    // the sweep worked perfectly - the probe contradicting the tool it exists
-    // to validate. Duplicates are dropped so the common case still runs twice,
-    // not three times.
+    // Configured base first, then each scheme's default; duplicates dropped.
     $schemes = is_string($opts['schemes'] ?? null)
         ? $opts['schemes'] : (string)$cfg['phone_probe_schemes'];
     $bases = [(string)$cfg['phone_url_base']];

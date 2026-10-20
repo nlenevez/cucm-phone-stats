@@ -5,27 +5,13 @@
  *
  *   php -S 127.0.0.1:8099 tests/mock-server.php
  *
- * WHAT THIS CAN AND CANNOT PROVE
- * ------------------------------
- * It exercises the plumbing: SOAP envelope construction, namespace-blind
- * parsing, RisPort StateInfo paging, the tolerant HTML table parser, label
- * normalisation, the database writes and the reporting views.
+ * Tests the plumbing, not Cisco's real field names (see bin/cucm-probe.php).
  *
- * It CANNOT prove that Cisco's real field names match the ones this tool
- * looks for, because the fixtures here were written from the same reading of
- * the documentation as the code was. A fixture cannot disagree with the
- * assumption that produced it. That is what bin/cucm-probe.php is for, and
- * it is why the phone fixtures below deliberately spell their labels several
- * different ways: the normaliser has to survive drift it was not shown.
- *
- * Generation: GET /_gen/<n> switches the phone counter set, so a sweep can
- * be run repeatedly to produce a trend (2 = errors grown, 3 = counters reset
- * as if the handset rebooted).
+ * GET /_gen/<n> switches the phone counter set (2 = errors grown, 3 = reset).
  */
 
 const GEN_FILE = __DIR__ . '/.mock-generation';
-// Common Phone Profiles. Assignments live in CPP_FILE so updatePhone is seen
-// by getPhone and the SQL query alike. Deleted at the start of a test run.
+// Common Phone Profile assignments, shared by getPhone, updatePhone and SQL.
 const CPP_FILE = __DIR__ . '/.mock-cpp';
 const CPP_PROFILES = [
     '1f5ae3f8-6f07-4e4b-91c5-1d4b6b1b0a01' => 'Standard Common Phone Profile',
@@ -34,55 +20,19 @@ const CPP_PROFILES = [
 ];
 const BIG_FILE = __DIR__ . '/.mock-big';
 
-/**
- * Large-estate mode: GET /_big/<n> synthesises n registered phones.
- *
- * It reproduces the failure seen on the real cluster: an unpartitioned
- * query is silently capped at BIG_CAP devices and then simply stops
- * returning StateInfo - a well formed, error free, WRONG answer - while
- * TotalDevicesFound keeps reporting the true total. A query narrowed by
- * name pattern is served in full. Without this the partitioning fallback
- * would be untestable, and an untested fallback for a fault you cannot
- * reproduce is just a hopeful guess.
- */
+/** GET /_big/<n> synthesises n phones; each query is silently capped at BIG_CAP. */
 const BIG_CAP = 120;
 const BIGCAP_FILE = __DIR__ . '/.mock-bigcap';
 
-/**
- * GET /_bigcap/1 makes TotalDevicesFound report the CAPPED count.
- *
- * This is the harder, real-world variant: the cluster returns 1000 devices
- * and also says 1000 exist, so comparing the two proves nothing and the
- * truncated answer is internally consistent. Detection has to fall back on
- * the result sitting exactly on the cap.
- */
+/** GET /_bigcap/1 makes TotalDevicesFound report the capped count. */
 function capHidesTotal(): bool {
     return is_readable(BIGCAP_FILE) && trim((string)file_get_contents(BIGCAP_FILE)) === '1';
 }
 const SOFT_FILE = __DIR__ . '/.mock-soft';
 const CONC_FILE = __DIR__ . '/.mock-conc';
 const RISSEEN_FILE = __DIR__ . '/.mock-risseen';
-const NOSUFFIX_FILE = __DIR__ . '/.mock-nosuffix';
 
-/**
- * GET /_nosuffix/1 makes the cluster refuse a leading wildcard.
- *
- * Not every CUCM will match on the end of a device name, and the client is
- * supposed to probe for it rather than assume. Modelling a cluster that
- * returns nothing for such a pattern is what proves the fallback works.
- */
-function suffixUnsupported(): bool {
-    return is_readable(NOSUFFIX_FILE) && trim((string)file_get_contents(NOSUFFIX_FILE)) === '1';
-}
-
-/**
- * Record which device-name prefixes RisPort actually handed back.
- *
- * "We never enumerate CSF" is a claim about what the cluster is asked for,
- * so the server is the only place that can honestly answer it. Filtering
- * client-side would look identical from the outside while still costing the
- * query.
- */
+/** Record which device-name prefixes RisPort handed back. */
 function noteReturnedPrefixes(array $devices): void {
     $seen = is_readable(RISSEEN_FILE)
         ? (json_decode((string)file_get_contents(RISSEEN_FILE), true) ?: []) : [];
@@ -95,15 +45,7 @@ function noteReturnedPrefixes(array $devices): void {
 }
 const EDGE_FILE = __DIR__ . '/.mock-edge';
 
-/**
- * GET /_edge/1 adds handsets that answer badly but not obviously so.
- *
- * The first of these is a real failure from the field: HTTP 200, zero-byte
- * body, curl reporting no error whatsoever. Every guard passed it through to
- * DOMDocument::loadHTML(''), which throws a ValueError under PHP 8 and took
- * an entire sweep of thousands down with it. The others are its neighbours:
- * a body of pure whitespace, and markup with no table at all.
- */
+/** GET /_edge/1 adds handsets that answer 200 with an empty, blank or tableless body. */
 function edgeClients(): array {
     if (!is_readable(EDGE_FILE) || trim((string)file_get_contents(EDGE_FILE)) !== '1') { return []; }
     return [
@@ -113,9 +55,7 @@ function edgeClients(): array {
                               'descr' => 'Answers 200 with whitespace', 'http' => 'Yes', 'behaviour' => 'blank'],
         'SEP00112233EE03' => ['ip' => '10.10.10.63', 'status' => 'Registered', 'model' => 'Cisco 8841',
                               'descr' => 'Answers 200 with no table', 'http' => 'Yes', 'behaviour' => 'notable'],
-        // RisPort returns DirNumber as a comma-separated list of every line
-        // appearance, and a phone with many lines runs well past a short
-        // column. This one broke a live sweep with MySQL 1406.
+        // 60 line appearances: a very long DirNumber.
         'SEP00112233EE04' => ['ip' => '10.10.10.64', 'status' => 'Registered', 'model' => 'Cisco 8861',
                               'descr' => 'Many line appearances', 'http' => 'Yes', 'behaviour' => 'clean',
                               'dn' => implode(',', array_map(fn($i) => '6' . str_pad((string)$i, 4, '0', STR_PAD_LEFT), range(1, 60)))],
@@ -123,15 +63,7 @@ function edgeClients(): array {
 }
 const SLOW_FILE = __DIR__ . '/.mock-slow';
 
-/**
- * Track how many phone requests are being served at once.
- *
- * The point is to assert overlap directly rather than infer it from elapsed
- * time. A timing assertion on a build machine is a flaky test; "the server
- * saw six requests in flight simultaneously" is not. Needs the built-in
- * server started with PHP_CLI_SERVER_WORKERS so requests are not serialised
- * by a single process - hence the file plus flock rather than a static.
- */
+/** Track concurrent phone requests (needs PHP_CLI_SERVER_WORKERS). */
 function concEnter(): void {
     $fh = fopen(CONC_FILE, 'c+');
     if (!$fh) { return; }
@@ -160,27 +92,14 @@ function slowMs(): int {
 function slowMod(): int {
     return is_readable(SLOWMOD_FILE) ? max(0, (int)file_get_contents(SLOWMOD_FILE)) : 0;
 }
-/**
- * Should this phone be slow? A realistic estate is not uniformly slow - it
- * is mostly fast with a scattering of handsets that crawl or time out, and
- * that VARIANCE is the entire difference between batching and a rolling
- * window. With uniform latency the two are indistinguishable.
- */
+/** Should this phone be slow? */
 function isSlowPhone(string $ip): bool {
     $mod = slowMod();
     if ($mod <= 0) { return true; }
     return (hexdec(substr(md5($ip), 0, 4)) % $mod) === 0;
 }
 
-/**
- * GET /_soft/1 adds registered soft clients to the estate.
- *
- * Behind a toggle so the counts every other test asserts stay stable. Their
- * addresses are deliberately in the same range as the handsets: a Jabber
- * client registers from the user's workstation, and the point of the
- * device-prefix filter is that nothing about the ADDRESS tells you not to
- * poll it - only the device name does.
- */
+/** GET /_soft/1 adds soft clients, in the same address range as the handsets. */
 function softClients(): array {
     if (!is_readable(SOFT_FILE) || trim((string)file_get_contents(SOFT_FILE)) !== '1') { return []; }
     return [
@@ -199,17 +118,10 @@ function bigCount(): int {
     return is_readable(BIG_FILE) ? max(0, (int)file_get_contents(BIG_FILE)) : 0;
 }
 
-const OUI_FILE = __DIR__ . '/.mock-oui';
 const AXLVER_FILE = __DIR__ . '/.mock-axlver';
 const ENUM_FILE   = __DIR__ . '/.mock-modelenum';
 
-/**
- * GET /_modelenum/1 makes RisPort report models as numeric enums.
- *
- * Which is what a real cluster does - the name lives in the typemodel
- * table, not in the RisPort response - so reporting a readable string here
- * was flattering the client and hiding the work it has to do.
- */
+/** GET /_modelenum/1 makes RisPort report models as numeric enums. */
 function modelEnums(): bool {
     return is_readable(ENUM_FILE) && trim((string)file_get_contents(ENUM_FILE)) === '1';
 }
@@ -227,13 +139,7 @@ function modelEnumFor(string $name): string {
     return (string)($flip[$name] ?? 627);
 }
 
-/**
- * Which AXL schema versions this cluster admits.
- *
- * An estate can easily run more than one CUCM release, and an older cluster
- * rejects the newer schemas outright - so the client has to negotiate down
- * to something it accepts rather than assume the latest.
- */
+/** AXL schema versions this cluster admits; GET /_axlver/<list> sets them. */
 function axlVersions(): array {
     if (is_readable(AXLVER_FILE)) {
         $v = trim((string)file_get_contents(AXLVER_FILE));
@@ -242,34 +148,16 @@ function axlVersions(): array {
     return ['14.0', '12.5'];
 }
 
-/**
- * GET /_oui/1 puts every phone on ONE OUI and ONE node.
- *
- * The realistic hard case, and the one seen in the field: a fleet bought
- * together shares 44:B6:BE, so SEP4*, SEP44*, SEP44B*, SEP44B6*, SEP44B6B*
- * and SEP44B6BE* are all over the cap in turn. Prefix splitting has to walk
- * the entire OUI before it separates anything, while the trailing digits are
- * the serial and split evenly at the first attempt.
- */
-function ouiClustered(): bool {
-    return is_readable(OUI_FILE) && trim((string)file_get_contents(OUI_FILE)) === '1';
-}
-
 /** Deterministic synthetic estate. */
 function bigEstate(): array {
     $out = [];
     for ($i = 0; $i < bigCount(); $i++) {
-        $name = ouiClustered()
-            ? 'SEP44B6BE' . strtoupper(str_pad(dechex($i), 3, '0', STR_PAD_LEFT))
-            : 'SEP' . strtoupper(substr(md5('dev' . $i), 0, 12));
+        $name = 'SEP' . strtoupper(substr(md5('dev' . $i), 0, 12));
         $out[$name] = [
             'ip' => sprintf('10.%d.%d.%d', 20 + intdiv($i, 65025), intdiv($i, 255) % 255, ($i % 254) + 1),
             'status' => 'Registered', 'model' => 'Cisco 8841',
             'descr' => "Synthetic $i", 'http' => 'Yes', 'behaviour' => 'clean',
-            // Spread across subscribers, as a real cluster is. This is what
-            // makes per-node enumeration a cheaper way past the response cap
-            // than splitting by device name.
-            'node' => ouiClustered() ? 'CUCM-SUB1' : 'CUCM-SUB' . (($i % 3) + 1),
+            'node' => 'CUCM-SUB' . (($i % 3) + 1),
         ];
     }
     return $out;
@@ -290,16 +178,6 @@ if (preg_match('#^/_modelenum/([01])$#', $uri, $m)) {
 if (preg_match('#^/_axlver/(.*)$#', $uri, $m)) {
     file_put_contents(AXLVER_FILE, urldecode($m[1]));
     echo "axl versions {$m[1]}\n";
-    return;
-}
-if (preg_match('#^/_oui/([01])$#', $uri, $m)) {
-    file_put_contents(OUI_FILE, $m[1]);
-    echo "oui {$m[1]}\n";
-    return;
-}
-if (preg_match('#^/_nosuffix/([01])$#', $uri, $m)) {
-    file_put_contents(NOSUFFIX_FILE, $m[1]);
-    echo "nosuffix {$m[1]}\n";
     return;
 }
 if ($uri === '/_ris/seen') {
@@ -371,10 +249,7 @@ http_response_code(404);
 echo "no mock route for $uri\n";
 
 // ---------------------------------------------------------------------------
-// The fixture estate.
-//
-// status/ip come from RisPort; the phone entries drive the HTTP fixtures.
-// Each phone is here to produce a specific, checkable outcome.
+// The fixture estate. Each phone produces one checkable outcome.
 // ---------------------------------------------------------------------------
 function estate(): array {
     return edgeClients() + softClients() + [
@@ -427,20 +302,14 @@ function soap_fault(string $string, string $axlcode = '5003'): void {
 // ---------------------------------------------------------------------- AXL
 function axl(string $body): void {
     if (($_SERVER['PHP_AUTH_USER'] ?? '') === '' ) {
-        // Basic auth is mandatory, exactly as the real thing is, so the
-        // client's auth handling is actually exercised.
+        // Basic auth is mandatory.
         http_response_code(401);
         header('WWW-Authenticate: Basic realm="mock"');
         echo 'auth required';
         return;
     }
-    // Only 14.0 and 12.5 are "supported", so version negotiation has
-    // something to walk down through - starting at 15.0, it must fall back.
     if (preg_match('#AXL/API/([0-9.]+)#', $body, $m) && !in_array($m[1], axlVersions(), true)) {
-        // How a real CUCM refuses a schema it does not know: HTTP 599 with a
-        // bare <axlError>, NOT a SOAP Fault. Treated as a transport failure
-        // that ends the request, this stopped version negotiation on its
-        // first candidate and the cluster was never reached at all.
+        // CUCM refuses an unknown schema with HTTP 599 and a bare <axlError>.
         http_response_code(599);
         header('Content-Type: text/xml; charset=utf-8');
         echo '<axlError><axlcode>-1</axlcode>'
@@ -470,9 +339,7 @@ function axl(string $body): void {
         preg_match('#<first>(\d+)</first>#', $body, $f);
         $skip  = (int)($s[1] ?? 0);
         $first = (int)($f[1] ?? 500);
-        // AXL must see the same estate RisPort does, including the
-        // synthetic one - it is the source the client uses to compute exact
-        // partitions, so a mismatch here would test nothing real.
+        // Same estate RisPort sees.
         $src   = bigCount() > 0 ? bigEstate() : estate();
         preg_match('#<name>([^<]*)</name>#', $body, $nm);
         $like  = trim($nm[1] ?? '%');
@@ -535,8 +402,7 @@ function axl_profile_methods(string $body): bool {
 function axl_sql(string $sql): void {
     $l = strtolower($sql);
 
-    // The Informix dialect trap, enforced: LIMIT must fail here, the way it
-    // fails on a real cluster, so a regression to MySQL syntax is caught.
+    // Informix: LIMIT is a syntax error.
     if (preg_match('/\blimit\b/', $l)) {
         soap_fault('A syntax error has occurred near LIMIT', '217');
         return;
@@ -546,8 +412,7 @@ function axl_sql(string $sql): void {
         return;
     }
     if (str_contains($l, 'from registrationdynamic')) {
-        // Only the columns this tool relies on exist; anything else is an
-        // Informix "column not found", so a probe of a wrong name fails.
+        // Unknown columns fault, as Informix does.
         $known = ['fkdevice', 'lastknownipaddress', 'lastknownucm', 'lastseen', 'pkid'];
         preg_match('/select\s+(?:first\s+\d+\s+)?(.*?)\s+from/s', $l, $m);
         foreach (preg_split('/\s*,\s*/', $m[1] ?? '') as $col) {
@@ -573,7 +438,7 @@ function axl_sql(string $sql): void {
         return;
     }
     if (str_contains($l, 'commonphoneconfig')) {
-        // pkids come back lowercase with no braces, as Informix stores them.
+        // pkids are lowercase, no braces.
         $rows = [];
         foreach (estate() as $name => $e) {
             $u = cppOf($name);
@@ -624,25 +489,10 @@ function ris(string $body): void {
     preg_match('#<[^>]*NodeName>([^<]*)<#', $body, $nn);
     $wantNode = trim($nn[1] ?? '');
 
-    // Which name patterns did the caller ask for?
     preg_match_all('#<[^>]*Item>([^<]*)<#', $body, $im);
     $patterns = array_values(array_filter($im[1] ?? [], fn($x) => trim($x) !== ''));
     if (!$patterns) { $patterns = ['*']; }
     $narrowed = !(count($patterns) === 1 && $patterns[0] === '*');
-
-    // A pattern with a wildcard anywhere but the end is a "suffix" pattern.
-    if (suffixUnsupported()) {
-        foreach ($patterns as $pat) {
-            if (str_contains($pat, '*') && !str_ends_with($pat, '*')) {
-                soap_out('<ns:selectCmDeviceResponse xmlns:ns="http://schemas.cisco.com/ast/soap">'
-                       . '<selectCmDeviceReturn><SelectCmDeviceResult>'
-                       . '<TotalDevicesFound>0</TotalDevicesFound><CmNodes></CmNodes>'
-                       . '</SelectCmDeviceResult><StateInfo></StateInfo>'
-                       . '</selectCmDeviceReturn></ns:selectCmDeviceResponse>');
-                return;
-            }
-        }
-    }
 
     $source = bigCount() > 0 ? bigEstate() : estate();
     $all = [];
@@ -655,34 +505,25 @@ function ris(string $body): void {
         }
     }
 
-    // The cap only bites an unnarrowed query, which is what makes splitting
-    // by name prefix a workaround rather than a coincidence.
     $trueTotal = count($all);
-    // The cap applies to EVERY query, as it does on a real cluster. Splitting
-    // helps only because each narrower query matches fewer devices - not
-    // because narrowing exempts you from the limit. Modelling it the other
-    // way made a scoped first query look complete when it would not be.
+    // The cap applies to every query, narrowed or not.
     $capped    = bigCount() > 0 ? BIG_CAP : PHP_INT_MAX;
-    // With capHidesTotal the response is self-consistent and gives detection
-    // nothing to compare against.
     if (capHidesTotal() && $trueTotal > $capped) { $trueTotal = $capped; }
 
-    // Page deliberately at 3 devices regardless of MaxReturnedDevices, so
-    // StateInfo paging is exercised even on a small fixture estate.
+    // Small pages so StateInfo paging is exercised.
     $pageSize = min($max, bigCount() > 0 ? 50 : 3);
     $offset   = $state === '' ? 0 : (int)$state;
     $reachable = min(count($all), $capped);
     $slice    = array_slice($all, $offset, min($pageSize, max(0, $reachable - $offset)), true);
-    // StateInfo simply stops once the cap is reached: no error, no warning.
+    // StateInfo stops silently at the cap.
     $next     = ($offset + $pageSize) < $reachable ? (string)($offset + $pageSize) : '';
 
     noteReturnedPrefixes($slice);
 
     $byNode = [];
     foreach ($slice as $name => $e) { $byNode[$e['node'] ?? 'CUCM-SUB1'][$name] = $e; }
-    // Even a truncated response lists every node the cluster has, which is
-    // what lets the client discover node names to query individually.
-    if (bigCount() > 0 && !ouiClustered()) {
+    // Even a truncated response lists every node.
+    if (bigCount() > 0) {
         foreach (['CUCM-SUB1', 'CUCM-SUB2', 'CUCM-SUB3'] as $n) { $byNode[$n] ??= []; }
     }
 
@@ -741,7 +582,6 @@ function phoneInner(string $ip, string $adapter): void {
     }
     if ($e['behaviour'] === 'noweb') { http_response_code(404); echo 'not found'; return; }
 
-    // 200 with nothing in it - the field failure this guards against.
     if ($e['behaviour'] === 'empty') { header('Content-Type: text/html'); echo ''; return; }
     if ($e['behaviour'] === 'blank') { header('Content-Type: text/html'); echo "   \n\t  \n"; return; }
     if ($e['behaviour'] === 'notable') {
@@ -754,12 +594,7 @@ function phoneInner(string $ip, string $adapter): void {
     echo phone_page($e['behaviour'], $adapter, $name, gen());
 }
 
-/**
- * Render a phone page. Each behaviour uses a DIFFERENT label spelling and a
- * DIFFERENT table layout on purpose - two-column, three-column with a ":"
- * spacer, and padded empty cells - because that is the variation real
- * firmware shows and the parser has to absorb it.
- */
+/** Render a phone page. Label spellings and table layouts vary on purpose. */
 function phone_page(string $behaviour, string $adapter, string $name, int $gen): string {
     $isAccess = str_contains($adapter, 'access');
 
@@ -780,10 +615,9 @@ function phone_page(string $behaviour, string $adapter, string $name, int $gen):
             'Domain Name'   => 'example.local',
             'TFTP Server 1' => '10.0.0.10',
         ];
-        // Deliberately varied, because firmware is:
+        // Neighbour reporting varies:
         //  - the clean phone reports CDP only
-        //  - the errors phone reports LLDP only, and a CDP placeholder that
-        //    must NOT be stored as a switch name
+        //  - the errors phone reports LLDP only, plus a CDP placeholder
         //  - the duplex-mismatch phone reports both, so CDP must win
         //  - access-down reports neither
         switch ($behaviour) {
@@ -815,8 +649,7 @@ function phone_page(string $behaviour, string $adapter, string $name, int $gen):
         return table3($kv);
     }
 
-    // Counters grow with the generation; generation 3 models a reboot, where
-    // the counters clear and start again from a low value.
+    // Counters grow per generation; generation 3 models a reboot.
     $bump = fn(int $base, int $step) => $gen === 3 ? (int)($step / 2) : $base + ($gen - 1) * $step;
 
     switch ($behaviour) {
@@ -841,8 +674,7 @@ function phone_page(string $behaviour, string $adapter, string $name, int $gen):
             ]);
 
         case 'errors':
-            // CamelCase labels, padded spacer cells, and a label the map has
-            // never seen, to check unmapped_labels counting.
+            // CamelCase labels, padded cells, and one unmapped label.
             return tablePadded([
                 'Port Information'   => '100 Mbps Full Duplex',
                 'RxTotalPkt'         => $bump(220000, 10000),

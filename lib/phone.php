@@ -1,27 +1,7 @@
 <?php
 /**
- * phone.php - fetch and parse a Cisco IP Phone's serviceability web pages.
- *
- * The phone serves pages like
- *   https://<ip>/CGI/Java/Serviceability?adapter=device.statistics.port.network
- * as an HTML table of label/value pairs. The layout drifts between firmware
- * releases (two columns, three columns with a ":" spacer, padded empty
- * cells), so the parser takes the non-empty cells of each row and treats the
- * first as the label and the remainder as the value. That tolerant approach
- * is carried over unchanged from patching-tools/cisco-phone-netstats.php,
- * which is already proven against real handsets.
- *
- * NORMALISATION, AND WHY THE RAW PAIRS ARE ALWAYS KEPT
- * ---------------------------------------------------
- * Label text is not stable across firmware: "Rx totalPkt", "RxTotalPkt" and
- * "Rx Total Pkt" are the same counter. Keys are therefore squashed to
- * lowercase alphanumerics before lookup, which absorbs most of the drift on
- * its own, and only then mapped to a canonical column.
- *
- * Whatever the map does or does not recognise, the complete label/value set
- * is stored verbatim as JSON. A counter this map has never seen is then
- * still recoverable from the database afterwards, instead of being lost at
- * collection time and needing a second sweep of the estate to get back.
+ * phone.php - fetch and parse Cisco IP Phone serviceability pages
+ * (/CGI/Java/Serviceability?adapter=...) into label/value pairs and columns.
  */
 
 require_once __DIR__ . '/util.php';
@@ -43,14 +23,7 @@ function cps_norm_key(string $label): string {
     return strtolower(preg_replace('/[^A-Za-z0-9]+/', '', $label));
 }
 
-/**
- * normalised label => canonical column.
- *
- * UNVERIFIED against Nathan's firmware - assembled from the Cisco 79xx/78xx
- * /88xx serviceability pages. Anything absent here still lands in raw_json,
- * and `bin/cucm-phone-netstats.php --raw` on one real handset is enough to
- * finish the map.
- */
+/** Normalised label => port_stats column. Unknown labels are still kept raw. */
 const CPS_COUNTER_MAP = [
     // --- receive ---
     'rxtotalpkt'        => 'rx_total_pkt',
@@ -100,11 +73,7 @@ const CPS_COUNTER_MAP = [
     'txunicastpkt'      => 'tx_unicast',
 ];
 
-/**
- * Counters that count a fault rather than traffic. These are what
- * "non-zero ethernet errors" and the error-trend report add up, so a
- * counter that is merely unusual (broadcasts, say) is deliberately not here.
- */
+/** Fault counters summed into errors_total. */
 const CPS_ERROR_COLUMNS = [
     'rx_crc_err', 'rx_align_err', 'rx_short_err', 'rx_long_err',
     'rx_jabber', 'rx_overrun',
@@ -136,12 +105,7 @@ const CPS_DEVICE_MAP = [
 ];
 
 /**
- * Parse a link-description string into speed / duplex / up.
- *
- * Handles the forms seen across firmware: "Auto Negotiation",
- * "100Mb Full Duplex", "1000 Full", "100 Half", "Down", "No Link",
- * "Auto 100 Full".
- *
+ * Parse a link description ("100Mb Full Duplex", "1000 Full", "Down") into speed/duplex/up.
  * @return array{speed_mbps:?int, duplex:?string, link_up:?int}
  */
 function cps_parse_link(string $text): array {
@@ -156,7 +120,7 @@ function cps_parse_link(string $text): array {
     } elseif (preg_match('/\b(\d{1,3})\s*(?:gb(?:ps|it)?|g)\b/', $t, $m)) {
         $speed = (int)$m[1] * 1000;
     } elseif (preg_match('/\b(10|100|1000|2500|10000)\b/', $t, $m)) {
-        // Bare "100 Full" - only trust a number that is a real ethernet rate.
+        // Bare number: only accept real ethernet rates.
         $speed = (int)$m[1];
     }
 
@@ -164,8 +128,7 @@ function cps_parse_link(string $text): array {
     if (preg_match('/\bfull\b/', $t))      { $duplex = 'full'; }
     elseif (preg_match('/\bhalf\b/', $t))  { $duplex = 'half'; }
 
-    // "Auto Negotiation" on its own advertises the setting, not the result:
-    // no speed, no duplex, and no basis to call the link up or down.
+    // "Auto Negotiation" alone says nothing about the link.
     if ($speed === null && $duplex === null && !$down) {
         return ['speed_mbps' => null, 'duplex' => null, 'link_up' => null];
     }
@@ -177,8 +140,7 @@ function cps_parse_link(string $text): array {
 }
 
 /**
- * Turn raw label/value pairs from one page into normalised columns.
- *
+ * Normalise one port page's label/value pairs.
  * @return array{counters:array<string,int>, link:array, errors_total:int, unmapped:int}
  */
 function cps_normalise_port(array $pairs): array {
@@ -191,7 +153,7 @@ function cps_normalise_port(array $pairs): array {
         $k = cps_norm_key((string)$label);
 
         if (isset(CPS_COUNTER_MAP[$k])) {
-            // Counter values are sometimes "1,234" or "1234 pkts".
+            // Values may be "1,234" or "1234 pkts".
             $digits = preg_replace('/[^0-9]/', '', (string)$value);
             if ($digits !== '') {
                 $counters[CPS_COUNTER_MAP[$k]] = (int)$digits;
@@ -208,9 +170,7 @@ function cps_normalise_port(array $pairs): array {
         if (!isset(CPS_COUNTER_MAP[$k])) { $unmapped++; }
     }
 
-    // Fallback: no recognised link label, so look for any value that reads
-    // like a link description. Firmware that renames the label still tends
-    // to keep the value shaped as "100Mb Full Duplex".
+    // No known link label: take any value shaped like "100Mb Full Duplex".
     if ($link['link_up'] === null) {
         foreach ($pairs as $value) {
             if (!is_string($value)) { continue; }
@@ -240,16 +200,9 @@ function cps_normalise_device(array $pairs): array {
 }
 
 /**
- * Collapse whitespace, including the non-breaking space, and trim.
- *
- * These pages pad their tables with &nbsp;, which DOMDocument decodes to
- * U+00A0. PCRE's \s does not match U+00A0 unless the pattern is in UTF-8
- * mode, so a plain /\s+/ leaves the spacer behind and a cell that should be
- * empty tests as non-empty - the label/value pairing then shifts by one cell
- * and the value comes out as "\u{00A0} 10" instead of "10".
- *
- * The non-UTF-8 branch is the fallback for a page in a legacy encoding,
- * where a /u pattern returns null rather than matching.
+ * Collapse whitespace (including U+00A0) and trim.
+ * &nbsp; decodes to U+00A0, which \s only matches with /u; the fallback
+ * handles non-UTF-8 input, where /u returns null.
  */
 function cps_squash_ws(string $s): string {
     $out = preg_replace('/[\s\x{00A0}]+/u', ' ', $s);
@@ -260,15 +213,11 @@ function cps_squash_ws(string $s): string {
 }
 
 /**
- * Parse a serviceability HTML page into label => value pairs.
- * Carried over from cisco-phone-netstats.php: take every non-empty,
- * non-separator cell in a row; first is the label, the rest is the value.
+ * Parse a serviceability page into label => value pairs: per row, the first
+ * non-empty cell is the label and the rest is the value.
  */
 function cps_parse_stats_html(string $html): array {
-    // DOMDocument::loadHTML() throws a ValueError on an empty string under
-    // PHP 8, and a phone answering 200 with a zero-byte body reaches here
-    // with curl reporting no error at all. Returning no pairs lets the
-    // caller classify it; throwing killed an entire sweep.
+    // loadHTML('') throws ValueError on PHP 8.
     if (trim($html) === '') { return []; }
 
     $prev = libxml_use_internal_errors(true);
@@ -292,16 +241,9 @@ function cps_parse_stats_html(string $html): array {
     return $stats;
 }
 
-/**
- * Build the URL for one adapter page on a phone.
- * $base is a template so tests (and http-only estates) can retarget it;
- * "{ip}" is substituted, and an IPv6 literal is bracketed.
- */
+/** URL of one adapter page; "{ip}" in $base is replaced, IPv6 literals bracketed. */
 function cps_phone_url(string $ip, string $adapter, string $base = 'https://{ip}'): string {
-    // Bracket only a genuine IPv6 literal. Testing merely for ":" also
-    // catches "10.0.0.5:8443", turning it into "[10.0.0.5:8443]" and a curl
-    // "Bad IPv6 address" - a confusing failure for what is a reasonable
-    // thing to type at --phone.
+    // Not a ":" test: "10.0.0.5:8443" must stay unbracketed.
     $isV6 = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false;
     $host = ($isV6 && !str_starts_with($ip, '[')) ? "[$ip]" : $ip;
     $root = str_replace('{ip}', $host, $base);
@@ -309,16 +251,8 @@ function cps_phone_url(string $ip, string $adapter, string $base = 'https://{ip}
 }
 
 /**
- * curl options confining a request to a safe set of schemes.
- *
- * Redirects are followed (some firmware bounces /CGI/... through a login
- * page), and CURLOPT_USERPWD is set whenever Web Access is Authenticated.
- * Together those mean a phone answering https:// with a 302 to http:// would
- * have curl re-send the Authorization header in cleartext. Restricting the
- * redirect protocols makes that impossible rather than unlikely.
- *
- * An https base is pinned to https - never downgrade. An http base may
- * upgrade to https, which is only ever an improvement.
+ * curl protocol limits: an https base never redirects to http, so credentials
+ * are never re-sent in cleartext.
  */
 function cps_curl_scheme_limits(string $base): array {
     $scheme = strtolower((string)parse_url(str_replace('{ip}', '0.0.0.0', $base), PHP_URL_SCHEME));
@@ -368,20 +302,8 @@ class CpsPhoneFetcher
     }
 
     /**
-     * Fetch every configured adapter from every phone.
-     *
-     * A rolling window, not batches. The previous implementation split the
-     * phones into chunks of $parallel and ran each chunk to completion
-     * before starting the next, which put a barrier between every chunk:
-     * one handset timing out at phone_timeout stalled the nine that had
-     * already answered in 200ms, so a chunk cost as much as its slowest
-     * member and 100 phones took 36 seconds. Here a finished request is
-     * replaced immediately, so slow handsets cost only their own latency
-     * and never anyone else's.
-     *
-     * The window is counted in REQUESTS - $parallel phones times the number
-     * of adapters - so "10 phones in flight" keeps meaning that however many
-     * pages each phone is asked for.
+     * Fetch every configured adapter from every phone, using a rolling window
+     * of ($parallel x adapters) requests.
      *
      * @param array<int,array{name:string, ip:string}> $phones
      * @return array<string, array> keyed by device name
@@ -426,9 +348,7 @@ class CpsPhoneFetcher
                 $ch  = $info['handle'];
                 $id  = spl_object_id($ch);
                 $job = $inFlight[$id] ?? null;
-                // Drop the map entry BEFORE closing: spl_object_id is reused
-                // once a handle is freed, and a stale entry would then be
-                // overwritten by the next request's job.
+                // Unset before close: spl_object_id is reused once freed.
                 unset($inFlight[$id]);
 
                 if ($job !== null) {
@@ -452,8 +372,6 @@ class CpsPhoneFetcher
                 $launch();   // refill the window straight away
             }
 
-            // Only block once nothing is completable; with a full window and
-            // nothing ready this is where the time is legitimately spent.
             if ($inFlight && $running) { curl_multi_select($mh, 0.2); }
         }
         curl_multi_close($mh);
@@ -475,14 +393,7 @@ class CpsPhoneFetcher
         return $this->interpret($body === false ? '' : $body, $errno, $err, $code);
     }
 
-    /**
-     * Turn a raw curl outcome into a page result.
-     *
-     * The distinct failure modes are kept apart on purpose, because each one
-     * points somewhere different: refused/timeout is the network or a phone
-     * that is off, 401 is Web Access set to Authenticated, and a 200 with no
-     * table means the page rendered but this parser did not understand it.
-     */
+    /** Turn a curl outcome into a page result, with an error_kind per failure mode. */
     private function interpret(string $body, int $errno, string $err, int $code): array
     {
         if ($errno !== 0) {
@@ -503,15 +414,12 @@ class CpsPhoneFetcher
             return ['ok' => false, 'http_code' => $code, 'error_kind' => 'http',
                     'error' => "phone returned HTTP $code"];
         }
-        // A 200 with no bytes is the phone's fault; a 200 we could not parse
-        // is arguably ours. Different remedies, so different error_kind.
         if (trim($body) === '') {
             return ['ok' => false, 'http_code' => 200, 'error_kind' => 'empty',
                     'error' => 'phone returned HTTP 200 with an empty body'];
         }
 
-        // Nothing a single handset does may abort a sweep of thousands, so
-        // any parser surprise becomes a recorded failure for that one page.
+        // A parser failure fails this page only, never the sweep.
         try {
             $pairs = cps_parse_stats_html($body);
         } catch (Throwable $e) {
@@ -527,17 +435,7 @@ class CpsPhoneFetcher
     }
 }
 
-/**
- * CDP / LLDP neighbour labels, normalised key => canonical field.
- *
- * Firmware disagrees about these more than about the counters: some pages
- * say "CDP Neighbor Device ID", others "Neighbor Device ID" under a CDP
- * heading, and the LLDP-MED variants add their own spellings. The alias
- * table covers what is known; cps_normalise_neighbour() then makes a
- * heuristic pass for anything shaped like a neighbour field that the table
- * missed, because guessing wrong here costs a switch port lookup, whereas
- * missing the field entirely costs a site visit.
- */
+/** CDP/LLDP neighbour labels, normalised key => uplinks field. */
 const CPS_NEIGHBOUR_MAP = [
     // --- CDP ---
     'cdpneighbordeviceid'      => 'cdp_neighbour',
@@ -573,17 +471,8 @@ const CPS_NEIGHBOUR_FIELDS = [
 ];
 
 /**
- * Extract the upstream switch and port the phone reports seeing.
- *
- * Two passes. The alias table first, then a heuristic for keys the table
- * does not know: anything whose normalised name starts cdp/lldp and mentions
- * a device/system name or a port. The heuristic never overwrites an alias
- * hit, so a known-good mapping always wins.
- *
- * A value of "not available", "none" or similar is treated as absent -
- * phones report the field with a placeholder when CDP is off on the switch,
- * and storing that placeholder as a switch name is worse than storing null.
- *
+ * Extract the CDP/LLDP neighbour the phone reports: alias table first, then a
+ * name heuristic that never overrides it. Placeholders ("none", "n/a") are dropped.
  * @return array<string,string>
  */
 function cps_normalise_neighbour(array $pairs): array {
@@ -604,8 +493,7 @@ function cps_normalise_neighbour(array $pairs): array {
         $v = trim((string)$value);
         if (in_array(strtolower($v), $placeholder, true)) { continue; }
         $proto = $m[1] === 'cdp' ? 'cdp' : 'lldp';
-        // Order matters: "port" is checked before the name, because
-        // "neighborportid" contains both "port" and "id".
+        // "port" first: "neighborportid" also contains "id".
         if (str_contains($k, 'port')) {
             $out[$proto . '_neighbour_port'] ??= $v;
         } elseif (str_contains($k, 'ip') || str_contains($k, 'address')) {
@@ -618,13 +506,7 @@ function cps_normalise_neighbour(array $pairs): array {
 }
 
 /**
- * Collapse CDP and LLDP into one answer for reporting.
- *
- * CDP wins when both are present: on a Cisco switch it carries the switch's
- * own hostname and an interface name a human can act on, whereas LLDP often
- * reports a MAC-derived chassis id and a numeric port. LLDP is the fallback
- * for the estates and switch vendors where CDP is off.
- *
+ * Collapse CDP and LLDP into one switch/port answer; CDP preferred.
  * @return array{switch_name:?string, switch_port:?string, switch_ip:?string, source:?string}
  */
 function cps_neighbour_summary(array $n): array {
