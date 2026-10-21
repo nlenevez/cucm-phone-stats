@@ -590,6 +590,15 @@ eq('switch-mismatch lists exactly the two', $mmSw, ['SEP001122334402', 'SEP00112
 run("$php $root/bin/cucm-switch-import.php --config $C $swDir");
 eq('re-importing the same output stores nothing new',
    (int)$db->query('SELECT COUNT(*) c FROM switch_captures')[0]['c'], 3);
+$db->pdo()->exec("UPDATE switch_captures SET switch_key = 'hidden' WHERE switch_key = 'sw-edge-07'");
+$r = run("$php $root/bin/cucm-report.php switch-missing --config $C --json");
+// The phone reports sw-edge-07.example.local; the report gives the bare hostname.
+eq('switch-missing names the uncaptured switch by hostname, with its phone count',
+   array_map(fn($x) => [$x['switch'], (int)$x['phones']], json_decode($r['out'], true) ?: []), [['sw-edge-07', 1]]);
+$r = run("$php $root/bin/cucm-report.php switch-compare --config $C --result no-capture --json");
+eq('--result filters by a literal (connection and view collations agree)',
+   array_column(json_decode($r['out'], true) ?: [], 'device_name'), ['SEP001122334404']);
+$db->pdo()->exec("UPDATE switch_captures SET switch_key = 'sw-edge-07' WHERE switch_key = 'hidden'");
 
 section('report: labels tells us what the phones actually send');
 $r = run("$php $root/bin/cucm-report.php labels --config $C --grep neighbor --json");

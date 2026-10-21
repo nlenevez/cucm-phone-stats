@@ -164,6 +164,7 @@ try {
          PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
          PDO::ATTR_EMULATE_PREPARES => false]
     );
+    $pdo->exec('SET NAMES utf8mb4');
 
     $sweeps = $pdo->query(
         'SELECT id, started_at, phones_polled, phones_ok, phones_failed
@@ -493,7 +494,6 @@ try {
       <code>docs/web-deployment.md</code>.
     </div>
   <?php endif; ?>
-  Generated <?= h(date('Y-m-d H:i')) ?> from <?= h($CONFIG['db_name']) ?> on <?= h($CONFIG['db_host']) ?>.
   Click a column heading to sort; click again to reverse.
 </footer>
 

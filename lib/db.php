@@ -37,6 +37,8 @@ class CpsDb
         } catch (PDOException $e) {
             throw new RuntimeException("MySQL connect failed ($host:$port/$name): " . $e->getMessage(), 0, $e);
         }
+        // Server-default collation, as schema.sql uses: views' literals then compare cleanly with ours.
+        $this->pdo->exec('SET NAMES utf8mb4');
     }
 
     public function pdo(): PDO { return $this->pdo; }

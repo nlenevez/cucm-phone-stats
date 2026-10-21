@@ -25,7 +25,7 @@ $opts   = $p['opts'];
 $report = $p['args'][0] ?? null;
 
 $known = ['speed-mismatch', 'errors', 'error-trend', 'switch-mismatch', 'switch-compare', 'switch-captures',
-          'phones', 'sweeps', 'uplinks', 'labels'];
+          'switch-missing', 'phones', 'sweeps', 'uplinks', 'labels'];
 if (!empty($opts['help']) || $report === null) {
     fwrite(STDERR, "Usage: php bin/cucm-report.php <" . implode('|', $known) . "> [options]\n"
                  . "  --sweep N | --all     one sweep, or every sweep (default latest)\n"
@@ -35,6 +35,7 @@ if (!empty($opts['help']) || $report === null) {
                  . "  --history             error-trend: every transition, not one row per port\n"
                  . "  --include-resets      error-trend: include counter resets\n"
                  . "  --result R            switch-compare: filter by result\n"
+                 . "  switch-missing        switches phones report that have no capture\n"
                  . "  --grep TEXT           labels: filter by label\n"
                  . "  --unmapped-only       labels: only labels not mapped\n");
     exit($report === null ? 1 : 0);
@@ -218,6 +219,15 @@ function cps_build_report(string $report, ?int $sweepId, array $opts): array
             $sql .= ' ORDER BY result, switch_name, switch_port, device_name';
             return [$sql, $params, ['device_name', 'switch_name', 'switch_key', 'switch_port', 'switch_status',
                 'phone_speed_mbps', 'phone_duplex', 'switch_speed', 'switch_duplex', 'result']];
+
+        case 'switch-missing':
+            // Switches phones report but no capture matched, by hostname (domain and "(serial)" dropped).
+            $sql = "SELECT MIN(SUBSTRING_INDEX(SUBSTRING_INDEX(TRIM(switch_name), '(', 1), '.', 1)) AS switch,
+                           COUNT(DISTINCT phone_id) AS phones, MIN(switch_port) AS example_port
+                    FROM v_switch_port_compare WHERE result = 'no-capture'";
+            if ($sweepId !== null) { $sql .= ' AND sweep_id = ?'; $params[] = $sweepId; }
+            $sql .= ' GROUP BY switch_key ORDER BY phones DESC, switch';
+            return [$sql, $params, ['switch', 'phones', 'example_port']];
 
         case 'switch-captures':
             $sql = 'SELECT c.id, c.switch_name, c.switch_key, c.switch_ip, c.source_file, c.captured_at, c.imported_at,

@@ -161,6 +161,7 @@ php bin/cucm-report.php <report> [--sweep N|--all] [--min N] [--since YYYY-MM-DD
 | `switch-mismatch` | phone network port differs from the switch port |
 | `switch-compare` | every uplink against the switch; `--result match\|speed\|duplex\|no-capture\|no-port\|...` |
 | `switch-captures` | imported switch captures |
+| `switch-missing` | switches phones report via CDP/LLDP that have no capture (`switch_key` = expected file name) |
 | `phones` | inventory, including Common Phone Profile |
 | `uplinks` | switch and port each phone reports (CDP/LLDP) |
 | `labels` | every label returned by phones and how it maps; `--grep TEXT`, `--unmapped-only` |
