@@ -226,10 +226,13 @@ foreach ($results as $name => $res) {
         }
     }
 
-    // CDP/LLDP can appear on any page depending on firmware.
+    // CDP/LLDP can appear on any page depending on firmware. Known labels from
+    // every page first, so a guess from one page never beats a match on another.
     $neighbour = [];
-    foreach ($pages as $page) {
-        if (!empty($page['ok'])) { $neighbour += cps_normalise_neighbour($page['pairs']); }
+    foreach ([false, true] as $fallback) {
+        foreach ($pages as $page) {
+            if (!empty($page['ok'])) { $neighbour += cps_normalise_neighbour($page['pairs'], $fallback); }
+        }
     }
     $uplink = cps_neighbour_summary($neighbour);
 

@@ -473,11 +473,14 @@ const CPS_NEIGHBOUR_FIELDS = [
 /**
  * Extract the CDP/LLDP neighbour the phone reports: alias table first, then a
  * name heuristic that never overrides it. Placeholders ("none", "n/a") are dropped.
+ * $fallback = false returns alias-table matches only.
  * @return array<string,string>
  */
-function cps_normalise_neighbour(array $pairs): array {
+function cps_normalise_neighbour(array $pairs, bool $fallback = true): array {
     $out = [];
-    $placeholder = ['', 'n/a', 'na', 'none', 'not available', 'unknown', '0.0.0.0', '-'];
+    // Includes on/off flags: the config page's "CDP: SW Port  Yes" says CDP is enabled, not where it leads.
+    $placeholder = ['', 'n/a', 'na', 'none', 'not available', 'unknown', '0.0.0.0', '-',
+                    'yes', 'no', 'enabled', 'disabled', 'on', 'off', 'true', 'false'];
 
     foreach ($pairs as $label => $value) {
         $k = cps_norm_key((string)$label);
@@ -486,10 +489,11 @@ function cps_normalise_neighbour(array $pairs): array {
         if (in_array(strtolower($v), $placeholder, true)) { continue; }
         $out[CPS_NEIGHBOUR_MAP[$k]] ??= $v;
     }
+    if (!$fallback) { return $out; }
 
     foreach ($pairs as $label => $value) {
         $k = cps_norm_key((string)$label);
-        if (!preg_match('/^(cdp|lldp)/', $k, $m)) { continue; }
+        if (!preg_match('/^(cdp|lldp)/', $k, $m) || !preg_match('/neighbo|nbr/', $k)) { continue; }
         $v = trim((string)$value);
         if (in_array(strtolower($v), $placeholder, true)) { continue; }
         $proto = $m[1] === 'cdp' ? 'cdp' : 'lldp';

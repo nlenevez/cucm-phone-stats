@@ -155,6 +155,10 @@ eq('CDP switch name',  $n['cdp_neighbour'], 'sw-access-01');
 eq('CDP switch port',  $n['cdp_neighbour_port'], 'GigabitEthernet1/0/12');
 eq('CDP switch IP',    $n['cdp_neighbour_ip'], '10.0.0.201');
 
+// Config-page flags are not neighbour data.
+$n = cps_normalise_neighbour(['CDP: SW Port' => 'Yes', 'LLDP-MED: SW Port' => 'Enabled', 'CDP Neighbor Device ID' => 'sw1']);
+ok('"CDP: SW Port = Yes" is not taken as the switch port', !isset($n['cdp_neighbour_port']) && !isset($n['lldp_neighbour_port']), json_encode($n));
+
 // LLDP-MED is a distinct spelling that has to land in the same fields.
 $n = cps_normalise_neighbour([
     'LLDP-MED Neighbor Device ID' => 'sw-edge-07',

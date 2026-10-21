@@ -109,7 +109,7 @@ function cps_report_labels(CpsDb $db, ?int $sweepId, array $opts): void
             ?? CPS_NEIGHBOUR_MAP[$k]
             ?? CPS_DEVICE_MAP[$k]
             ?? (in_array($k, CPS_LINK_LABELS, true) ? 'link state' : null);
-        if ($mapped === null && preg_match('/^(cdp|lldp)/', $k)) {
+        if ($mapped === null && preg_match('/^(cdp|lldp)/', $k) && preg_match('/neighbo|nbr/', $k)) {
             $mapped = 'neighbour (matched by fallback)';
         }
         if (!empty($opts['unmapped-only']) && $mapped !== null) { continue; }
