@@ -24,7 +24,7 @@ else only reads.
 
 - **Cisco AXL Web Service** (Serviceability > Tools > Service Activation).
   Off by default; without it `/axl/` returns 404.
-- **Cisco RIS Data Collector**: answers `selectCmDevice`.
+- **Cisco RIS Data Collector**: answers `selectCmDeviceExt` / `selectCmDevice`.
 
 ## Phone web access
 

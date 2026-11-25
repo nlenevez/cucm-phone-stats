@@ -4,11 +4,12 @@
 
 First release.
 
-- Phone discovery via RisPort70 `selectCmDevice`, with an AXL
-  `RegistrationDynamic` fallback; multiple servers merged.
-- RisPort enumeration: one query, re-queried per CUCM node when the answer
-  is at or near the 1000 cap; nodes still at the cap reported as incomplete
-  (`ris_partitions` = auto | always | off).
+- Phone discovery: names from AXL `listPhone`, registration from RisPort70
+  `selectCmDeviceExt` by name (500 per query, not capped), `selectCmDevice`
+  if Ext is refused; AXL `RegistrationDynamic` fallback (`--source axl-sql`);
+  multiple servers merged.
+- `ris_enumeration = risport`: one RisPort query, re-queried per node when
+  at or near the cap (`ris_partitions` = auto | always | off).
 - Sliding-window RisPort rate limiting with retry on throttle faults.
 - AXL client with schema-version negotiation; model names from `typemodel`.
 - Concurrent polling of phone web pages; network/access port speed, duplex

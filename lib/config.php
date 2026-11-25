@@ -33,6 +33,9 @@ const CPS_DEFAULTS = [
     'ris_max_devices' => 1000,
     // Re-query per node when a response is capped: auto | always | off.
     'ris_partitions'  => 'auto',
+    // axl = names from AXL, then RisPort selectCmDeviceExt by name (no cap);
+    // risport = one RisPort query (capped; per-node re-query per ris_partitions).
+    'ris_enumeration' => 'axl',
 
     'phone_url_base'  => 'https://{ip}',
     'phone_user'      => '',

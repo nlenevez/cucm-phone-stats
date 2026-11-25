@@ -744,12 +744,16 @@ eq('and --undo puts it back', $liveCpp('SEP001122334402'), $STD);
 // ------------------------------------------- large estate / RisPort cap ---
 section('integration: RisPort response cap and per-node enumeration');
 file_get_contents("http://127.0.0.1:$port/_big/300");   // 300 phones, cap 120
+// These exercise the RisPort-only path; the AXL-names path is tested below.
+$confRis = "$root/tests/.cucm-test-ris.conf";
+file_put_contents($confRis, file_get_contents($conf) . "\nris_enumeration = risport\n");
+$CR = escapeshellarg($confRis);
 
 // TotalDevicesFound reports the capped count.
 file_get_contents("http://127.0.0.1:$port/_bigcap/1");
 $confCap = "$root/tests/.cucm-test-cap.conf";
 // ris_max_devices equal to the server's cap.
-file_put_contents($confCap, file_get_contents($conf) . "\nris_max_devices = 120\n");
+file_put_contents($confCap, file_get_contents($confRis) . "\nris_max_devices = 120\n");
 
 $r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confCap) . " --json");
 eq('a self-consistent capped answer is still detected and recovered',
@@ -757,7 +761,7 @@ eq('a self-consistent capped answer is still detected and recovered',
 ok('the cap is reported', str_contains($r['err'], 'at the 120 cap'), substr($r['err'], 0, 200));
 
 // Negative control: partitioning off comes back short.
-file_put_contents($confCap, file_get_contents($conf) . "\nris_max_devices = 120\nris_partitions = off\n");
+file_put_contents($confCap, file_get_contents($confRis) . "\nris_max_devices = 120\nris_partitions = off\n");
 $r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confCap) . " --json");
 eq('with partitioning off the cap still truncates', count(json_decode($r['out'], true) ?: []), 120);
 @unlink($confCap);
@@ -765,12 +769,12 @@ file_get_contents("http://127.0.0.1:$port/_bigcap/0");
 
 // Reproduce the truncation first.
 $confOff = "$root/tests/.cucm-test-off.conf";
-file_put_contents($confOff, file_get_contents($conf) . "\nris_partitions = off\n");
+file_put_contents($confOff, file_get_contents($confRis) . "\nris_partitions = off\n");
 $r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confOff) . " --json");
 $off = json_decode($r['out'], true);
 eq('unpartitioned query is truncated by the cap', count($off ?: []), 120);
 
-$r = run("$php $root/bin/cucm-phones.php --config $C --json");
+$r = run("$php $root/bin/cucm-phones.php --config $CR --json");
 $auto = json_decode($r['out'], true);
 eq('auto partitioning recovers the full estate', count($auto ?: []), 300);
 ok('it re-queries per node', str_contains($r['err'], 'querying each of'), substr($r['err'], 0, 300));
@@ -778,12 +782,31 @@ ok('it re-queries per node', str_contains($r['err'], 'querying each of'), substr
 $names = array_column($auto ?: [], 'name');
 eq('no duplicates across partitions', count(array_unique($names)), count($names));
 
-$r = run("$php $root/bin/cucm-sweep.php --config $C --no-db --sample 25 --json");
+$r = run("$php $root/bin/cucm-sweep.php --config $CR --no-db --sample 25 --json");
 $bs = json_decode($r['out'], true);
 eq('sweep sees the full estate after partitioning', $bs['discovered'] ?? null, 300);
 eq('sample still honoured on a large estate', $bs['polled'] ?? null, 25);
 
 @unlink($confOff);
+
+section('integration: AXL names + selectCmDeviceExt are not capped');
+// Mock cap is 120 per query; 100 names per Ext query stays under it.
+$confExt = "$root/tests/.cucm-test-ext.conf";
+file_put_contents($confExt, file_get_contents($conf) . "\nris_max_devices = 100\n");
+$r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confExt) . " -v --json");
+$ext = array_column(json_decode($r['out'], true) ?: [], 'name');
+eq('every phone found by name, past the cap', count(array_unique($ext)), 300);
+$last = array_filter($ext, fn($n) => strncmp($n, 'SEPF', 4) === 0);
+ok('names that sort last are present', count($last) > 0, implode(',', array_slice($ext, -3)));
+ok('AXL and RisPort counts are logged', str_contains($r['err'], 'AXL lists 300 phone(s) named SEP*; RisPort reports 300'),
+   substr($r['err'], 0, 400));
+file_get_contents("http://127.0.0.1:$port/_noext/1");
+$r = run("$php $root/bin/cucm-phones.php --config " . escapeshellarg($confExt) . " --json");
+eq('a cluster refusing Ext falls back to selectCmDevice by name', count(json_decode($r['out'], true) ?: []), 300);
+ok('and says so', str_contains($r['err'], 'selectCmDeviceExt failed'), substr($r['err'], 0, 200));
+file_get_contents("http://127.0.0.1:$port/_noext/0");
+@unlink($confExt);
+@unlink($confRis);
 file_get_contents("http://127.0.0.1:$port/_big/0");     // back to the small estate
 
 // ------------------------------------------------- badly behaved phones ---

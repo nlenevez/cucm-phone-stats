@@ -19,6 +19,7 @@ const CPP_PROFILES = [
     '5b0c9e2a-3d4f-4a61-9c7e-2f8d1a6b4c90' => 'Fixed 100 Full CPP',
 ];
 const BIG_FILE = __DIR__ . '/.mock-big';
+const NOEXT_FILE = __DIR__ . '/.mock-noext';
 
 /** GET /_big/<n> synthesises n phones; each query is silently capped at BIG_CAP. */
 const BIG_CAP = 120;
@@ -213,6 +214,11 @@ if (preg_match('#^/_slow/(\d+)$#', $uri, $m)) {
 if (preg_match('#^/_bigcap/([01])$#', $uri, $m)) {
     file_put_contents(BIGCAP_FILE, $m[1]);
     echo "bigcap {$m[1]}\n";
+    return;
+}
+if (preg_match('#^/_noext/([01])$#', $uri, $m)) {
+    file_put_contents(NOEXT_FILE, $m[1]);
+    echo "noext {$m[1]}\n";
     return;
 }
 if (preg_match('#^/_edge/([01])$#', $uri, $m)) {
@@ -493,6 +499,18 @@ function ris(string $body): void {
     $patterns = array_values(array_filter($im[1] ?? [], fn($x) => trim($x) !== ''));
     if (!$patterns) { $patterns = ['*']; }
     $narrowed = !(count($patterns) === 1 && $patterns[0] === '*');
+    // Ext takes explicit names only; /_noext/1 makes the cluster refuse Ext.
+    $ext = str_contains($body, 'selectCmDeviceExt');
+    if ($ext && is_readable(NOEXT_FILE) && trim((string)file_get_contents(NOEXT_FILE)) === '1') {
+        soap_fault('No such operation: selectCmDeviceExt');
+        return;
+    }
+    if ($ext) {
+        foreach ($patterns as $pat) {
+            if (str_contains($pat, '*')) { soap_fault('selectCmDeviceExt does not support wildcards'); return; }
+        }
+    }
+    $resp = $ext ? 'selectCmDeviceExt' : 'selectCmDevice';
 
     $source = bigCount() > 0 ? bigEstate() : estate();
     $all = [];
@@ -548,12 +566,12 @@ function ris(string $body): void {
         $nodesXml .= '<item><Name>' . htmlspecialchars((string)$nodeName) . '</Name>'
                    . '<NoChange>false</NoChange><CmDevices>' . $xml . '</CmDevices></item>';
     }
-    soap_out('<ns:selectCmDeviceResponse xmlns:ns="http://schemas.cisco.com/ast/soap">'
+    soap_out('<ns:' . $resp . 'Response xmlns:ns="http://schemas.cisco.com/ast/soap">'
            . '<selectCmDeviceReturn><SelectCmDeviceResult>'
            . '<TotalDevicesFound>' . $trueTotal . '</TotalDevicesFound>'
            . '<CmNodes>' . ($nodesXml ?: '<item><Name>CUCM-SUB1</Name><CmDevices></CmDevices></item>') . '</CmNodes>'
            . '</SelectCmDeviceResult><StateInfo>' . $next . '</StateInfo>'
-           . '</selectCmDeviceReturn></ns:selectCmDeviceResponse>');
+           . '</selectCmDeviceReturn></ns:' . $resp . 'Response>');
 }
 
 // ------------------------------------------------------------------ phones

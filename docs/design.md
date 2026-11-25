@@ -2,7 +2,7 @@
 
 ## Sources
 
-- **RisPort70 `selectCmDevice`** gives registration state: status, current
+- **RisPort70 `selectCmDeviceExt`** gives registration state: status, current
   IP, firmware, directory number, `HttpSupported`. AXL holds configuration
   only, not whether a phone is registered or its current address.
 - **AXL** gives model names (`typemodel`), the Common Phone Profile, and the
@@ -11,12 +11,14 @@
 
 ## Enumeration
 
-RisPort returns at most 1000 devices per answer without flagging truncation.
-One query is sent; if it returns at or near the cap, or fewer than
-`TotalDevicesFound`, each node is queried separately and results are merged
-by device name. A node still at the cap is reported as incomplete. Multiple
-`cucm_servers` are merged, preferring rows with an IP and `Registered`
-status. Device-type and subnet filters are applied to the results.
+RisPort caps each answer without flagging truncation. AXL `listPhone` is not
+capped, so it supplies the names (scoped to `poll_device_prefixes`) and
+`selectCmDeviceExt` looks them up, 500 per query; Ext takes no `*` and
+returns one row per device across nodes. `ris_enumeration = risport` sends
+one query and re-queries each node if the answer is at or near the cap.
+Multiple `cucm_servers` are merged, preferring rows with an IP and
+`Registered` status; servers returning the same name list are queried once.
+Subnet filters are applied to the results.
 
 ## SOAP
 

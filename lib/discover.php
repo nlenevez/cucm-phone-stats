@@ -55,7 +55,10 @@ function cps_discover_phones(array $cfg, string $source, string $status, array $
             cps_warn("ris_partitions = '$mode' is not auto|always|off; using auto");
             $mode = 'auto';
         }
-        $res = CpsRisportClient::discover(cps_risport_clients($cfg), $status, 'Phone', $mode);
+        $enum = strtolower(trim((string)($cfg['ris_enumeration'] ?? 'axl')));
+        $res = $enum === 'risport' || ((string)($cfg['axl_user'] ?? '')) === ''
+            ? CpsRisportClient::discover(cps_risport_clients($cfg), $status, 'Phone', $mode)
+            : cps_discover_by_axl_names($cfg, $status, $mode, cps_poll_prefixes($cfg, $opts));
         foreach ($res['errors'] as $e) {
             cps_warn("RisPort {$e['server']}: {$e['error']}");
         }
@@ -96,6 +99,73 @@ function cps_discover_phones(array $cfg, string $source, string $status, array $
 }
 
 /**
+ * Names from AXL listPhone, registration from selectCmDeviceExt by name.
+ * Falls back to a plain RisPort query if AXL cannot list names.
+ *
+ * @param string[] $prefixes device-name prefixes; empty = every phone
+ * @return array{devices: array<string,array>, errors: array<int,array>}
+ */
+function cps_discover_by_axl_names(array $cfg, string $status, string $mode, array $prefixes): array
+{
+    $urls    = cps_server_urls($cfg);
+    $clients = cps_risport_clients($cfg);
+    $byName  = [];
+    $errors  = [];
+    $done    = [];
+    foreach ($urls as $i => $url) {
+        $client = $clients[$i];
+        try {
+            $axl   = cps_axl_client($cfg, $url);
+            $names = [];
+            foreach ($prefixes ?: [''] as $p) {
+                foreach ($axl->listPhones(['name'], 1000, $p . '%') as $r) {
+                    $n = trim((string)($r['name'] ?? ''));
+                    if ($n !== '') { $names[strtoupper($n)] = $n; }
+                }
+            }
+            ksort($names);
+            $names = array_values($names);
+        } catch (Throwable $e) {
+            unset($names);
+            cps_warn("$url: AXL could not list phone names, using a plain RisPort query: " . $e->getMessage());
+            $res = CpsRisportClient::discover([$client], $status, 'Phone', $mode);
+        }
+        if (isset($names)) {
+            $key = sha1(implode("\n", $names));
+            if (isset($done[$key])) {
+                cps_log("$url: same " . count($names) . " phone names as {$done[$key]}, skipped", 2);
+                unset($names);
+                continue;
+            }
+            $res = CpsRisportClient::discoverNames([$client], $names, $status);
+            if (!$res['errors']) { $done[$key] = $url; }
+            cps_log(sprintf('%s: AXL lists %d phone(s)%s; RisPort reports %d %s',
+                $url, count($names), $prefixes ? ' named ' . implode('/', $prefixes) . '*' : '',
+                count($res['devices']), $status));
+            unset($names);
+        }
+        $errors = array_merge($errors, $res['errors']);
+        foreach ($res['devices'] as $name => $r) {
+            $r['ris_server'] ??= $url;
+            if (!isset($byName[$name]) || (empty($byName[$name]['ip']) && !empty($r['ip']))) {
+                $byName[$name] = $r;
+            }
+        }
+    }
+    return ['devices' => $byName, 'errors' => $errors];
+}
+
+/** Device-name prefixes in scope ([] = all), from --all-devices / --device-prefixes / config. */
+function cps_poll_prefixes(array $cfg, array $opts): array
+{
+    if (!empty($opts['all-devices'])) { return []; }
+    $raw = is_string($opts['device-prefixes'] ?? null)
+        ? $opts['device-prefixes']
+        : (string)($cfg['poll_device_prefixes'] ?? '');
+    return preg_split('/[\s,]+/', trim($raw), -1, PREG_SPLIT_NO_EMPTY);
+}
+
+/**
  * Drop phones in the configured/CLI excluded subnets.
  *
  * @return array<int,array<string,mixed>> the phones still in scope
@@ -130,10 +200,7 @@ function cps_apply_device_prefixes(array $phones, array $cfg, array $opts): arra
         cps_log('--all-devices: device-prefix filtering disabled', 2);
         return $phones;
     }
-    $raw = is_string($opts['device-prefixes'] ?? null)
-        ? $opts['device-prefixes']
-        : (string)($cfg['poll_device_prefixes'] ?? '');
-    $prefixes = preg_split('/[\s,]+/', trim($raw), -1, PREG_SPLIT_NO_EMPTY);
+    $prefixes = cps_poll_prefixes($cfg, $opts);
     if (!$prefixes) { return $phones; }
 
     $res = cps_filter_by_device_prefix($phones, $prefixes);

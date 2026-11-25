@@ -91,7 +91,7 @@ class CpsRisportClient
     public function lastDiagnostics(): array { return $this->lastDiag; }
 
     /**
-     * selectCmDevice, following StateInfo until the cluster is exhausted.
+     * selectCmDevice or selectCmDeviceExt (one row per device; names only, no '*').
      *
      * @param string $status Registered|UnRegistered|Rejected|Any
      * @param string $deviceClass Phone|Gateway|H323|Cti|VoiceMail|MediaResources|Any
@@ -103,6 +103,7 @@ class CpsRisportClient
         array  $selectItems = ['*'],
         string $selectBy = 'Name',
         string $nodeName = '',
+        string $method = 'selectCmDevice',
     ): array {
         $devices   = [];
         $stateInfo = '';
@@ -113,6 +114,7 @@ class CpsRisportClient
             'server'        => $this->soap->baseUrl(),
             'status_filter' => $status,
             'device_class'  => $deviceClass,
+            'method'        => $method,
             'max_returned'  => $this->maxReturnedDevices,
             'rounds'        => [],
             'nodes'         => [],
@@ -125,7 +127,7 @@ class CpsRisportClient
             foreach ($selectItems as $it) {
                 $itemsXml .= '<soap:item><soap:Item>' . cps_xesc($it) . '</soap:Item></soap:item>';
             }
-            $body = '<soap:selectCmDevice>'
+            $body = '<soap:' . $method . '>'
                   . '<soap:StateInfo>' . cps_xesc($stateInfo) . '</soap:StateInfo>'
                   . '<soap:CmSelectionCriteria>'
                   . '<soap:MaxReturnedDevices>' . $this->maxReturnedDevices . '</soap:MaxReturnedDevices>'
@@ -138,7 +140,7 @@ class CpsRisportClient
                   . '<soap:Protocol>Any</soap:Protocol>'
                   . '<soap:DownloadStatus>Any</soap:DownloadStatus>'
                   . '</soap:CmSelectionCriteria>'
-                  . '</soap:selectCmDevice>';
+                  . '</soap:' . $method . '>';
 
             $env = CpsSoapClient::envelope($body, ['soap' => CPS_RIS_NS]);
             $doc = $this->postWithRetry($env);
@@ -267,7 +269,7 @@ class CpsRisportClient
     public const HARD_CAP = 1000;
 
     /** The most this client can expect back from a single query. */
-    private function effectiveCap(): int
+    public function effectiveCap(): int
     {
         return min(max(1, $this->maxReturnedDevices), self::HARD_CAP);
     }
@@ -391,24 +393,39 @@ class CpsRisportClient
     }
 
     /**
-     * Look up a known list of device names, $chunk names per query.
+     * Look up device names with selectCmDeviceExt, $chunk per query;
+     * selectCmDevice if Ext is refused.
      *
      * @param CpsRisportClient[] $clients
      * @param string[] $names
      * @return array{devices: array<string,array>, errors: array<int,array>}
      */
-    public static function discoverNames(array $clients, array $names, string $status = 'Registered', int $chunk = 200): array
+    public static function discoverNames(array $clients, array $names, string $status = 'Registered', int $chunk = 500): array
     {
         $byName = [];
         $errors = [];
+        $names  = array_values(array_unique($names));
         foreach ($clients as $c) {
-            foreach (array_chunk(array_values(array_unique($names)), $chunk) as $part) {
+            $method = 'selectCmDeviceExt';
+            $size   = max(1, min($chunk, $c->effectiveCap()));
+            foreach (array_chunk($names, $size) as $part) {
                 try {
-                    $rows = $c->selectCmDevice($status, 'Phone', $part);
+                    $rows = $c->selectCmDevice($status, 'Phone', $part, 'Name', '', $method);
                 } catch (Throwable $e) {
-                    $errors[] = ['server' => $c->baseUrl(), 'error' => $e->getMessage()];
-                    cps_warn($c->baseUrl() . ': ' . $e->getMessage());
-                    continue 2;
+                    if ($method !== 'selectCmDeviceExt' || self::isRateLimitFault($e)) {
+                        $errors[] = ['server' => $c->baseUrl(), 'error' => $e->getMessage()];
+                        cps_warn($c->baseUrl() . ': ' . $e->getMessage());
+                        continue 2;
+                    }
+                    cps_warn($c->baseUrl() . ': selectCmDeviceExt failed, using selectCmDevice: ' . trim($e->getMessage()));
+                    $method = 'selectCmDevice';
+                    try {
+                        $rows = $c->selectCmDevice($status, 'Phone', $part, 'Name', '', $method);
+                    } catch (Throwable $e2) {
+                        $errors[] = ['server' => $c->baseUrl(), 'error' => $e2->getMessage()];
+                        cps_warn($c->baseUrl() . ': ' . $e2->getMessage());
+                        continue 2;
+                    }
                 }
                 foreach ($rows as $r) {
                     $r['ris_server'] = $c->baseUrl();

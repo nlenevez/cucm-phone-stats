@@ -139,13 +139,16 @@ filtered to the flagged phones.
 
 #### RisPort enumeration
 
-RisPort returns at most 1000 devices per answer and does not say when it has
-truncated. Discovery sends one query; if the answer is at or near the cap (or
-short of `TotalDevicesFound`) it queries each CUCM node separately and merges
-the results. A node still at the cap is reported as incomplete.
-`ris_partitions`: `auto` (default), `always` (always query per node), `off`
-(one query only). Device-type scoping (`poll_device_prefixes`,
-`--all-devices`) is applied to the results.
+RisPort caps each answer and does not say when it has truncated. By default
+(`ris_enumeration = axl`) phone names come from AXL `listPhone`, filtered by
+`poll_device_prefixes`, and are looked up with `selectCmDeviceExt`, 500 per
+query. If Ext is refused, `selectCmDevice` is used with the same names. The
+log shows `AXL lists N phone(s) named SEP*; RisPort reports M Registered`.
+
+`ris_enumeration = risport` sends one RisPort query and, if the answer is at
+or near the cap, queries each node separately; a node still at the cap is
+reported as incomplete. `ris_partitions`: `auto` (default), `always`, `off`.
+This path is also used when AXL cannot list names.
 
 ### cucm-report.php
 

@@ -35,6 +35,9 @@ ris_gap_ms     = 0
 ris_max_devices = 1000
 ; auto = re-query each node if the answer is at the cap; always = always per node; off = one query.
 ris_partitions = auto
+; axl = list phone names from AXL, then look them up with selectCmDeviceExt
+; 500 at a time (not capped); risport = one capped RisPort query as above.
+ris_enumeration = axl
 
 ; --------------------------------------------------------------- phones ---
 ; Phone web base URL; {ip} is replaced with the phone's address.
