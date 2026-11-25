@@ -1,0 +1,17 @@
+cucm.conf
+probe-evidence/
+tests/.mock-generation
+tests/.cucm-test.conf
+*.log
+tests/.mock-conc
+tests/.mock-slow
+tests/.mock-big
+tests/.mock-soft
+tests/.mock-slowmod
+tests/.mock-edge
+tests/.mock-bigcap
+tests/.mock-risseen
+tests/.mock-axlver
+tests/.mock-modelenum
+tests/.mock-cpp
+tests/.mock-noext
